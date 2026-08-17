@@ -23,8 +23,10 @@ use std::collections::HashMap;
 use std::convert::TryFrom;
 use std::fmt::{Debug, Error, Formatter};
 use std::io::{BufRead, BufReader, Write};
+use std::net::Shutdown;
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::net::UnixStream;
+use std::path::PathBuf;
 use std::str::FromStr;
 use std::time::Duration;
 
@@ -43,9 +45,18 @@ const DEFAULT_QMP_READ_TIMEOUT: u64 = 5000;
 pub const DEFAULT_QMP_CONNECT_DEADLINE_MS: u64 = 50000;
 
 const DEVICE_DELETED_TIMEOUT: Duration = Duration::from_secs(10);
+const QMP_RECONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+type QmpClient = qapi::Qmp<qapi::Stream<BufReader<UnixStream>, UnixStream>>;
+
+fn is_transport_error(error: &qapi::ExecuteError) -> bool {
+    matches!(error, qapi::ExecuteError::Io(_))
+}
 
 pub struct Qmp {
-    qmp: qapi::Qmp<qapi::Stream<BufReader<UnixStream>, UnixStream>>,
+    qmp: QmpClient,
+    socket_path: PathBuf,
+    transport_poisoned: bool,
 
     // This is basically the output of
     // `cat /sys/devices/system/memory/block_size_bytes`
@@ -86,23 +97,16 @@ impl Qmp {
     /// before QEMU is spawned, then complete startup on that same connection.
     /// This avoids creating and abandoning additional connections while QEMU
     /// is still initializing.
-    pub fn from_stream(stream: UnixStream, overall_timeout: Duration) -> Result<Self> {
-        if overall_timeout.is_zero() {
-            return Err(anyhow!("invalid QMP timeout of 0"));
-        }
-
-        let deadline = Instant::now() + overall_timeout;
-        stream
-            .set_nonblocking(false)
-            .context("set qmp stream blocking")?;
-
-        let mut reader = BufReader::new(stream.try_clone().context("clone qmp stream")?);
-        let info = read_qmp_greeting(&mut reader, deadline).context("read QMP greeting")?;
-        negotiate_qmp_capabilities(&mut reader, &stream, deadline)
-            .context("enable QMP capabilities")?;
-
-        let mut qmp = Qmp {
-            qmp: qapi::Qmp::new(qapi::Stream::new(reader, stream)),
+    pub fn from_stream(
+        stream: UnixStream,
+        socket_path: PathBuf,
+        overall_timeout: Duration,
+    ) -> Result<Self> {
+        let (qmp_client, info) = initialize_qmp_stream(stream, overall_timeout)?;
+        let qmp = Qmp {
+            qmp: qmp_client,
+            socket_path,
+            transport_poisoned: false,
             guest_memory_block_size: 0,
             ccw_subchannel: None,
             pci_bridge_devices: HashMap::new(),
@@ -110,14 +114,68 @@ impl Qmp {
 
         info!(sl!(), "QMP initialized: {:#?}", info);
 
-        // Establish a sane steady-state timeout immediately after handshake.
-        qmp.qmp
+        Ok(qmp)
+    }
+
+    fn reconnect(&mut self) -> Result<()> {
+        if let Err(error) = self
+            .qmp
             .inner_mut()
             .get_mut_write()
-            .set_read_timeout(Some(Duration::from_millis(DEFAULT_QMP_READ_TIMEOUT)))
-            .context("set steady-state qmp read timeout")?;
+            .shutdown(Shutdown::Both)
+        {
+            debug!(sl!(), "failed to close poisoned QMP transport: {}", error);
+        }
 
-        Ok(qmp)
+        let stream = UnixStream::connect(&self.socket_path)
+            .with_context(|| format!("reconnect QMP socket {}", self.socket_path.display()))?;
+        let (mut qmp, info) = initialize_qmp_stream(stream, QMP_RECONNECT_TIMEOUT)
+            .context("reinitialize QMP transport")?;
+        let pci = qmp
+            .execute(&qapi_qmp::query_pci {})
+            .context("query PCI state after QMP reconnect")?;
+
+        self.pci_bridge_devices = collect_pci_bridge_devices(&pci);
+        if self.ccw_subchannel.is_some() {
+            warn!(sl!(), "disabling CCW hotplug after QMP transport recovery");
+            self.ccw_subchannel = None;
+        }
+
+        self.qmp = qmp;
+        self.transport_poisoned = false;
+        info!(sl!(), "QMP reconnected: {:#?}", info);
+        Ok(())
+    }
+
+    fn recover_transport(&mut self) {
+        self.transport_poisoned = true;
+        if let Err(error) = self.reconnect() {
+            warn!(sl!(), "QMP reconnect failed: {:#}", error);
+        }
+    }
+
+    fn ensure_transport(&mut self) -> Result<()> {
+        if self.transport_poisoned {
+            self.reconnect()?;
+        }
+        Ok(())
+    }
+
+    fn execute<C: qapi::Command>(&mut self, command: &C) -> qapi::ExecuteResult<C> {
+        self.ensure_transport().map_err(|error| {
+            qapi::ExecuteError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                format!("QMP transport is unavailable: {error:#}"),
+            ))
+        })?;
+
+        let result = self.qmp.execute(command);
+        if matches!(&result, Err(qapi::ExecuteError::Io(_))) {
+            // The command may have reached QEMU. Recover only for future
+            // operations and return the original error without replaying it.
+            self.recover_transport();
+        }
+        result
     }
 
     pub fn set_ccw_subchannel(&mut self, subchannel: CcwSubChannel) {
@@ -133,48 +191,45 @@ impl Qmp {
     }
 
     pub fn set_ignore_shared_memory_capability(&mut self) -> Result<()> {
-        self.qmp
-            .execute(&migrate_set_capabilities {
-                capabilities: vec![MigrationCapabilityStatus {
-                    capability: MigrationCapability::x_ignore_shared,
-                    state: true,
-                }],
-            })
-            .map(|_| ())
-            .context("set ignore shared memory capability")
+        self.execute(&migrate_set_capabilities {
+            capabilities: vec![MigrationCapabilityStatus {
+                capability: MigrationCapability::x_ignore_shared,
+                state: true,
+            }],
+        })
+        .map(|_| ())
+        .context("set ignore shared memory capability")
     }
 
     pub fn execute_migration(&mut self, uri: &str) -> Result<()> {
-        self.qmp
-            .execute(&migrate {
-                channels: None,
-                detach: None,
-                resume: None,
-                uri: Some(uri.to_string()),
-            })
-            .map(|_| ())
-            .context("execute migration")
+        self.execute(&migrate {
+            channels: None,
+            detach: None,
+            resume: None,
+            uri: Some(uri.to_string()),
+        })
+        .map(|_| ())
+        .context("execute migration")
     }
 
     pub async fn execute_query_migrate(&mut self) -> Result<MigrationInfo> {
-        let migrate_info = self.qmp.execute(&qmp::query_migrate {})?;
+        let migrate_info = self.execute(&qmp::query_migrate {})?;
 
         Ok(migrate_info)
     }
 
     pub fn execute_migration_incoming(&mut self, uri: &str) -> Result<()> {
-        self.qmp
-            .execute(&migrate_incoming {
-                channels: None,
-                exit_on_error: None,
-                uri: Some(uri.to_string()),
-            })
-            .map(|_| ())
-            .context("execute migration incoming")
+        self.execute(&migrate_incoming {
+            channels: None,
+            exit_on_error: None,
+            uri: Some(uri.to_string()),
+        })
+        .map(|_| ())
+        .context("execute migration incoming")
     }
 
     pub fn hotplug_vcpus(&mut self, vcpu_cnt: u32) -> Result<u32> {
-        let hotpluggable_cpus = self.qmp.execute(&qmp::query_hotpluggable_cpus {})?;
+        let hotpluggable_cpus = self.execute(&qmp::query_hotpluggable_cpus {})?;
         //info!(sl!(), "hotpluggable CPUs: {:#?}", hotpluggable_cpus);
 
         let mut hotplugged = 0;
@@ -226,7 +281,7 @@ impl Qmp {
                     }
                 }
             }
-            self.qmp.execute(&qmp::device_add {
+            self.execute(&qmp::device_add {
                 bus: None,
                 id: Some(vcpu_id_from_core_id(core_id)),
                 driver: driver.clone(),
@@ -245,7 +300,7 @@ impl Qmp {
     }
 
     pub fn hotunplug_vcpus(&mut self, vcpu_cnt: u32) -> Result<u32> {
-        let hotpluggable_cpus = self.qmp.execute(&qmp::query_hotpluggable_cpus {})?;
+        let hotpluggable_cpus = self.execute(&qmp::query_hotpluggable_cpus {})?;
 
         let mut hotunplugged = 0;
         for vcpu in &hotpluggable_cpus {
@@ -260,7 +315,7 @@ impl Qmp {
                 info!(sl!(), "hotpluggable vcpu {} not hotplugged yet", core_id);
                 continue;
             }
-            self.qmp.execute(&qmp::device_del {
+            self.execute(&qmp::device_del {
                 id: vcpu_id_from_core_id(core_id),
             })?;
             hotunplugged += 1;
@@ -283,7 +338,7 @@ impl Qmp {
     }
 
     pub fn hotplugged_memory_size(&mut self) -> Result<u64> {
-        let memory_frontends = self.qmp.execute(&qapi_qmp::query_memory_devices {})?;
+        let memory_frontends = self.execute(&qapi_qmp::query_memory_devices {})?;
 
         let mut hotplugged_mem_size = 0_u64;
 
@@ -339,7 +394,7 @@ impl Qmp {
     /// Automatically detects if virtio-mem is available and uses it; otherwise falls back to pc-dimm.
     pub fn hotplug_memory(&mut self, size: u64) -> Result<()> {
         // Query existing memory devices to detect virtio-mem
-        let memory_devices = self.qmp.execute(&qapi_qmp::query_memory_devices {})?;
+        let memory_devices = self.execute(&qapi_qmp::query_memory_devices {})?;
 
         // Check if virtio-mem device exists
         let has_virtio_mem = memory_devices
@@ -432,13 +487,13 @@ impl Qmp {
                 rom: None,
             },
         });
-        self.qmp.execute(&memory_backend)?;
+        self.execute(&memory_backend)?;
 
         let memory_frontend_id = format!("frontend-to-{memory_backend_id}");
 
         let mut mem_frontend_args = Dictionary::new();
         mem_frontend_args.insert("memdev".to_owned(), memory_backend_id.into());
-        self.qmp.execute(&qmp::device_add {
+        self.execute(&qmp::device_add {
             bus: None,
             id: Some(memory_frontend_id),
             driver: "pc-dimm".to_owned(),
@@ -451,7 +506,7 @@ impl Qmp {
     /// Cleanup virtio-mem resources on setup failure
     fn cleanup_virtio_mem_setup(&mut self, device_id: &str) {
         // Remove memory backend object
-        let _ = self.qmp.execute(&qmp::object_del {
+        let _ = self.execute(&qmp::object_del {
             id: "virtiomem".to_owned(),
         });
 
@@ -567,8 +622,10 @@ impl Qmp {
         };
 
         // Execute backend creation with cleanup on error
-        if let Err(e) = self.qmp.execute(&memory_backend) {
-            self.cleanup_virtio_mem_setup(device_id);
+        if let Err(e) = self.execute(&memory_backend) {
+            if !is_transport_error(&e) {
+                self.cleanup_virtio_mem_setup(device_id);
+            }
             return if e.to_string().contains("Cannot allocate memory") {
                 Err(anyhow!("Failed to allocate {} MB for virtio-mem: {}. \
                             Please use command 'echo 1 > /proc/sys/vm/overcommit_memory' to handle it.",
@@ -583,13 +640,15 @@ impl Qmp {
         device_args.insert("memdev".to_owned(), "virtiomem".into());
         device_args.insert("devno".to_owned(), devno.into());
 
-        if let Err(e) = self.qmp.execute(&qmp::device_add {
+        if let Err(e) = self.execute(&qmp::device_add {
             bus: None,
             id: Some(device_id.to_owned()),
             driver: "virtio-mem-ccw".to_owned(),
             arguments: device_args,
         }) {
-            self.cleanup_virtio_mem_setup(device_id);
+            if !is_transport_error(&e) {
+                self.cleanup_virtio_mem_setup(device_id);
+            }
             return Err(anyhow!("Failed to add virtio-mem-ccw device: {}", e));
         }
 
@@ -625,7 +684,7 @@ impl Qmp {
         );
 
         // Use qom-set to change the requested-size property of virtiomem0
-        self.qmp.execute(&qmp::qom_set {
+        self.execute(&qmp::qom_set {
             path: "virtiomem0".to_owned(),
             property: "requested-size".to_owned(),
             value: serde_json::json!(size_bytes),
@@ -640,7 +699,7 @@ impl Qmp {
 
     pub fn hotunplug_memory(&mut self, size: i64) -> Result<()> {
         // Query existing memory devices to detect virtio-mem
-        let memory_devices = self.qmp.execute(&qapi_qmp::query_memory_devices {})?;
+        let memory_devices = self.execute(&qapi_qmp::query_memory_devices {})?;
 
         // Check if virtio-mem device exists
         let has_virtio_mem = memory_devices
@@ -741,8 +800,8 @@ impl Qmp {
                     }
                 };
 
-                self.qmp.execute(&qmp::device_del { id: frontend_id })?;
-                self.qmp.execute(&qmp::object_del { id: backend_id })?;
+                self.execute(&qmp::device_del { id: frontend_id })?;
+                self.execute(&qmp::object_del { id: backend_id })?;
             } else {
                 // This shouldn't happen as it was checked by find() above already.
                 return Err(anyhow!("memory device to hotunplug is not a dimm"));
@@ -782,7 +841,7 @@ impl Qmp {
 
         // Fallback: walk query-pci tree. Under OVMF, pcie-pci-bridge (pci-bridge-N)
         // is nested under rp-pci-bridge-N, not at the root of the PCI tree.
-        let pci = self.qmp.execute(&qapi_qmp::query_pci {})?;
+        let pci = self.execute(&qapi_qmp::query_pci {})?;
         for pci_info in &pci {
             if let Some((bus, slot)) = find_free_slot_in_pci_devices(&pci_info.devices) {
                 info!(
@@ -812,10 +871,13 @@ impl Qmp {
 
     fn pass_fd(&mut self, fd: RawFd, fdname: &str) -> Result<()> {
         info!(sl!(), "passing fd {:?} as {}", fd, fdname);
+        self.ensure_transport()
+            .context("prepare QMP transport for FD passing")?;
 
         // Put the QMP 'getfd' command itself into the message payload.
-        let getfd_cmd =
-            format!("{{ \"execute\": \"getfd\", \"arguments\": {{ \"fdname\": \"{fdname}\" }} }}");
+        let getfd_cmd = format!(
+            "{{ \"execute\": \"getfd\", \"arguments\": {{ \"fdname\": \"{fdname}\" }} }}\r\n"
+        );
         let buf = getfd_cmd.as_bytes();
         let bufs = &mut [std::io::IoSlice::new(buf)][..];
 
@@ -824,16 +886,48 @@ impl Qmp {
         let fds = [fd];
         let cmsg = [ControlMessage::ScmRights(&fds)];
 
-        let result = sendmsg::<()>(
+        let sent = match sendmsg::<()>(
             self.qmp.inner_mut().get_mut_write().as_raw_fd(),
             bufs,
             &cmsg,
             MsgFlags::empty(),
             None,
-        );
-        info!(sl!(), "sendmsg() result: {:#?}", result);
+        ) {
+            Ok(0) => {
+                self.recover_transport();
+                return Err(anyhow!(
+                    "failed to send QMP file descriptor {} ({}): zero-byte write",
+                    fdname,
+                    fd
+                ));
+            }
+            Ok(sent) => sent,
+            Err(error) => {
+                self.recover_transport();
+                return Err(anyhow!(
+                    "failed to send QMP file descriptor {} ({}): {}",
+                    fdname,
+                    fd,
+                    error
+                ));
+            }
+        };
+        if sent < buf.len() {
+            if let Err(error) = self.qmp.inner_mut().get_mut_write().write_all(&buf[sent..]) {
+                self.recover_transport();
+                return Err(anyhow!(
+                    "failed to finish QMP getfd command {} ({}): {}",
+                    fdname,
+                    fd,
+                    error
+                ));
+            }
+        }
 
         let result = self.qmp.read_response::<&qmp::getfd>();
+        if matches!(&result, Err(qapi::ExecuteError::Io(_))) {
+            self.recover_transport();
+        }
 
         match result {
             Ok(_) => {
@@ -909,61 +1003,64 @@ impl Qmp {
             vhostfd_names.push(vhostfdname);
         }
 
-        self.qmp
-            .execute(&qapi_qmp::netdev_add(qapi_qmp::Netdev::tap {
-                id: netdev_id.clone(),
-                tap: qapi_qmp::NetdevTapOptions {
-                    br: None,
-                    downscript: None,
-                    fd: None,
-                    // Logic in cmdline_generator::Netdev::new() seems to
-                    // guarantee that there will always be at least one fd.
-                    fds: Some(fd_names.join(",")),
-                    helper: None,
-                    ifname: None,
-                    poll_us: None,
-                    queues: None,
-                    script: None,
-                    sndbuf: None,
-                    vhost: if vhostfd_names.is_empty() {
-                        None
-                    } else {
-                        Some(true)
-                    },
-                    vhostfd: None,
-                    vhostfds: if vhostfd_names.is_empty() {
-                        None
-                    } else {
-                        Some(vhostfd_names.join(","))
-                    },
-                    vhostforce: None,
-                    vnet_hdr: None,
+        self.execute(&qapi_qmp::netdev_add(qapi_qmp::Netdev::tap {
+            id: netdev_id.clone(),
+            tap: qapi_qmp::NetdevTapOptions {
+                br: None,
+                downscript: None,
+                fd: None,
+                // Logic in cmdline_generator::Netdev::new() seems to
+                // guarantee that there will always be at least one fd.
+                fds: Some(fd_names.join(",")),
+                helper: None,
+                ifname: None,
+                poll_us: None,
+                queues: None,
+                script: None,
+                sndbuf: None,
+                vhost: if vhostfd_names.is_empty() {
+                    None
+                } else {
+                    Some(true)
                 },
-            }))
-            .map_err(|e| {
-                if use_ccw_bus {
-                    if let Some(subchannel) = self.ccw_subchannel.as_mut() {
-                        let _ = subchannel.remove_device(&frontend_id);
-                    }
-                }
-
-                anyhow!(e)
-            })?;
-
-        let device_add_result = self.qmp.execute(&qmp::device_add {
-            bus,
-            id: Some(frontend_id.clone()),
-            driver: virtio_net_device.get_device_driver().clone(),
-            arguments: netdev_frontend_args,
-        });
-        if let Err(e) = device_add_result {
+                vhostfd: None,
+                vhostfds: if vhostfd_names.is_empty() {
+                    None
+                } else {
+                    Some(vhostfd_names.join(","))
+                },
+                vhostforce: None,
+                vnet_hdr: None,
+            },
+        }))
+        .map_err(|e| {
             if use_ccw_bus {
                 if let Some(subchannel) = self.ccw_subchannel.as_mut() {
                     let _ = subchannel.remove_device(&frontend_id);
                 }
             }
 
-            if let Err(del_err) = self.qmp.execute(&qmp::netdev_del {
+            anyhow!(e)
+        })?;
+
+        let device_add_result = self.execute(&qmp::device_add {
+            bus,
+            id: Some(frontend_id.clone()),
+            driver: virtio_net_device.get_device_driver().clone(),
+            arguments: netdev_frontend_args,
+        });
+        if let Err(e) = device_add_result {
+            if is_transport_error(&e) {
+                return Err(e.into());
+            }
+
+            if use_ccw_bus {
+                if let Some(subchannel) = self.ccw_subchannel.as_mut() {
+                    let _ = subchannel.remove_device(&frontend_id);
+                }
+            }
+
+            if let Err(del_err) = self.execute(&qmp::netdev_del {
                 id: netdev_id.clone(),
             }) {
                 warn!(
@@ -999,7 +1096,7 @@ impl Qmp {
         };
 
         let mut path = vec![];
-        let pci = self.qmp.execute(&qapi_qmp::query_pci {})?;
+        let pci = self.execute(&qapi_qmp::query_pci {})?;
         for pci_info in pci.iter() {
             if let Some(_device) = get_pci_path_by_qdev_id(&pci_info.devices, qdev_id, &mut path) {
                 let pci_path = format_str(&path);
@@ -1019,13 +1116,17 @@ impl Qmp {
         driver: &str,
         arguments: Dictionary,
     ) -> Result<()> {
-        if let Err(e) = self.qmp.execute(&qmp::device_add {
+        if let Err(e) = self.execute(&qmp::device_add {
             bus,
             id: Some(node_name.to_owned()),
             driver: driver.to_owned(),
             arguments,
         }) {
-            if let Err(e) = self.qmp.execute(&qapi_qmp::blockdev_del {
+            if is_transport_error(&e) {
+                return Err(anyhow!("device_add {:?}", e));
+            }
+
+            if let Err(e) = self.execute(&qapi_qmp::blockdev_del {
                 node_name: node_name.to_owned(),
             }) {
                 warn!(
@@ -1048,8 +1149,12 @@ impl Qmp {
             .set_read_timeout(Some(timeout))?;
 
         let result = loop {
-            if let Err(e) = self.qmp.nop() {
-                warn!(sl!(), "The QMP nop() failed for {}: {:?}", device_id, e);
+            if let Err(e) = self.execute(&qmp::query_version {}) {
+                break Err(anyhow!(
+                    "QMP transport failed while waiting for DEVICE_DELETED for {}: {}; device state is uncertain",
+                    device_id,
+                    e
+                ));
             }
 
             let found = self.qmp.events().any(|event| {
@@ -1238,8 +1343,7 @@ impl Qmp {
             }
         };
 
-        self.qmp
-            .execute(&qapi_qmp::blockdev_add(blockdev_options))
+        self.execute(&qapi_qmp::blockdev_add(blockdev_options))
             .map_err(|e| anyhow!("blockdev-add backend {:?}", e))
             .map(|_| ())?;
 
@@ -1304,7 +1408,7 @@ impl Qmp {
             let subchannel = match self.ccw_subchannel.as_mut() {
                 Some(sub) => sub,
                 None => {
-                    self.qmp.execute(&qapi_qmp::blockdev_del {
+                    self.execute(&qapi_qmp::blockdev_del {
                         node_name: node_name.to_owned(),
                     })?;
 
@@ -1317,7 +1421,7 @@ impl Qmp {
             let slot = match subchannel.add_device(&node_name) {
                 Ok(s) => s,
                 Err(e) => {
-                    self.qmp.execute(&qapi_qmp::blockdev_del {
+                    self.execute(&qapi_qmp::blockdev_del {
                         node_name: node_name.to_owned(),
                     })?;
 
@@ -1404,27 +1508,27 @@ impl Qmp {
     /// Hotunplug block device.
     pub fn hotunplug_block_device(&mut self, block_driver: &str, index: u64) -> Result<()> {
         let node_name = block_node_name(index);
+        let mut frontend_deleted = false;
 
         let result = (|| -> Result<()> {
             // Remove the frontend device (virtio-blk-pci / scsi-hd / virtio-blk-ccw).
-            self.qmp
-                .execute(&qmp::device_del {
-                    id: node_name.clone(),
-                })
-                .map_err(|e| anyhow!("device_del for block device {}: {:?}", node_name, e))?;
+            self.execute(&qmp::device_del {
+                id: node_name.clone(),
+            })
+            .map_err(|e| anyhow!("device_del for block device {}: {:?}", node_name, e))?;
 
             // device_del is asynchronous — wait for the guest to acknowledge removal
             // before tearing down the backend, otherwise blockdev_del may fail with
             // "Node is still in use".
             self.wait_for_device_deleted(&node_name, DEVICE_DELETED_TIMEOUT)
                 .context("hotunplug_block_device(): waiting for DEVICE_DELETED")?;
+            frontend_deleted = true;
 
             // Remove the blockdev backend node.
-            self.qmp
-                .execute(&qapi_qmp::blockdev_del {
-                    node_name: node_name.clone(),
-                })
-                .map_err(|e| anyhow!("blockdev_del for block device {}: {:?}", node_name, e))?;
+            self.execute(&qapi_qmp::blockdev_del {
+                node_name: node_name.clone(),
+            })
+            .map_err(|e| anyhow!("blockdev_del for block device {}: {:?}", node_name, e))?;
 
             Ok(())
         })();
@@ -1438,8 +1542,10 @@ impl Qmp {
             );
         }
 
-        // Clean up CCW subchannel state (s390x) on all paths.
-        if block_driver == VIRTIO_BLK_CCW {
+        // Reuse a CCW subchannel only after frontend deletion was confirmed.
+        // On timeout the QEMU state is ambiguous, so retaining the allocation
+        // is the safe failure mode.
+        if block_driver == VIRTIO_BLK_CCW && frontend_deleted {
             if let Some(ref mut subchannel) = self.ccw_subchannel {
                 let _ = subchannel.remove_device(&node_name);
             }
@@ -1496,8 +1602,7 @@ impl Qmp {
         };
         info!(sl!(), "vfio_device_add: {:?}", vfio_device_add.clone());
 
-        self.qmp
-            .execute(&vfio_device_add)
+        self.execute(&vfio_device_add)
             .map_err(|e| anyhow!("device_add vfio device failed {:?}", e))?;
 
         // For AP devices, we don't need to get the PCI path as it's not available.
@@ -1513,15 +1618,13 @@ impl Qmp {
     }
 
     pub fn qmp_stop(&mut self) -> Result<()> {
-        self.qmp
-            .execute(&qmp::stop {})
+        self.execute(&qmp::stop {})
             .map(|_| ())
             .context("execute qmp stop")
     }
 
     pub fn qmp_cont(&mut self) -> Result<()> {
-        self.qmp
-            .execute(&qmp::cont {})
+        self.execute(&qmp::cont {})
             .map(|_| ())
             .context("execute qmp cont")
     }
@@ -1529,7 +1632,6 @@ impl Qmp {
     /// Get vCPU thread IDs through QMP query_cpus_fast.
     pub fn get_vcpu_thread_ids(&mut self) -> Result<VcpuThreadIds> {
         let vcpu_info = self
-            .qmp
             .execute(&qmp::query_cpus_fast {})
             .map_err(|e| anyhow!("query_cpus_fast failed: {:?}", e))?;
 
@@ -1593,6 +1695,35 @@ fn is_flat_cpu_topology(driver: &str) -> bool {
 
 const PCI_BRIDGE_MAX_CAPACITY: i64 = 30;
 const PCI_BRIDGE_FIRST_HOTPLUG_SLOT: i64 = 1;
+
+fn collect_pci_bridge_devices(pci: &[qapi_qmp::PciInfo]) -> HashMap<String, HashMap<i64, String>> {
+    fn collect(devices: &[PciDeviceInfo], bridges: &mut HashMap<String, HashMap<i64, String>>) {
+        for device in devices {
+            if let Some(bridge) = &device.pci_bridge {
+                if let Some(children) = &bridge.devices {
+                    if device.qdev_id.starts_with("pci-bridge-") {
+                        bridges.insert(
+                            device.qdev_id.clone(),
+                            children
+                                .iter()
+                                .map(|child| (child.slot, child.qdev_id.clone()))
+                                .collect(),
+                        );
+                    }
+                    collect(children, bridges);
+                } else if device.qdev_id.starts_with("pci-bridge-") {
+                    bridges.insert(device.qdev_id.clone(), HashMap::new());
+                }
+            }
+        }
+    }
+
+    let mut bridges = HashMap::new();
+    for bus in pci {
+        collect(&bus.devices, &mut bridges);
+    }
+    bridges
+}
 
 fn free_slot_on_pci_bridge(pci_dev: &PciDeviceInfo) -> Option<i64> {
     if !pci_dev.qdev_id.starts_with("pci-bridge-") {
@@ -1663,6 +1794,33 @@ pub fn get_qmp_socket_path(sid: &str) -> String {
 /// Generate a blockdev node name based on the given index.
 fn block_node_name(index: u64) -> String {
     format!("drive-{index}")
+}
+
+fn initialize_qmp_stream(
+    stream: UnixStream,
+    overall_timeout: Duration,
+) -> Result<(QmpClient, qapi_qmp::QMP)> {
+    if overall_timeout.is_zero() {
+        return Err(anyhow!("invalid QMP timeout of 0"));
+    }
+
+    let deadline = Instant::now() + overall_timeout;
+    stream
+        .set_nonblocking(false)
+        .context("set qmp stream blocking")?;
+
+    let mut reader = BufReader::new(stream.try_clone().context("clone qmp stream")?);
+    let info = read_qmp_greeting(&mut reader, deadline).context("read QMP greeting")?;
+    negotiate_qmp_capabilities(&mut reader, &stream, deadline)
+        .context("enable QMP capabilities")?;
+
+    let mut qmp = qapi::Qmp::new(qapi::Stream::new(reader, stream));
+    qmp.inner_mut()
+        .get_mut_write()
+        .set_read_timeout(Some(Duration::from_millis(DEFAULT_QMP_READ_TIMEOUT)))
+        .context("set steady-state qmp read timeout")?;
+
+    Ok((qmp, info))
 }
 
 /// Read the QMP greeting while tolerating asynchronous events emitted before
@@ -1783,7 +1941,7 @@ fn negotiate_qmp_capabilities(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::{BufRead, BufReader, Write};
+    use std::io::{BufRead, BufReader, Read, Write};
     use std::os::unix::net::UnixListener;
     use std::path::PathBuf;
     use tempfile::tempdir;
@@ -1798,6 +1956,187 @@ mod tests {
         assert_ne!(first, second);
         assert_eq!(first.file_name().unwrap(), QMP_SOCKET_FILE);
         assert_eq!(second.file_name().unwrap(), QMP_SOCKET_FILE);
+    }
+
+    fn complete_mock_handshake(conn: &mut UnixStream) {
+        conn.write_all(
+            br#"{"QMP":{"version":{"qemu":{"major":8,"minor":2,"micro":2},"package":"mock"},"capabilities":[]}}"#,
+        )
+        .unwrap();
+        conn.write_all(b"\r\n").unwrap();
+
+        let mut command = String::new();
+        BufReader::new(conn.try_clone().unwrap())
+            .read_line(&mut command)
+            .unwrap();
+        assert!(command.contains("qmp_capabilities"), "{}", command);
+        conn.write_all(b"{\"return\":{}}\r\n").unwrap();
+    }
+
+    #[test]
+    fn transport_failure_reconnects_without_replaying_command() {
+        let temp_dir = tempdir().unwrap();
+        let socket_path = temp_dir.path().join(QMP_SOCKET_FILE);
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let client = UnixStream::connect(&socket_path).unwrap();
+
+        let server = thread::spawn(move || {
+            let mut commands = Vec::new();
+
+            let (mut first, _) = listener.accept().unwrap();
+            complete_mock_handshake(&mut first);
+            let mut command = String::new();
+            BufReader::new(first.try_clone().unwrap())
+                .read_line(&mut command)
+                .unwrap();
+            commands.push(command);
+            drop(first);
+
+            let (mut second, _) = listener.accept().unwrap();
+            complete_mock_handshake(&mut second);
+            let mut reader = BufReader::new(second.try_clone().unwrap());
+
+            let mut query_pci = String::new();
+            reader.read_line(&mut query_pci).unwrap();
+            commands.push(query_pci);
+            second
+                .write_all(
+                    br#"{"return":[{"bus":0,"devices":[{"bus":0,"slot":1,"function":0,"class_info":{"class":1536},"id":{"device":1,"vendor":1},"irq_pin":0,"qdev_id":"pci-bridge-0","pci_bridge":{"bus":{"number":0,"secondary":1,"subordinate":1,"io_range":{"base":0,"limit":0},"memory_range":{"base":0,"limit":0},"prefetchable_range":{"base":0,"limit":0}},"devices":[{"bus":1,"slot":5,"function":0,"class_info":{"class":256},"id":{"device":2,"vendor":2},"irq_pin":0,"qdev_id":"drive-1","regions":[]}]},"regions":[]}]}]}"#,
+                )
+                .unwrap();
+            second.write_all(b"\r\n").unwrap();
+
+            let mut query_cpus = String::new();
+            reader.read_line(&mut query_cpus).unwrap();
+            commands.push(query_cpus);
+            second.write_all(b"{\"return\":[]}\r\n").unwrap();
+
+            commands
+        });
+
+        let mut qmp = Qmp::from_stream(client, socket_path, Duration::from_secs(3)).unwrap();
+        qmp.qmp_stop()
+            .expect_err("failed command must return its original transport error");
+
+        assert!(!qmp.transport_poisoned);
+        assert_eq!(qmp.pci_bridge_devices["pci-bridge-0"][&5], "drive-1");
+        assert!(qmp.get_vcpu_thread_ids().unwrap().vcpus.is_empty());
+
+        let commands = server.join().unwrap();
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|command| command.contains("\"stop\""))
+                .count(),
+            1
+        );
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|command| command.contains("query-pci"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|command| command.contains("query-cpus-fast"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn failed_reconnect_keeps_transport_poisoned() {
+        let temp_dir = tempdir().unwrap();
+        let socket_path = temp_dir.path().join(QMP_SOCKET_FILE);
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let client = UnixStream::connect(&socket_path).unwrap();
+
+        let server = thread::spawn(move || {
+            let (mut conn, _) = listener.accept().unwrap();
+            complete_mock_handshake(&mut conn);
+            let mut command = String::new();
+            BufReader::new(conn.try_clone().unwrap())
+                .read_line(&mut command)
+                .unwrap();
+            assert!(command.contains("\"stop\""), "{}", command);
+        });
+
+        let mut qmp = Qmp::from_stream(client, socket_path, Duration::from_secs(3)).unwrap();
+        qmp.qmp_stop().expect_err("closed transport must fail");
+        server.join().unwrap();
+        assert!(qmp.transport_poisoned);
+
+        let error = qmp
+            .get_vcpu_thread_ids()
+            .expect_err("poisoned transport must reconnect before any new command");
+        assert!(
+            format!("{error:#}").contains("QMP transport is unavailable"),
+            "{:#}",
+            error
+        );
+        assert!(qmp.transport_poisoned);
+    }
+
+    #[test]
+    fn fd_passing_failure_reconnects_without_resending_fd() {
+        let temp_dir = tempdir().unwrap();
+        let socket_path = temp_dir.path().join(QMP_SOCKET_FILE);
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let client = UnixStream::connect(&socket_path).unwrap();
+
+        let server = thread::spawn(move || {
+            let (mut first, _) = listener.accept().unwrap();
+            complete_mock_handshake(&mut first);
+            let mut getfd = [0_u8; 256];
+            let getfd_len = first.read(&mut getfd).unwrap();
+            let getfd = String::from_utf8_lossy(&getfd[..getfd_len]).into_owned();
+            drop(first);
+
+            let (mut second, _) = listener.accept().unwrap();
+            complete_mock_handshake(&mut second);
+            let mut query_pci = String::new();
+            BufReader::new(second.try_clone().unwrap())
+                .read_line(&mut query_pci)
+                .unwrap();
+            assert!(query_pci.contains("query-pci"), "{}", query_pci);
+            second.write_all(b"{\"return\":[]}\r\n").unwrap();
+            second
+                .set_read_timeout(Some(Duration::from_millis(100)))
+                .unwrap();
+
+            let mut unexpected = [0_u8; 256];
+            let unexpected_len = match second.read(&mut unexpected) {
+                Ok(length) => length,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    0
+                }
+                Err(error) => panic!("unexpected read error: {}", error),
+            };
+            (
+                getfd,
+                String::from_utf8_lossy(&unexpected[..unexpected_len]).into_owned(),
+            )
+        });
+
+        let mut qmp = Qmp::from_stream(client, socket_path, Duration::from_secs(3)).unwrap();
+        let (fd, _peer) = UnixStream::pair().unwrap();
+        qmp.pass_fd(fd.as_raw_fd(), "network-fd")
+            .expect_err("ambiguous getfd must not be replayed");
+
+        let (first_command, reconnect_commands) = server.join().unwrap();
+        assert!(first_command.contains("\"getfd\""), "{}", first_command);
+        assert!(
+            !reconnect_commands.contains("\"getfd\""),
+            "{}",
+            reconnect_commands
+        );
     }
 
     fn mock_qmp_handshake(
@@ -1849,7 +2188,7 @@ mod tests {
             conn.write_all(b"{\"return\":{}}\r\n").unwrap();
         });
 
-        let qmp = Qmp::from_stream(client, Duration::from_secs(3))
+        let qmp = Qmp::from_stream(client, sock_path, Duration::from_secs(3))
             .expect("QMP handshake should complete on the early-dialed connection");
         drop(qmp);
         server.join().unwrap();
@@ -1894,7 +2233,8 @@ mod tests {
             conn
         });
 
-        let err = Qmp::from_stream(client, Duration::from_millis(150)).expect_err("must time out");
+        let err = Qmp::from_stream(client, sock_path, Duration::from_millis(150))
+            .expect_err("must time out");
         let err_msg = format!("{err:#}");
         assert!(
             err_msg.contains("timed out"),
@@ -1917,7 +2257,7 @@ mod tests {
         // the full startup deadline.
         drop(listener);
         let started = Instant::now();
-        Qmp::from_stream(client, Duration::from_secs(3))
+        Qmp::from_stream(client, sock_path, Duration::from_secs(3))
             .expect_err("closed listener must fail QMP startup");
         assert!(
             started.elapsed() < Duration::from_millis(500),

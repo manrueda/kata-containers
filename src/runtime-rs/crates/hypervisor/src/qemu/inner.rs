@@ -4,7 +4,7 @@
 //
 
 use super::cmdline_generator::{get_network_device, QemuCmdLine};
-use super::qmp::Qmp;
+use super::qmp::{get_qmp_socket_path, Qmp};
 use crate::device::pci_path::PciPath;
 use crate::device::topology::PCIePort;
 use crate::qemu::cmdline_generator::VfioDeviceConfig;
@@ -462,10 +462,12 @@ impl QemuInner {
         // Complete QMP startup on the connection established before QEMU was
         // spawned, matching the Go runtime's transport setup. Do not create
         // and abandon additional connections while QEMU is initializing.
-        let qmp_result =
-            tokio::task::spawn_blocking(move || Qmp::from_stream(early_qmp_conn, qmp_timeout))
-                .await
-                .context("join QMP startup task")?;
+        let qmp_socket_path = get_qmp_socket_path(&self.id).into();
+        let qmp_result = tokio::task::spawn_blocking(move || {
+            Qmp::from_stream(early_qmp_conn, qmp_socket_path, qmp_timeout)
+        })
+        .await
+        .context("join QMP startup task")?;
         match qmp_result {
             Ok(mut qmp) => {
                 if let Some(subchannel) = cmdline.take_ccw_subchannel() {
