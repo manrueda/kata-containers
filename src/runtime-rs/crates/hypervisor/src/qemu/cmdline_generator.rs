@@ -6,8 +6,8 @@
 use crate::device::topology::{TopologyPortDevice, DEFAULT_PCIE_ROOT_BUS};
 use crate::qemu::qmp::get_qmp_socket_path;
 use crate::utils::{
-    chown_to_parent, clear_cloexec, create_vhost_net_fds, open_named_tuntap, uses_native_ccw_bus,
-    SocketAddress,
+    chown_to_parent, clear_cloexec, create_dir_all_with_inherit_owner, create_vhost_net_fds,
+    open_named_tuntap, uses_native_ccw_bus, SocketAddress,
 };
 
 use crate::{kernel_param::KernelParams, Address, HypervisorConfig};
@@ -21,10 +21,11 @@ use serde::{Deserialize, Serialize};
 use serde_json;
 use std::collections::HashMap;
 use std::fmt::{Display, Write};
-use std::fs::{read_to_string, File};
+use std::fs::{read_to_string, remove_file, symlink_metadata, File};
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::PathBuf;
+use std::os::unix::prelude::FileTypeExt;
+use std::path::{Path, PathBuf};
 use std::str;
 use tokio;
 
@@ -1904,6 +1905,47 @@ pub struct QmpSocket {
     listener: Option<File>,
 }
 
+fn prepare_qmp_socket_path(sock_path: &Path) -> Result<()> {
+    let parent = sock_path
+        .parent()
+        .ok_or_else(|| anyhow!("QMP socket path has no parent: {}", sock_path.display()))?;
+    create_dir_all_with_inherit_owner(parent, 0o750)
+        .with_context(|| format!("create QMP socket directory {}", parent.display()))?;
+
+    match symlink_metadata(sock_path) {
+        Ok(metadata) if metadata.file_type().is_socket() => match UnixStream::connect(sock_path) {
+            Ok(_) => {
+                return Err(anyhow!(
+                    "refusing to replace active QMP socket {}",
+                    sock_path.display()
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => {
+                remove_file(sock_path)
+                    .with_context(|| format!("remove stale QMP socket {}", sock_path.display()))?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("probe QMP socket {}", sock_path.display()));
+            }
+        },
+        Ok(_) => {
+            return Err(anyhow!(
+                "refusing to replace non-socket QMP path {}",
+                sock_path.display()
+            ));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("inspect QMP socket path {}", sock_path.display()));
+        }
+    }
+
+    Ok(())
+}
+
 impl QmpSocket {
     /// Bind the QMP listening socket and perform an early client dial.
     ///
@@ -1912,12 +1954,24 @@ impl QmpSocket {
     /// accepts it. Callers must complete the handshake on *this* stream
     /// (see [`crate::qemu::qmp::Qmp::from_stream`]) instead of dialing again.
     fn new(sid: &str, proto: MonitorProtocol) -> Result<(Self, Option<UnixStream>)> {
+        Self::new_with_path(
+            PathBuf::from(get_qmp_socket_path(sid)),
+            proto,
+            is_rootless(),
+        )
+    }
+
+    fn new_with_path(
+        sock_path: PathBuf,
+        proto: MonitorProtocol,
+        chown_socket: bool,
+    ) -> Result<(Self, Option<UnixStream>)> {
         let qmp_socket = match proto {
             MonitorProtocol::Qmp | MonitorProtocol::QmpPretty => {
-                let sock_path = PathBuf::from(get_qmp_socket_path(sid));
+                prepare_qmp_socket_path(&sock_path)?;
                 let listener =
                     UnixListener::bind(&sock_path).context("unix listener bind failed.")?;
-                if is_rootless() {
+                if chown_socket {
                     chown_to_parent(sock_path.as_path()).context("chown qmp socket failed")?;
                 }
 
@@ -2847,11 +2901,34 @@ pub struct QemuCmdLine<'a> {
 
 impl<'a> QemuCmdLine<'a> {
     pub fn new(id: &str, config: &'a HypervisorConfig) -> Result<QemuCmdLine<'a>> {
+        Self::new_inner(id, config, None)
+    }
+
+    #[cfg(test)]
+    fn new_with_qmp_path(
+        id: &str,
+        config: &'a HypervisorConfig,
+        qmp_socket_path: PathBuf,
+        chown_socket: bool,
+    ) -> Result<QemuCmdLine<'a>> {
+        Self::new_inner(id, config, Some((qmp_socket_path, chown_socket)))
+    }
+
+    fn new_inner(
+        id: &str,
+        config: &'a HypervisorConfig,
+        qmp_socket_override: Option<(PathBuf, bool)>,
+    ) -> Result<QemuCmdLine<'a>> {
         let ccw_subchannel = match bus_type() {
             VirtioBusType::Ccw => Some(CcwSubChannel::new()),
             _ => None,
         };
-        let (qmp_socket, early_qmp_conn) = QmpSocket::new(id, MonitorProtocol::Qmp)?;
+        let (qmp_socket, early_qmp_conn) = match qmp_socket_override {
+            Some((path, chown_socket)) => {
+                QmpSocket::new_with_path(path, MonitorProtocol::Qmp, chown_socket)?
+            }
+            None => QmpSocket::new(id, MonitorProtocol::Qmp)?,
+        };
         let mut qemu_cmd_line = QemuCmdLine {
             id: id.to_string(),
             config,
@@ -3826,6 +3903,7 @@ mod tests {
     use super::*;
     use rstest::rstest;
     use serial_test::serial;
+    use tempfile::tempdir;
 
     fn contains_param(params: &[String], expected: &str) -> bool {
         params
@@ -3854,12 +3932,54 @@ mod tests {
     }
 
     async fn build_test_cmdline(id: &str, config: &HypervisorConfig) -> Vec<String> {
-        let _ = std::fs::remove_file(QMP_SOCKET_FILE);
-        let cmdline = QemuCmdLine::new(id, config).unwrap();
+        let temp_dir = tempdir().unwrap();
+        let qmp_socket_path = temp_dir.path().join(id).join(QMP_SOCKET_FILE);
+        let cmdline = QemuCmdLine::new_with_qmp_path(id, config, qmp_socket_path, false).unwrap();
         let params = cmdline.build().await.unwrap();
         drop(cmdline);
-        let _ = std::fs::remove_file(QMP_SOCKET_FILE);
         params
+    }
+
+    #[test]
+    fn prepare_qmp_socket_path_creates_parent_and_removes_stale_socket() {
+        let temp_dir = tempdir().unwrap();
+        let socket_path = temp_dir.path().join("sandbox").join(QMP_SOCKET_FILE);
+
+        prepare_qmp_socket_path(&socket_path).unwrap();
+        assert!(socket_path.parent().unwrap().is_dir());
+
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        drop(listener);
+        assert!(socket_path.exists());
+
+        prepare_qmp_socket_path(&socket_path).unwrap();
+        assert!(!socket_path.exists());
+    }
+
+    #[test]
+    fn prepare_qmp_socket_path_refuses_to_replace_non_socket() {
+        let temp_dir = tempdir().unwrap();
+        let socket_path = temp_dir.path().join(QMP_SOCKET_FILE);
+        std::fs::write(&socket_path, b"not a socket").unwrap();
+
+        let error = prepare_qmp_socket_path(&socket_path).expect_err("must preserve regular files");
+
+        assert!(error.to_string().contains("refusing to replace non-socket"));
+        assert_eq!(std::fs::read(&socket_path).unwrap(), b"not a socket");
+    }
+
+    #[test]
+    fn prepare_qmp_socket_path_refuses_to_replace_active_socket() {
+        let temp_dir = tempdir().unwrap();
+        let socket_path = temp_dir.path().join(QMP_SOCKET_FILE);
+        let listener = UnixListener::bind(&socket_path).unwrap();
+
+        let error =
+            prepare_qmp_socket_path(&socket_path).expect_err("must preserve active sockets");
+
+        assert!(error.to_string().contains("refusing to replace active"));
+        assert!(socket_path.exists());
+        drop(listener);
     }
 
     #[actix_rt::test]
@@ -3926,8 +4046,11 @@ mod tests {
         #[case] expected_param: &str,
     ) {
         let config = test_qemu_config(Some("none"), false);
-        let _ = std::fs::remove_file(QMP_SOCKET_FILE);
-        let mut cmdline = QemuCmdLine::new("block-read-only", &config).unwrap();
+        let temp_dir = tempdir().unwrap();
+        let qmp_socket_path = temp_dir.path().join(QMP_SOCKET_FILE);
+        let mut cmdline =
+            QemuCmdLine::new_with_qmp_path("block-read-only", &config, qmp_socket_path, false)
+                .unwrap();
         cmdline
             .add_block_device(
                 "blk0",
@@ -3949,7 +4072,6 @@ mod tests {
         assert!(!params.iter().any(|arg| arg.contains("auto-read-only=")));
 
         drop(cmdline);
-        let _ = std::fs::remove_file(QMP_SOCKET_FILE);
     }
 
     #[rstest]

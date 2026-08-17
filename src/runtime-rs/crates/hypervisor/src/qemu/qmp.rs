@@ -11,7 +11,6 @@ use crate::VcpuThreadIds;
 
 use anyhow::{anyhow, Context, Result};
 use kata_types::config::hypervisor::{VIRTIO_BLK_CCW, VIRTIO_SCSI};
-use kata_types::rootless::is_rootless;
 use nix::sys::socket::{sendmsg, ControlMessage, MsgFlags};
 use qapi_qmp::{
     self as qmp, BlockdevAioOptions, BlockdevDiscardOptions, BlockdevOptions, BlockdevOptionsBase,
@@ -1658,11 +1657,7 @@ pub fn get_pci_path_by_qdev_id(
 }
 
 pub fn get_qmp_socket_path(sid: &str) -> String {
-    if is_rootless() {
-        [get_jailer_root(sid).as_str(), QMP_SOCKET_FILE].join("/")
-    } else {
-        QMP_SOCKET_FILE.to_string()
-    }
+    [get_jailer_root(sid).as_str(), QMP_SOCKET_FILE].join("/")
 }
 
 /// Generate a blockdev node name based on the given index.
@@ -1790,7 +1785,20 @@ mod tests {
     use super::*;
     use std::io::{BufRead, BufReader, Write};
     use std::os::unix::net::UnixListener;
+    use std::path::PathBuf;
     use tempfile::tempdir;
+
+    #[test]
+    fn qmp_socket_paths_are_absolute_and_sandbox_scoped() {
+        let first = PathBuf::from(get_qmp_socket_path("sandbox-one"));
+        let second = PathBuf::from(get_qmp_socket_path("sandbox-two"));
+
+        assert!(first.is_absolute());
+        assert!(second.is_absolute());
+        assert_ne!(first, second);
+        assert_eq!(first.file_name().unwrap(), QMP_SOCKET_FILE);
+        assert_eq!(second.file_name().unwrap(), QMP_SOCKET_FILE);
+    }
 
     fn mock_qmp_handshake(
         greeting_delay: Duration,
