@@ -22,8 +22,8 @@ use serde_json;
 use std::collections::HashMap;
 use std::fmt::{Display, Write};
 use std::fs::{read_to_string, File};
-use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd};
-use std::os::unix::net::UnixListener;
+use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::str;
 use tokio;
@@ -1885,7 +1885,7 @@ impl std::fmt::Display for MonitorProtocol {
 
 #[derive(Debug)]
 enum QmpSockType {
-    Fd(File),
+    Fd(RawFd),
     Path(PathBuf),
 }
 
@@ -1899,10 +1899,19 @@ pub struct QmpSocket {
     server: bool,
     // nowait tells if qemu should block waiting for a client to connect.
     nowait: bool,
+    // Runtime-owned listener. Drop this after QEMU has inherited the FD so an
+    // early QEMU exit resets the pending client connection immediately.
+    listener: Option<File>,
 }
 
 impl QmpSocket {
-    fn new(sid: &str, proto: MonitorProtocol) -> Result<Self> {
+    /// Bind the QMP listening socket and perform an early client dial.
+    ///
+    /// The returned [`UnixStream`] is the single QMP client connection that
+    /// will sit in the accept backlog until QEMU inherits the listener FD and
+    /// accepts it. Callers must complete the handshake on *this* stream
+    /// (see [`crate::qemu::qmp::Qmp::from_stream`]) instead of dialing again.
+    fn new(sid: &str, proto: MonitorProtocol) -> Result<(Self, Option<UnixStream>)> {
         let qmp_socket = match proto {
             MonitorProtocol::Qmp | MonitorProtocol::QmpPretty => {
                 let sock_path = PathBuf::from(get_qmp_socket_path(sid));
@@ -1911,29 +1920,47 @@ impl QmpSocket {
                 if is_rootless() {
                     chown_to_parent(sock_path.as_path()).context("chown qmp socket failed")?;
                 }
+
+                // Dial once before QEMU starts (Go setupEarlyQmpConnection).
+                let early_conn = UnixStream::connect(&sock_path).with_context(|| {
+                    format!("early QMP dial failed for {}", sock_path.display())
+                })?;
+
                 let raw_fd = listener.into_raw_fd();
                 clear_cloexec(raw_fd).context("clearing unix listenser O_CLOEXEC failed")?;
                 let sock_file = unsafe { File::from_raw_fd(raw_fd) };
                 // The default QMP socket or called base socket is qmp.sock.
-                QmpSocket {
-                    protocol: MonitorProtocol::new("qmp"),
-                    address: QmpSockType::Fd(sock_file),
-                    server: true,
-                    nowait: true,
-                }
+                (
+                    QmpSocket {
+                        protocol: MonitorProtocol::new("qmp"),
+                        address: QmpSockType::Fd(raw_fd),
+                        server: true,
+                        nowait: true,
+                        listener: Some(sock_file),
+                    },
+                    Some(early_conn),
+                )
             }
             MonitorProtocol::Hmp => {
                 // If extra monitor needed, HMP socket with qmp-extra.sock will be added.
-                QmpSocket {
-                    protocol: MonitorProtocol::new("hmp"),
-                    address: QmpSockType::Path(PathBuf::from(DEBUG_MONITOR_SOCKET)),
-                    server: true,
-                    nowait: true,
-                }
+                (
+                    QmpSocket {
+                        protocol: MonitorProtocol::new("hmp"),
+                        address: QmpSockType::Path(PathBuf::from(DEBUG_MONITOR_SOCKET)),
+                        server: true,
+                        nowait: true,
+                        listener: None,
+                    },
+                    None,
+                )
             }
         };
 
         Ok(qmp_socket)
+    }
+
+    fn close_listener(&mut self) {
+        self.listener.take();
     }
 }
 
@@ -1946,7 +1973,7 @@ impl ToQemuParams for QmpSocket {
 
         match &self.address {
             // -qmp unix:fd=SOCK_FD,server=on,wait=off
-            QmpSockType::Fd(f) => params.push(format!("unix:fd={}", f.as_raw_fd())),
+            QmpSockType::Fd(fd) => params.push(format!("unix:fd={fd}")),
             // -monitor unix:path=SOCK_PATH,server=on,wait=off
             QmpSockType::Path(p) => params.push(format!("unix:path={}", p.display())),
         }
@@ -2812,6 +2839,10 @@ pub struct QemuCmdLine<'a> {
 
     devices: Vec<Box<dyn ToQemuParams>>,
     ccw_subchannel: Option<CcwSubChannel>,
+
+    /// Early-dialed QMP client connection. Created with the listener so the
+    /// handshake can complete on a single connection after QEMU accepts it.
+    early_qmp_conn: Option<UnixStream>,
 }
 
 impl<'a> QemuCmdLine<'a> {
@@ -2820,6 +2851,7 @@ impl<'a> QemuCmdLine<'a> {
             VirtioBusType::Ccw => Some(CcwSubChannel::new()),
             _ => None,
         };
+        let (qmp_socket, early_qmp_conn) = QmpSocket::new(id, MonitorProtocol::Qmp)?;
         let mut qemu_cmd_line = QemuCmdLine {
             id: id.to_string(),
             config,
@@ -2828,11 +2860,12 @@ impl<'a> QemuCmdLine<'a> {
             smp: Smp::new(config),
             machine: Machine::new(config),
             cpu: Cpu::new(config),
-            qmp_socket: QmpSocket::new(id, MonitorProtocol::Qmp)?,
+            qmp_socket,
             knobs: Knobs::new(config),
             bios: None,
             devices: Vec::new(),
             ccw_subchannel,
+            early_qmp_conn,
         };
 
         // add_virtiofs_share() installs the file-backed memory backend when
@@ -2910,8 +2943,18 @@ impl<'a> QemuCmdLine<'a> {
         self.ccw_subchannel.take()
     }
 
+    /// Takes the early-dialed QMP client connection created with the listener.
+    pub(crate) fn take_early_qmp_conn(&mut self) -> Option<UnixStream> {
+        self.early_qmp_conn.take()
+    }
+
+    /// Close the runtime's copy after QEMU inherits the listener FD.
+    pub(crate) fn close_qmp_listener(&mut self) {
+        self.qmp_socket.close_listener();
+    }
+
     fn add_monitor(&mut self, proto: &str) -> Result<()> {
-        let monitor = QmpSocket::new(self.id.as_str(), MonitorProtocol::new(proto))?;
+        let (monitor, _) = QmpSocket::new(self.id.as_str(), MonitorProtocol::new(proto))?;
         self.devices.push(Box::new(monitor));
 
         Ok(())

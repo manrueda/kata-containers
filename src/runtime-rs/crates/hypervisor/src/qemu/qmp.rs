@@ -23,7 +23,7 @@ use qapi_qmp::{MigrationCapability, MigrationCapabilityStatus};
 use std::collections::HashMap;
 use std::convert::TryFrom;
 use std::fmt::{Debug, Error, Formatter};
-use std::io::BufReader;
+use std::io::{BufRead, BufReader, Write};
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::str::FromStr;
@@ -33,11 +33,15 @@ use qapi_spec::Dictionary;
 use std::thread;
 use std::time::Instant;
 
-/// default qmp connection read timeout
-const DEFAULT_QMP_READ_TIMEOUT: u64 = 250;
-const DEFAULT_QMP_INIT_READ_TIMEOUT: u64 = 5000;
-const DEFAULT_QMP_CONNECT_DEADLINE_MS: u64 = 50000;
-const DEFAULT_QMP_RETRY_SLEEP_MS: u64 = 50;
+/// QMP read timeout (milliseconds).
+///
+/// Historically this was 250ms and was re-applied after VFIO / DEVICE_DELETED
+/// paths. Under concurrent boot pressure that short timeout surfaces as
+/// `EAGAIN` / "Resource temporarily unavailable"; reusing the stream after a
+/// partial read can then lose qapi framing.
+const DEFAULT_QMP_READ_TIMEOUT: u64 = 5000;
+/// Default overall deadline for QMP bring-up when the caller does not pass one.
+pub const DEFAULT_QMP_CONNECT_DEADLINE_MS: u64 = 50000;
 
 const DEVICE_DELETED_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -76,46 +80,45 @@ impl Debug for Qmp {
 }
 
 impl Qmp {
-    pub fn new(qmp_sock_path: &str) -> Result<Self> {
-        let try_new_once_fn = || -> Result<Qmp> {
-            let stream = UnixStream::connect(qmp_sock_path)?;
-
-            stream
-                .set_read_timeout(Some(Duration::from_millis(DEFAULT_QMP_INIT_READ_TIMEOUT)))
-                .context("set qmp read timeout")?;
-
-            let mut qmp = Qmp {
-                qmp: qapi::Qmp::new(qapi::Stream::new(
-                    BufReader::new(stream.try_clone()?),
-                    stream,
-                )),
-                guest_memory_block_size: 0,
-                ccw_subchannel: None,
-                pci_bridge_devices: HashMap::new(),
-            };
-
-            let info = qmp.qmp.handshake().context("qmp handshake failed")?;
-            info!(sl!(), "QMP initialized: {:#?}", info);
-
-            Ok(qmp)
-        };
-
-        let deadline = Instant::now() + Duration::from_millis(DEFAULT_QMP_CONNECT_DEADLINE_MS);
-        let mut last_err: Option<anyhow::Error> = None;
-
-        while Instant::now() < deadline {
-            match try_new_once_fn() {
-                Ok(qmp) => return Ok(qmp),
-                Err(e) => {
-                    debug!(sl!(), "QMP not ready yet: {}", e);
-                    last_err = Some(e);
-                    thread::sleep(Duration::from_millis(DEFAULT_QMP_RETRY_SLEEP_MS));
-                }
-            }
+    /// Complete QMP bring-up on an already-dialed stream.
+    ///
+    /// Mirrors the transport setup used by the Go runtime's
+    /// `setupEarlyQmpConnection`: dial once against the runtime-owned listener
+    /// before QEMU is spawned, then complete startup on that same connection.
+    /// This avoids creating and abandoning additional connections while QEMU
+    /// is still initializing.
+    pub fn from_stream(stream: UnixStream, overall_timeout: Duration) -> Result<Self> {
+        if overall_timeout.is_zero() {
+            return Err(anyhow!("invalid QMP timeout of 0"));
         }
 
-        Err(last_err.unwrap_or_else(|| anyhow!("QMP init timed out")))
-            .with_context(|| format!("timed out waiting for QMP ready: {}", qmp_sock_path))
+        let deadline = Instant::now() + overall_timeout;
+        stream
+            .set_nonblocking(false)
+            .context("set qmp stream blocking")?;
+
+        let mut reader = BufReader::new(stream.try_clone().context("clone qmp stream")?);
+        let info = read_qmp_greeting(&mut reader, deadline).context("read QMP greeting")?;
+        negotiate_qmp_capabilities(&mut reader, &stream, deadline)
+            .context("enable QMP capabilities")?;
+
+        let mut qmp = Qmp {
+            qmp: qapi::Qmp::new(qapi::Stream::new(reader, stream)),
+            guest_memory_block_size: 0,
+            ccw_subchannel: None,
+            pci_bridge_devices: HashMap::new(),
+        };
+
+        info!(sl!(), "QMP initialized: {:#?}", info);
+
+        // Establish a sane steady-state timeout immediately after handshake.
+        qmp.qmp
+            .inner_mut()
+            .get_mut_write()
+            .set_read_timeout(Some(Duration::from_millis(DEFAULT_QMP_READ_TIMEOUT)))
+            .context("set steady-state qmp read timeout")?;
+
+        Ok(qmp)
     }
 
     pub fn set_ccw_subchannel(&mut self, subchannel: CcwSubChannel) {
@@ -1494,33 +1497,9 @@ impl Qmp {
         };
         info!(sl!(), "vfio_device_add: {:?}", vfio_device_add.clone());
 
-        // We've chosen to set a 5-second read timeout on Unix sockets for QMP operations. We consider set_read_timeout()
-        // a lightweight operation that shouldn't significantly impact performance, even with multiple VFIO devices.
-        // However, we also need to ensure its debuggability.
-        // As it could obscure the root cause of connection failures as set an excessively long QMP timeout.
-        // For example, if QEMU fails to launch, a 5-second QMP timeout will immediately provide a "QMP connection failed" log message,
-        // clearly pinpointing the issue. Conversely, a prolonged timeout might only result in vague error messages, making debugging
-        // difficult as it won't explicitly indicate where the problem lies.
-
-        // Given our current inability to comprehensively test across a wide range of hardware and configurations, we've made a pragmatic
-        // decision: we'll maintain the 5-second timeout for now. A configurable timeout option will be introduced if future use cases
-        // clearly demonstrate a justified need.
-        {
-            // set read timeout with 5000
-            self.qmp
-                .inner_mut()
-                .get_mut_write()
-                .set_read_timeout(Some(Duration::from_millis(5000)))?;
-            // send the VFIO hotplug request
-            self.qmp
-                .execute(&vfio_device_add)
-                .map_err(|e| anyhow!("device_add vfio device failed {:?}", e))?;
-            // reset read timeout with 250
-            self.qmp
-                .inner_mut()
-                .get_mut_write()
-                .set_read_timeout(Some(Duration::from_millis(DEFAULT_QMP_READ_TIMEOUT)))?;
-        }
+        self.qmp
+            .execute(&vfio_device_add)
+            .map_err(|e| anyhow!("device_add vfio device failed {:?}", e))?;
 
         // For AP devices, we don't need to get the PCI path as it's not available.
         if let Some(result) = early_return {
@@ -1689,4 +1668,276 @@ pub fn get_qmp_socket_path(sid: &str) -> String {
 /// Generate a blockdev node name based on the given index.
 fn block_node_name(index: u64) -> String {
     format!("drive-{index}")
+}
+
+/// Read the QMP greeting while tolerating asynchronous events emitted before
+/// it. QEMU can emit events such as `RESUME` before the greeting when the
+/// client is connected to the inherited listener before QEMU starts.
+fn read_qmp_greeting(
+    reader: &mut BufReader<UnixStream>,
+    deadline: Instant,
+) -> Result<qapi_qmp::QMP> {
+    let mut line = Vec::new();
+    loop {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .ok_or_else(|| anyhow!("timed out waiting for QMP greeting"))?;
+        reader
+            .get_mut()
+            .set_read_timeout(Some(
+                remaining.min(Duration::from_millis(DEFAULT_QMP_READ_TIMEOUT)),
+            ))
+            .context("set QMP greeting read timeout")?;
+
+        match reader.read_until(b'\n', &mut line) {
+            Ok(0) => return Err(anyhow!("QMP peer closed before sending a greeting")),
+            Ok(_) => {}
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                continue;
+            }
+            Err(e) => return Err(e).context("read QMP greeting line"),
+        }
+
+        let value: serde_json::Value =
+            serde_json::from_slice(&line).context("parse QMP greeting line")?;
+        if value.get("QMP").is_some() {
+            let capabilities: qapi_qmp::QapiCapabilities =
+                serde_json::from_value(value).context("decode QMP greeting")?;
+            return Ok(capabilities.QMP);
+        }
+
+        if let Some(event) = value.get("event") {
+            debug!(
+                sl!(),
+                "ignoring QMP event before greeting: {}",
+                event.as_str().unwrap_or("unknown")
+            );
+            line.clear();
+            continue;
+        }
+
+        return Err(anyhow!("unexpected message before QMP greeting: {}", value));
+    }
+}
+
+/// Enable QMP capabilities while tolerating startup events and a repeated
+/// greeting. These messages have been observed with an early client under
+/// concurrent QEMU startup and are not accepted by `qapi::Qmp::handshake()`.
+fn negotiate_qmp_capabilities(
+    reader: &mut BufReader<UnixStream>,
+    mut writer: &UnixStream,
+    deadline: Instant,
+) -> Result<()> {
+    writer
+        .write_all(b"{\"execute\":\"qmp_capabilities\"}\n")
+        .context("write qmp_capabilities command")?;
+    writer.flush().context("flush qmp_capabilities command")?;
+
+    let mut line = Vec::new();
+    loop {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .ok_or_else(|| anyhow!("QMP init timed out during capabilities negotiation"))?;
+        reader
+            .get_mut()
+            .set_read_timeout(Some(
+                remaining.min(Duration::from_millis(DEFAULT_QMP_READ_TIMEOUT)),
+            ))
+            .context("set QMP capabilities read timeout")?;
+
+        match reader.read_until(b'\n', &mut line) {
+            Ok(0) => return Err(anyhow!("QMP peer closed during capabilities negotiation")),
+            Ok(_) => {}
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                continue;
+            }
+            Err(e) => return Err(e).context("read qmp_capabilities response"),
+        }
+
+        let value: serde_json::Value =
+            serde_json::from_slice(&line).context("parse qmp_capabilities response")?;
+        if value.get("return").is_some() {
+            return Ok(());
+        }
+        if let Some(error) = value.get("error") {
+            return Err(anyhow!("qmp_capabilities failed: {}", error));
+        }
+        if value.get("event").is_some() || value.get("QMP").is_some() {
+            debug!(
+                sl!(),
+                "ignoring asynchronous QMP startup message: {}", value
+            );
+            line.clear();
+            continue;
+        }
+
+        return Err(anyhow!("unexpected qmp_capabilities response: {}", value));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixListener;
+    use tempfile::tempdir;
+
+    fn mock_qmp_handshake(
+        greeting_delay: Duration,
+        fragment_delay: Option<Duration>,
+        event_before_greeting: bool,
+        repeat_greeting_before_response: bool,
+    ) {
+        let temp_dir = tempdir().unwrap();
+        let sock_path = temp_dir.path().join("qmp.sock");
+        let listener = UnixListener::bind(&sock_path).unwrap();
+        let client = UnixStream::connect(&sock_path).unwrap();
+
+        let server = thread::spawn(move || {
+            let (mut conn, _) = listener.accept().unwrap();
+            thread::sleep(greeting_delay);
+
+            if event_before_greeting {
+                conn.write_all(br#"{"timestamp":{"seconds":1,"microseconds":0},"event":"RESUME"}"#)
+                    .unwrap();
+                conn.write_all(b"\r\n").unwrap();
+            }
+
+            let greeting = br#"{"QMP":{"version":{"qemu":{"major":8,"minor":2,"micro":2},"package":"mock"},"capabilities":[]}}"#;
+            if let Some(delay) = fragment_delay {
+                for chunk in greeting.chunks(7) {
+                    conn.write_all(chunk).unwrap();
+                    thread::sleep(delay);
+                }
+                conn.write_all(b"\r\n").unwrap();
+            } else {
+                conn.write_all(greeting).unwrap();
+                conn.write_all(b"\r\n").unwrap();
+            }
+
+            let mut command = String::new();
+            BufReader::new(conn.try_clone().unwrap())
+                .read_line(&mut command)
+                .unwrap();
+            assert!(
+                command.contains("qmp_capabilities"),
+                "unexpected QMP command: {}",
+                command
+            );
+            if repeat_greeting_before_response {
+                conn.write_all(greeting).unwrap();
+                conn.write_all(b"\r\n").unwrap();
+            }
+            conn.write_all(b"{\"return\":{}}\r\n").unwrap();
+        });
+
+        let qmp = Qmp::from_stream(client, Duration::from_secs(3))
+            .expect("QMP handshake should complete on the early-dialed connection");
+        drop(qmp);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn early_dial_completes_delayed_qmp_handshake() {
+        mock_qmp_handshake(Duration::from_millis(200), None, false, false);
+    }
+
+    #[test]
+    fn early_dial_completes_fragmented_qmp_handshake() {
+        mock_qmp_handshake(
+            Duration::from_millis(50),
+            Some(Duration::from_millis(10)),
+            false,
+            false,
+        );
+    }
+
+    #[test]
+    fn early_dial_accepts_event_before_qmp_greeting() {
+        mock_qmp_handshake(Duration::from_millis(50), None, true, false);
+    }
+
+    #[test]
+    fn early_dial_accepts_repeated_greeting_during_negotiation() {
+        mock_qmp_handshake(Duration::from_millis(50), None, false, true);
+    }
+
+    #[test]
+    fn early_dial_times_out_when_no_greeting() {
+        let temp_dir = tempdir().unwrap();
+        let sock_path = temp_dir.path().join("qmp.sock");
+        let listener = UnixListener::bind(&sock_path).unwrap();
+        let client = UnixStream::connect(&sock_path).unwrap();
+
+        // Accept but never write a greeting.
+        let server = thread::spawn(move || {
+            let (conn, _) = listener.accept().unwrap();
+            thread::sleep(Duration::from_millis(500));
+            conn
+        });
+
+        let err = Qmp::from_stream(client, Duration::from_millis(150)).expect_err("must time out");
+        let err_msg = format!("{err:#}");
+        assert!(
+            err_msg.contains("timed out"),
+            "unexpected error: {}",
+            err_msg
+        );
+
+        drop(server.join().unwrap());
+    }
+
+    #[test]
+    fn early_dial_fails_fast_when_listener_disappears() {
+        let temp_dir = tempdir().unwrap();
+        let sock_path = temp_dir.path().join("qmp.sock");
+        let listener = UnixListener::bind(&sock_path).unwrap();
+        let client = UnixStream::connect(&sock_path).unwrap();
+
+        // Model QEMU exiting before accept after the runtime has closed its
+        // listener copy. The queued client must be reset without waiting for
+        // the full startup deadline.
+        drop(listener);
+        let started = Instant::now();
+        Qmp::from_stream(client, Duration::from_secs(3))
+            .expect_err("closed listener must fail QMP startup");
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "listener closure was not detected promptly"
+        );
+    }
+
+    #[test]
+    fn early_dial_survives_concurrent_handshakes() {
+        const CONNECTIONS: usize = 64;
+
+        let clients: Vec<_> = (0..CONNECTIONS)
+            .map(|index| {
+                thread::spawn(move || {
+                    let greeting_delay = Duration::from_millis((index % 8) as u64 * 5);
+                    let fragment_delay = (index % 3 == 0).then_some(Duration::from_millis(1));
+                    mock_qmp_handshake(
+                        greeting_delay,
+                        fragment_delay,
+                        index % 4 == 0,
+                        index % 7 == 0,
+                    );
+                })
+            })
+            .collect();
+
+        for client in clients {
+            client.join().unwrap();
+        }
+    }
 }

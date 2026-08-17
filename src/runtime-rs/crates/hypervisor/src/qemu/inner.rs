@@ -8,7 +8,7 @@ use super::qmp::Qmp;
 use crate::device::pci_path::PciPath;
 use crate::device::topology::PCIePort;
 use crate::qemu::cmdline_generator::VfioDeviceConfig;
-use crate::qemu::qmp::get_qmp_socket_path;
+use crate::qemu::qmp::DEFAULT_QMP_CONNECT_DEADLINE_MS;
 use crate::{
     device::driver::ProtectionDeviceConfig, hypervisor_persist::HypervisorState, selinux,
     HypervisorConfig, MemoryConfig, VcpuThreadIds, VsockDevice, HYPERVISOR_QEMU, KATA_BLK_DEV_TYPE,
@@ -53,6 +53,20 @@ use tokio::{
 };
 
 const VSOCK_SCHEME: &str = "vsock";
+
+fn qmp_startup_timeout(timeout_ms: i32) -> Result<Duration> {
+    if timeout_ms < 0 {
+        return Err(anyhow!("invalid QMP startup timeout: {timeout_ms}"));
+    }
+
+    // Preserve the historical 50-second QMP budget. The shared Hypervisor
+    // trait has inconsistent timeout units today, while the runtime-rs caller
+    // passes 10_000 and Dragonball interprets that value as milliseconds.
+    let requested_ms = timeout_ms as u64;
+    Ok(Duration::from_millis(
+        requested_ms.max(DEFAULT_QMP_CONNECT_DEADLINE_MS),
+    ))
+}
 
 #[derive(Debug)]
 pub struct QemuInner {
@@ -107,9 +121,11 @@ impl QemuInner {
         Ok(())
     }
 
-    pub(crate) async fn start_vm(&mut self, _timeout: i32) -> Result<()> {
+    pub(crate) async fn start_vm(&mut self, timeout: i32) -> Result<()> {
         info!(sl!(), "Starting QEMU VM");
         let netns = self.netns.clone().unwrap_or_default();
+
+        let qmp_timeout = qmp_startup_timeout(timeout)?;
 
         // Create the runtime directory (side-effect of get_jailer_root) before
         // QemuCmdLine::new() binds qmp.sock inside it. With shared_fs=none,
@@ -424,6 +440,10 @@ impl QemuInner {
 
         let mut qemu_process = command.stderr(Stdio::piped()).spawn()?;
         let stderr = qemu_process.stderr.take().unwrap();
+        // QEMU has inherited the listener FD. Closing the runtime's copy means
+        // an early QEMU exit resets the queued client instead of leaving the
+        // startup wait blocked until its deadline.
+        cmdline.close_qmp_listener();
         self.qemu_process = Mutex::new(Some(qemu_process));
 
         info!(sl!(), "qemu process started");
@@ -435,9 +455,18 @@ impl QemuInner {
 
         tokio::spawn(log_qemu_stderr(stderr, exit_notify));
 
-        let qmp_socket_path = get_qmp_socket_path(self.id.as_str());
+        let early_qmp_conn = cmdline
+            .take_early_qmp_conn()
+            .ok_or_else(|| anyhow!("missing early QMP connection"))?;
 
-        match Qmp::new(&qmp_socket_path) {
+        // Complete QMP startup on the connection established before QEMU was
+        // spawned, matching the Go runtime's transport setup. Do not create
+        // and abandon additional connections while QEMU is initializing.
+        let qmp_result =
+            tokio::task::spawn_blocking(move || Qmp::from_stream(early_qmp_conn, qmp_timeout))
+                .await
+                .context("join QMP startup task")?;
+        match qmp_result {
             Ok(mut qmp) => {
                 if let Some(subchannel) = cmdline.take_ccw_subchannel() {
                     qmp.set_ccw_subchannel(subchannel);
@@ -1428,6 +1457,23 @@ mod tests {
 
     use super::*;
     use rstest::rstest;
+
+    #[test]
+    fn test_qmp_startup_timeout_preserves_compatibility_floor() {
+        assert!(qmp_startup_timeout(-1).is_err());
+        assert_eq!(
+            qmp_startup_timeout(0).unwrap(),
+            Duration::from_millis(DEFAULT_QMP_CONNECT_DEADLINE_MS)
+        );
+        assert_eq!(
+            qmp_startup_timeout(10_000).unwrap(),
+            Duration::from_millis(DEFAULT_QMP_CONNECT_DEADLINE_MS)
+        );
+        assert_eq!(
+            qmp_startup_timeout(60_000).unwrap(),
+            Duration::from_secs(60)
+        );
+    }
 
     #[tokio::test]
     async fn test_network_device_hotplug_capability() {
