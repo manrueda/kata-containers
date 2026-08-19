@@ -1517,7 +1517,7 @@ fn generate_installation_prefix_drop_in(
     shim: &str,
     config_d_dir: &Path,
 ) -> Result<String> {
-    if matches!(shim, "qemu-runtime-rs" | "qemu" | "clh-runtime-rs") {
+    if matches!(shim, "qemu-runtime-rs" | "qemu" | "clh-runtime-rs" | "clh") {
         let base_config = config_d_dir
             .parent()
             .ok_or_else(|| anyhow::anyhow!("config.d has no parent: {}", config_d_dir.display()))?
@@ -2339,6 +2339,62 @@ valid_virtio_fs_daemon_paths = ["/opt/kata/libexec/virtiofsd"]
                 format!("{dest}/share/aavmf/AAVMF_CODE.fd")
             );
         }
+    }
+
+    #[rstest]
+    #[case("x86_64")]
+    #[case("aarch64")]
+    fn clh_go_prefix_rewrites_only_base_paths(#[case] _arch: &str) {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = prefix_test_config(tmp.path());
+        let base = tmp.path().join("configuration-clh.toml");
+        fs::write(
+            &base,
+            r#"[hypervisor.clh]
+path = "/opt/kata/bin/cloud-hypervisor"
+kernel = "/opt/kata/share/kata-containers/vmlinux.container"
+image = "/opt/kata/share/kata-containers/kata-containers.img"
+virtio_fs_daemon = "/opt/kata/libexec/virtiofsd"
+valid_hypervisor_paths = ["/opt/kata/bin/cloud-hypervisor"]
+valid_virtio_fs_daemon_paths = ["/opt/kata/libexec/virtiofsd"]
+"#,
+        )
+        .unwrap();
+
+        let content = generate_base_config_prefix_drop_in(&config, "clh", &base).unwrap();
+        let drop_in = content.parse::<DocumentMut>().unwrap();
+        let clh = drop_in["hypervisor"]["clh"].as_table().unwrap();
+        let dest = config.dest_dir.as_str();
+
+        assert_eq!(
+            clh["path"].as_str().unwrap(),
+            format!("{dest}/bin/cloud-hypervisor")
+        );
+        assert_eq!(
+            clh["virtio_fs_daemon"].as_str().unwrap(),
+            format!("{dest}/libexec/virtiofsd")
+        );
+        assert_eq!(
+            clh["valid_hypervisor_paths"]
+                .as_array()
+                .unwrap()
+                .get(0)
+                .unwrap()
+                .as_str()
+                .unwrap(),
+            format!("{dest}/bin/cloud-hypervisor")
+        );
+        assert_eq!(
+            clh["valid_virtio_fs_daemon_paths"]
+                .as_array()
+                .unwrap()
+                .get(0)
+                .unwrap()
+                .as_str()
+                .unwrap(),
+            format!("{dest}/libexec/virtiofsd")
+        );
+        assert!(clh.get("initrd").is_none());
     }
 
     #[rstest]
