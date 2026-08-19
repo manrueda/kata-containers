@@ -589,6 +589,7 @@ shims:
     enabled: ~  # null = use disableAll setting (enabled when false, disabled when true)
     supportedArches:
       - amd64
+      - arm64
     allowedHypervisorAnnotations: []
     containerd:
       snapshotter: ""
