@@ -12,7 +12,7 @@ use std::collections::HashSet;
 use std::fs;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::Path;
-use toml_edit::{value, ArrayOfTables, DocumentMut, Item, Table};
+use toml_edit::{value, Array, ArrayOfTables, DocumentMut, Item, Table, Value};
 #[cfg(test)]
 use walkdir::WalkDir;
 
@@ -221,7 +221,8 @@ fn write_common_drop_ins(
     // 1. Installation prefix adjustments (if not default)
     if config.dest_dir != DEFAULT_KATA_INSTALL_DIR {
         info!("  - Installation prefix: {} (non-default)", config.dest_dir);
-        let prefix_content = generate_installation_prefix_drop_in(config, shim)?;
+        let prefix_content =
+            generate_installation_prefix_drop_in(config, shim, Path::new(config_d_dir))?;
         write_drop_in_file(config_d_dir, "10-installation-prefix.toml", &prefix_content)?;
     }
 
@@ -1435,19 +1436,16 @@ fn qemu_system_binary_for(arch: &str) -> String {
 
 /// Create a QEMU wrapper script that adds the -L flag for firmware paths.
 /// This is needed when using a non-default installation prefix.
-fn create_qemu_wrapper_script(config: &Config, shim: &str) -> Result<Option<String>> {
+fn create_qemu_wrapper_script(
+    config: &Config,
+    shim: &str,
+    qemu_binary: &str,
+) -> Result<Option<String>> {
     let qemu_artifact = match get_qemu_artifact_name(shim) {
         Some(artifact) => artifact,
         None => return Ok(None), // Not a QEMU shim, no wrapper needed
     };
 
-    let binary_suffix = qemu_artifact.trim_start_matches("qemu");
-    let qemu_binary = format!(
-        "{}/bin/{}{}",
-        config.dest_dir,
-        qemu_system_binary_for(current_arch()),
-        binary_suffix
-    );
     let wrapper_script_path = format!("{}-installation-prefix", qemu_binary);
     let host_wrapper_path = wrapper_script_path.clone();
 
@@ -1483,7 +1481,17 @@ fn get_hypervisor_path(config: &Config, shim: &str) -> Result<String> {
     if is_qemu_shim(shim) {
         // For QEMU shims, use the wrapper script that adds firmware paths
         // create_qemu_wrapper_script always returns Some for QEMU shims
-        create_qemu_wrapper_script(config, shim)?.ok_or_else(|| {
+        let qemu_artifact = get_qemu_artifact_name(shim).ok_or_else(|| {
+            anyhow::anyhow!("QEMU wrapper script should always be created for QEMU shims")
+        })?;
+        let binary_suffix = qemu_artifact.trim_start_matches("qemu");
+        let qemu_binary = format!(
+            "{}/bin/{}{}",
+            config.dest_dir,
+            qemu_system_binary_for(current_arch()),
+            binary_suffix
+        );
+        create_qemu_wrapper_script(config, shim, &qemu_binary)?.ok_or_else(|| {
             anyhow::anyhow!("QEMU wrapper script should always be created for QEMU shims")
         })
     } else {
@@ -1504,7 +1512,121 @@ fn get_hypervisor_path(config: &Config, shim: &str) -> Result<String> {
 /// Generate drop-in content for installation prefix adjustments.
 /// This replaces /opt/kata with the custom dest_dir in all relevant paths.
 /// For QEMU shims, this also creates a wrapper script for firmware paths.
-fn generate_installation_prefix_drop_in(config: &Config, shim: &str) -> Result<String> {
+fn generate_installation_prefix_drop_in(
+    config: &Config,
+    shim: &str,
+    config_d_dir: &Path,
+) -> Result<String> {
+    if shim == "qemu-runtime-rs" {
+        let base_config = config_d_dir
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("config.d has no parent: {}", config_d_dir.display()))?
+            .join(format!("configuration-{shim}.toml"));
+        return generate_base_config_prefix_drop_in(config, shim, &base_config);
+    }
+
+    generate_legacy_installation_prefix_drop_in(config, shim)
+}
+
+/// Build a prefix drop-in from the installed base configuration.
+///
+/// Only non-empty paths rooted at the default installation directory are
+/// emitted. Missing and empty values are deliberately left to the base config,
+/// so an architecture-specific default cannot be invented by kata-deploy.
+fn generate_base_config_prefix_drop_in(
+    config: &Config,
+    shim: &str,
+    base_config: &Path,
+) -> Result<String> {
+    let hypervisor_name = get_hypervisor_name(shim)?;
+    let content = fs::read_to_string(base_config).with_context(|| {
+        format!(
+            "Failed to read base configuration: {}",
+            base_config.display()
+        )
+    })?;
+    let base = content.parse::<DocumentMut>().with_context(|| {
+        format!(
+            "Failed to parse base configuration: {}",
+            base_config.display()
+        )
+    })?;
+    let base_hypervisor = base
+        .get("hypervisor")
+        .and_then(|item| item.get(hypervisor_name))
+        .and_then(Item::as_table)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "Base configuration {} has no [hypervisor.{hypervisor_name}] table",
+                base_config.display()
+            )
+        })?;
+
+    let mut overrides = Table::new();
+    for (key, item) in base_hypervisor.iter() {
+        match item {
+            Item::Value(Value::String(path)) => {
+                let Some(mut rewritten) = rewrite_install_path(path.value(), &config.dest_dir)
+                else {
+                    continue;
+                };
+
+                if key == "path" && is_qemu_shim(shim) {
+                    rewritten =
+                        create_qemu_wrapper_script(config, shim, &rewritten)?.ok_or_else(|| {
+                            anyhow::anyhow!("Failed to create QEMU wrapper for {shim}")
+                        })?;
+                }
+                overrides[key] = value(rewritten);
+            }
+            Item::Value(Value::Array(paths)) => {
+                let mut rewritten_paths = Array::new();
+                let mut changed = false;
+                for entry in paths.iter() {
+                    match entry {
+                        Value::String(path) => {
+                            if let Some(rewritten) =
+                                rewrite_install_path(path.value(), &config.dest_dir)
+                            {
+                                rewritten_paths.push(rewritten);
+                                changed = true;
+                            } else {
+                                rewritten_paths.push(path.value());
+                            }
+                        }
+                        other => rewritten_paths.push(other.clone()),
+                    }
+                }
+                if changed {
+                    overrides[key] = Item::Value(Value::Array(rewritten_paths));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut hypervisor = Table::new();
+    hypervisor.set_implicit(true);
+    hypervisor.insert(hypervisor_name, Item::Table(overrides));
+
+    let mut drop_in = DocumentMut::new();
+    drop_in.insert("hypervisor", Item::Table(hypervisor));
+
+    Ok(format!(
+        "# Installation prefix adjustments\n# Generated by kata-deploy\n\n{}",
+        drop_in
+    ))
+}
+
+fn rewrite_install_path(path: &str, dest_dir: &str) -> Option<String> {
+    let suffix = path.strip_prefix(DEFAULT_KATA_INSTALL_DIR)?;
+    if !suffix.is_empty() && !suffix.starts_with('/') {
+        return None;
+    }
+    Some(format!("{dest_dir}{suffix}"))
+}
+
+fn generate_legacy_installation_prefix_drop_in(config: &Config, shim: &str) -> Result<String> {
     let hypervisor_name = get_hypervisor_name(shim)?;
 
     // Build the drop-in content with adjusted paths
@@ -1974,6 +2096,114 @@ mod tests {
     #[case("ppc64le", "qemu-system-ppc64")]
     fn test_qemu_system_binary_for(#[case] arch: &str, #[case] expected: &str) {
         assert_eq!(qemu_system_binary_for(arch), expected);
+    }
+
+    fn prefix_test_config(dest_dir: &Path) -> crate::config::Config {
+        crate::config::Config {
+            node_name: "test".to_string(),
+            debug: false,
+            shims_for_arch: vec!["qemu-runtime-rs".to_string()],
+            default_shim_for_arch: "qemu-runtime-rs".to_string(),
+            allowed_hypervisor_annotations_for_arch: vec![],
+            snapshotter_handler_mapping_for_arch: None,
+            agent_https_proxy: None,
+            agent_no_proxy: None,
+            pull_type_mapping_for_arch: None,
+            installation_prefix: Some("/test".to_string()),
+            multi_install_suffix: None,
+            devkit_enabled: false,
+            helm_post_delete_hook: false,
+            experimental_setup_snapshotter: None,
+            erofs_merge_mode: None,
+            experimental_force_guest_pull_for_arch: vec![],
+            dest_dir: dest_dir.to_string_lossy().into_owned(),
+            host_install_dir: dest_dir.to_string_lossy().into_owned(),
+            crio_drop_in_conf_dir: String::new(),
+            crio_drop_in_conf_file: String::new(),
+            crio_drop_in_conf_file_debug: String::new(),
+            containerd_conf_file: String::new(),
+            containerd_conf_file_backup: String::new(),
+            containerd_drop_in_conf_file: String::new(),
+            containerd_user_drop_in_source_file: None,
+            daemonset_name: "kata-deploy".to_string(),
+            custom_runtimes_enabled: false,
+            custom_runtimes: vec![],
+            erofs_snapshotter_mode: None,
+            erofs_dmverity: false,
+            startup_taints: vec![],
+            container_runtime_version: None,
+            k8s_distribution: None,
+        }
+    }
+
+    #[rstest]
+    #[case("x86_64", "")]
+    #[case("aarch64", "/opt/kata/share/kata-containers/firmware/AAVMF_CODE.fd")]
+    fn qemu_runtime_rs_prefix_follows_arch_base_config(#[case] arch: &str, #[case] firmware: &str) {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = prefix_test_config(tmp.path());
+        let base = tmp.path().join("configuration-qemu-runtime-rs.toml");
+        fs::write(
+            &base,
+            format!(
+                r#"[hypervisor.qemu]
+path = "/opt/kata/bin/qemu-system-{arch}"
+kernel = "/opt/kata/share/kata-containers/vmlinux.container"
+image = "/opt/kata/share/kata-containers/kata-containers.img"
+firmware = "{firmware}"
+virtio_fs_daemon = "/opt/kata/libexec/virtiofsd"
+valid_hypervisor_paths = ["/opt/kata/bin/qemu-system-{arch}"]
+valid_virtio_fs_daemon_paths = ["/opt/kata/libexec/virtiofsd"]
+"#
+            ),
+        )
+        .unwrap();
+
+        let content =
+            generate_base_config_prefix_drop_in(&config, "qemu-runtime-rs", &base).unwrap();
+        let drop_in = content.parse::<DocumentMut>().unwrap();
+        let qemu = drop_in["hypervisor"]["qemu"].as_table().unwrap();
+        let dest = config.dest_dir.as_str();
+
+        assert_eq!(
+            qemu["path"].as_str().unwrap(),
+            format!("{dest}/bin/qemu-system-{arch}-installation-prefix")
+        );
+        assert_eq!(
+            qemu["virtio_fs_daemon"].as_str().unwrap(),
+            format!("{dest}/libexec/virtiofsd")
+        );
+        assert_eq!(
+            qemu["valid_hypervisor_paths"]
+                .as_array()
+                .unwrap()
+                .get(0)
+                .unwrap()
+                .as_str()
+                .unwrap(),
+            format!("{dest}/bin/qemu-system-{arch}")
+        );
+        assert_eq!(
+            qemu["valid_virtio_fs_daemon_paths"]
+                .as_array()
+                .unwrap()
+                .get(0)
+                .unwrap()
+                .as_str()
+                .unwrap(),
+            format!("{dest}/libexec/virtiofsd")
+        );
+        assert!(qemu.get("initrd").is_none());
+        assert!(qemu.get("firmware_volume").is_none());
+
+        if firmware.is_empty() {
+            assert!(qemu.get("firmware").is_none());
+        } else {
+            assert_eq!(
+                qemu["firmware"].as_str().unwrap(),
+                format!("{dest}/share/kata-containers/firmware/AAVMF_CODE.fd")
+            );
+        }
     }
 
     #[rstest]
