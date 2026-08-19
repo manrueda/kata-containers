@@ -2153,6 +2153,45 @@ valid_virtio_fs_daemon_paths = ["/opt/kata/libexec/virtiofsd"]
     }
 
     #[rstest]
+    #[case("x86_64")]
+    #[case("aarch64")]
+    fn dragonball_prefix_preserves_built_in_hypervisor_fields(#[case] _arch: &str) {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = test_config("dragonball", tmp.path().to_str().unwrap());
+        install_base_config(
+            &config,
+            "dragonball",
+            r#"[hypervisor.dragonball]
+path = ""
+ctlpath = ""
+kernel = "/opt/kata/share/kata-containers/vmlinux-dragonball-experimental.container"
+image = "/opt/kata/share/kata-containers/kata-containers.img"
+firmware = ""
+valid_hypervisor_paths = []
+"#,
+        );
+
+        let content = generate_installation_prefix_drop_in(&config, "dragonball").unwrap();
+        let drop_in = content.parse::<DocumentMut>().unwrap();
+        let dragonball = drop_in["hypervisor"]["dragonball"].as_table().unwrap();
+        let dest = config.dest_dir.as_str();
+
+        assert_eq!(
+            dragonball["kernel"].as_str().unwrap(),
+            format!("{dest}/share/kata-containers/vmlinux-dragonball-experimental.container")
+        );
+        assert_eq!(
+            dragonball["image"].as_str().unwrap(),
+            format!("{dest}/share/kata-containers/kata-containers.img")
+        );
+        assert!(dragonball.get("path").is_none());
+        assert!(dragonball.get("ctlpath").is_none());
+        assert!(dragonball.get("initrd").is_none());
+        assert!(dragonball.get("firmware").is_none());
+        assert!(dragonball.get("valid_hypervisor_paths").is_none());
+    }
+
+    #[rstest]
     #[case("")]
     #[case("unknown-shim")]
     #[case("custom")]
