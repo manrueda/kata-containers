@@ -1005,11 +1005,12 @@ func (q *qemu) buildDevices(ctx context.Context, kernelPath string) ([]govmmQemu
 			continue
 		}
 		drive := config.BlockDrive{
-			File:     extra.Path,
-			Format:   "raw",
-			ID:       fmt.Sprintf("extension-%s", extra.Name),
-			ShareRW:  true,
-			ReadOnly: true,
+			File:           extra.Path,
+			Format:         "raw",
+			ID:             fmt.Sprintf("extension-%s", extra.Name),
+			ShareRW:        true,
+			ReadOnly:       true,
+			DisableLocking: true,
 		}
 		devices, err = q.arch.appendBlockDevice(ctx, devices, drive)
 		if err != nil {
