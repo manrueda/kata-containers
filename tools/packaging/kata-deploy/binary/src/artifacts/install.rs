@@ -1517,7 +1517,7 @@ fn generate_installation_prefix_drop_in(
     shim: &str,
     config_d_dir: &Path,
 ) -> Result<String> {
-    if shim == "qemu-runtime-rs" {
+    if matches!(shim, "qemu-runtime-rs" | "qemu") {
         let base_config = config_d_dir
             .parent()
             .ok_or_else(|| anyhow::anyhow!("config.d has no parent: {}", config_d_dir.display()))?
@@ -2202,6 +2202,68 @@ valid_virtio_fs_daemon_paths = ["/opt/kata/libexec/virtiofsd"]
             assert_eq!(
                 qemu["firmware"].as_str().unwrap(),
                 format!("{dest}/share/kata-containers/firmware/AAVMF_CODE.fd")
+            );
+        }
+    }
+
+    #[rstest]
+    #[case("x86_64", "", "")]
+    #[case(
+        "aarch64",
+        "/opt/kata/share/aavmf/AAVMF_CODE.fd",
+        "/opt/kata/share/aavmf/AAVMF_VARS.fd"
+    )]
+    fn qemu_go_prefix_follows_arch_base_config(
+        #[case] arch: &str,
+        #[case] firmware: &str,
+        #[case] firmware_volume: &str,
+    ) {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = prefix_test_config(tmp.path());
+        let base = tmp.path().join("configuration-qemu.toml");
+        fs::write(
+            &base,
+            format!(
+                r#"[hypervisor.qemu]
+path = "/opt/kata/bin/qemu-system-{arch}"
+kernel = "/opt/kata/share/kata-containers/vmlinuz.container"
+image = "/opt/kata/share/kata-containers/kata-containers.img"
+firmware = "{firmware}"
+firmware_volume = "{firmware_volume}"
+virtio_fs_daemon = "/opt/kata/libexec/virtiofsd"
+valid_hypervisor_paths = ["/opt/kata/bin/qemu-system-{arch}"]
+valid_virtio_fs_daemon_paths = ["/opt/kata/libexec/virtiofsd"]
+"#
+            ),
+        )
+        .unwrap();
+
+        let content = generate_base_config_prefix_drop_in(&config, "qemu", &base).unwrap();
+        let drop_in = content.parse::<DocumentMut>().unwrap();
+        let qemu = drop_in["hypervisor"]["qemu"].as_table().unwrap();
+        let dest = config.dest_dir.as_str();
+
+        assert_eq!(
+            qemu["path"].as_str().unwrap(),
+            format!("{dest}/bin/qemu-system-{arch}-installation-prefix")
+        );
+        assert_eq!(
+            qemu["virtio_fs_daemon"].as_str().unwrap(),
+            format!("{dest}/libexec/virtiofsd")
+        );
+        assert!(qemu.get("initrd").is_none());
+
+        if firmware.is_empty() {
+            assert!(qemu.get("firmware").is_none());
+            assert!(qemu.get("firmware_volume").is_none());
+        } else {
+            assert_eq!(
+                qemu["firmware"].as_str().unwrap(),
+                format!("{dest}/share/aavmf/AAVMF_CODE.fd")
+            );
+            assert_eq!(
+                qemu["firmware_volume"].as_str().unwrap(),
+                format!("{dest}/share/aavmf/AAVMF_VARS.fd")
             );
         }
     }
