@@ -1517,7 +1517,10 @@ fn generate_installation_prefix_drop_in(
     shim: &str,
     config_d_dir: &Path,
 ) -> Result<String> {
-    if matches!(shim, "qemu-runtime-rs" | "qemu" | "clh-runtime-rs" | "clh") {
+    if matches!(
+        shim,
+        "qemu-runtime-rs" | "qemu" | "clh-runtime-rs" | "clh" | "dragonball"
+    ) {
         let base_config = config_d_dir
             .parent()
             .ok_or_else(|| anyhow::anyhow!("config.d has no parent: {}", config_d_dir.display()))?
@@ -2395,6 +2398,46 @@ valid_virtio_fs_daemon_paths = ["/opt/kata/libexec/virtiofsd"]
             format!("{dest}/libexec/virtiofsd")
         );
         assert!(clh.get("initrd").is_none());
+    }
+
+    #[rstest]
+    #[case("x86_64")]
+    #[case("aarch64")]
+    fn dragonball_prefix_preserves_built_in_hypervisor_fields(#[case] _arch: &str) {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = prefix_test_config(tmp.path());
+        let base = tmp.path().join("configuration-dragonball.toml");
+        fs::write(
+            &base,
+            r#"[hypervisor.dragonball]
+path = ""
+ctlpath = ""
+kernel = "/opt/kata/share/kata-containers/vmlinux-dragonball-experimental.container"
+image = "/opt/kata/share/kata-containers/kata-containers.img"
+firmware = ""
+valid_hypervisor_paths = []
+"#,
+        )
+        .unwrap();
+
+        let content = generate_base_config_prefix_drop_in(&config, "dragonball", &base).unwrap();
+        let drop_in = content.parse::<DocumentMut>().unwrap();
+        let dragonball = drop_in["hypervisor"]["dragonball"].as_table().unwrap();
+        let dest = config.dest_dir.as_str();
+
+        assert_eq!(
+            dragonball["kernel"].as_str().unwrap(),
+            format!("{dest}/share/kata-containers/vmlinux-dragonball-experimental.container")
+        );
+        assert_eq!(
+            dragonball["image"].as_str().unwrap(),
+            format!("{dest}/share/kata-containers/kata-containers.img")
+        );
+        assert!(dragonball.get("path").is_none());
+        assert!(dragonball.get("ctlpath").is_none());
+        assert!(dragonball.get("initrd").is_none());
+        assert!(dragonball.get("firmware").is_none());
+        assert!(dragonball.get("valid_hypervisor_paths").is_none());
     }
 
     #[rstest]
