@@ -2098,6 +2098,61 @@ valid_virtio_fs_daemon_paths = ["/opt/kata/libexec/virtiofsd"]
     }
 
     #[rstest]
+    #[case("x86_64")]
+    #[case("aarch64")]
+    fn clh_go_prefix_rewrites_only_base_paths(#[case] _arch: &str) {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = test_config("clh", tmp.path().to_str().unwrap());
+        install_base_config(
+            &config,
+            "clh",
+            r#"[hypervisor.clh]
+path = "/opt/kata/bin/cloud-hypervisor"
+kernel = "/opt/kata/share/kata-containers/vmlinux.container"
+image = "/opt/kata/share/kata-containers/kata-containers.img"
+virtio_fs_daemon = "/opt/kata/libexec/virtiofsd"
+valid_hypervisor_paths = ["/opt/kata/bin/cloud-hypervisor"]
+valid_virtio_fs_daemon_paths = ["/opt/kata/libexec/virtiofsd"]
+"#,
+        );
+
+        let content = generate_installation_prefix_drop_in(&config, "clh").unwrap();
+        let drop_in = content.parse::<DocumentMut>().unwrap();
+        let clh = drop_in["hypervisor"]["clh"].as_table().unwrap();
+        let dest = config.dest_dir.as_str();
+
+        assert_eq!(
+            clh["path"].as_str().unwrap(),
+            format!("{dest}/bin/cloud-hypervisor")
+        );
+        assert_eq!(
+            clh["virtio_fs_daemon"].as_str().unwrap(),
+            format!("{dest}/libexec/virtiofsd")
+        );
+        assert_eq!(
+            clh["valid_hypervisor_paths"]
+                .as_array()
+                .unwrap()
+                .get(0)
+                .unwrap()
+                .as_str()
+                .unwrap(),
+            format!("{dest}/bin/cloud-hypervisor")
+        );
+        assert_eq!(
+            clh["valid_virtio_fs_daemon_paths"]
+                .as_array()
+                .unwrap()
+                .get(0)
+                .unwrap()
+                .as_str()
+                .unwrap(),
+            format!("{dest}/libexec/virtiofsd")
+        );
+        assert!(clh.get("initrd").is_none());
+    }
+
+    #[rstest]
     #[case("")]
     #[case("unknown-shim")]
     #[case("custom")]
