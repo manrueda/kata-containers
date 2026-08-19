@@ -11,6 +11,9 @@ on:
       tag:
         required: true
         type: string
+      arm64-tag:
+        required: true
+        type: string
       pr-number:
         required: true
         type: string
@@ -104,3 +107,83 @@ jobs:
       - name: Report tests
         if: always()
         run: bash tests/functional/kata-deploy/gha-run.sh report-tests
+
+  run-kata-deploy-mixed-shims:
+    name: run-kata-deploy-mixed-shims-${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            deploy_k8s: true
+            k8s: k3s
+            runner: ubuntu-22.04
+            tag: ${{ inputs.tag }}
+          - arch: arm64
+            deploy_k8s: false
+            k8s: kubeadm
+            runner: arm64-k8s
+            tag: ${{ inputs.arm64-tag }}
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.job }}-${{ github.event.pull_request.number || github.ref }}-${{ matrix.arch }}
+      cancel-in-progress: true
+    runs-on: ${{ matrix.runner }}
+    env:
+      DOCKER_REGISTRY: ${{ inputs.registry }}
+      DOCKER_REPO: ${{ inputs.repo }}
+      DOCKER_TAG: ${{ matrix.tag }}
+      GH_PR_NUMBER: ${{ inputs.pr-number }}
+      KATA_DEPLOY_TEST_UNION: kata-deploy-mixed-shims.bats
+      KATA_HYPERVISOR: qemu
+      KUBERNETES: ${{ matrix.k8s }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ inputs.commit-hash }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Rebase atop of the latest target branch
+        run: |
+          ./tests/git-helper.sh "rebase-atop-of-the-latest-target-branch"
+        env:
+          TARGET_BRANCH: ${{ inputs.target-branch }}
+
+      - name: Remove unnecessary directories to free up space
+        if: matrix.deploy_k8s
+        run: |
+          sudo rm -rf /usr/local/.ghcup
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /usr/local/share/boost
+          sudo rm -rf /usr/lib/jvm
+          sudo rm -rf /usr/share/swift
+          sudo rm -rf /usr/local/share/powershell
+          sudo rm -rf /usr/local/julia*
+          sudo rm -rf /opt/az
+          sudo rm -rf /usr/local/share/chromium
+          sudo rm -rf /opt/microsoft
+          sudo rm -rf /opt/google
+          sudo rm -rf /usr/lib/firefox
+
+      - name: Deploy k3s
+        if: matrix.deploy_k8s
+        run: bash tests/functional/kata-deploy/gha-run.sh deploy-k8s
+
+      - name: Install `bats`
+        run: bash tests/functional/kata-deploy/gha-run.sh install-bats
+
+      - name: Run mixed-shim test
+        run: bash tests/functional/kata-deploy/gha-run.sh run-tests
+
+      - name: Report tests
+        if: always()
+        run: bash tests/functional/kata-deploy/gha-run.sh report-tests
+
+      - name: Clean up mixed-shim deployment
+        if: always()
+        run: |
+          kubectl delete pods -l test=kata-deploy-mixed-shims --ignore-not-found=true --wait=true --timeout=180s || true
+          helm uninstall kata-deploy -n kube-system --ignore-not-found --wait --timeout 10m || true

@@ -176,6 +176,17 @@ impl QemuInner {
                         // command line.
                         continue;
                     }
+                    // Cloud Hypervisor locks the image's full byte range, which
+                    // overlaps QEMU's permission lock bytes despite both VMMs
+                    // opening these shared Kata artifacts read-only. Kata owns
+                    // these immutable files, so QEMU locking is redundant.
+                    let disable_locking = is_readonly
+                        && (path_on_host == self.config.boot_info.image
+                            || self
+                                .config
+                                .guest_extension_images
+                                .iter()
+                                .any(|image| image.path == path_on_host));
                     match driver_option.as_str() {
                         KATA_NVDIMM_DEV_TYPE => cmdline.add_nvdimm(&path_on_host, is_readonly)?,
                         KATA_CCW_DEV_TYPE | KATA_BLK_DEV_TYPE | KATA_SCSI_DEV_TYPE => {
@@ -193,6 +204,7 @@ impl QemuInner {
                                 driver_option.as_str() == KATA_SCSI_DEV_TYPE,
                                 discard_unmap,
                                 serial,
+                                disable_locking,
                             )?
                         }
                         unsupported => {
@@ -446,19 +458,21 @@ impl QemuInner {
             });
         }
 
+        let exit_notify = self
+            .exit_notify
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| anyhow!("no exit notify"))?;
+
         let mut qemu_process = command.stderr(Stdio::piped()).spawn()?;
         // QEMU inherited its startup descriptors during spawn. Drop the
         // privileged shim's copies immediately; QEMU owns the fdsets from here.
         drop(cmdline);
         let stderr = qemu_process.stderr.take().unwrap();
         self.qemu_process = Mutex::new(Some(qemu_process));
+        self.exit_notify = None;
 
         info!(sl!(), "qemu process started");
-
-        let exit_notify: mpsc::Sender<()> = self
-            .exit_notify
-            .take()
-            .ok_or_else(|| anyhow!("no exit notify"))?;
 
         tokio::spawn(log_qemu_stderr(stderr, exit_notify));
 
@@ -476,58 +490,81 @@ impl QemuInner {
 
         let qmp_socket_path = get_qmp_socket_path(self.id.as_str());
 
-        match Qmp::new(&qmp_socket_path) {
-            Ok(mut qmp) => {
-                if let Some(subchannel) = ccw_subchannel {
-                    qmp.set_ccw_subchannel(subchannel);
-                }
-                qmp.verify_block_fdsets(block_fdsets)?;
-                // Setup virtio-mem device if enabled.  It requires a memory
-                // hotplug region (maxmem) on the QEMU command line; that region
-                // is not reserved for every configuration (e.g. on s390x the
-                // shared memory-backend used with a virtio-blk-ccw rootfs zeroes
-                // maxmem/slots, and static resource management sizes the VM
-                // upfront).  Skip the setup in that case -- like other static
-                // sizing arches (e.g. arm64) the guest simply runs with its
-                // boot memory -- instead of failing VM start with
-                // "the configuration is not prepared for memory devices".
-                if self.config.memory_info.enable_virtio_mem {
-                    if has_memory_hotplug_region {
-                        qmp.setup_virtio_mem(
-                            self.config.memory_info.default_memory,
-                            self.config.memory_info.default_maxmemory,
-                            &self.config.machine_info.machine_type,
-                            self.config.shared_fs.shared_fs.as_deref(),
-                        )
-                        .context("Failed to setup virtio-mem during VM initialization")?;
-                    } else {
-                        info!(
-                            sl!(),
-                            "virtio-mem enabled but no memory hotplug region (maxmem) was reserved; skipping virtio-mem setup"
-                        );
-                    }
-                }
-                let bridge_count = self.config.device_info.default_bridges;
-                if bridge_count > 0 {
-                    qmp.init_pci_bridges(bridge_count);
-                }
-                self.qmp = Some(qmp);
+        let initialize: Result<()> = async {
+            let mut qmp = Qmp::new(&qmp_socket_path).context("couldn't initialise QMP")?;
+            if let Some(subchannel) = ccw_subchannel {
+                qmp.set_ccw_subchannel(subchannel);
             }
-            Err(e) => {
-                error!(sl!(), "couldn't initialise QMP: {:?}", e);
-                return Err(e);
-            }
-        }
+            qmp.verify_block_fdsets(block_fdsets)?;
 
-        // Start the virtual machine by restoring it from a VM template if enabled.
-        if self.config.vm_template.boot_from_template {
-            self.boot_from_template()
-                .await
-                .context("boot from template")?;
-            self.resume_vm().context("resume vm")?;
+            // Setup virtio-mem device if enabled.  It requires a memory
+            // hotplug region (maxmem) on the QEMU command line; that region
+            // is not reserved for every configuration (e.g. on s390x the
+            // shared memory-backend used with a virtio-blk-ccw rootfs zeroes
+            // maxmem/slots, and static resource management sizes the VM
+            // upfront).  Skip the setup in that case -- like other static
+            // sizing arches (e.g. arm64) the guest simply runs with its
+            // boot memory -- instead of failing VM start with
+            // "the configuration is not prepared for memory devices".
+            if self.config.memory_info.enable_virtio_mem {
+                if has_memory_hotplug_region {
+                    qmp.setup_virtio_mem(
+                        self.config.memory_info.default_memory,
+                        self.config.memory_info.default_maxmemory,
+                        &self.config.machine_info.machine_type,
+                        self.config.shared_fs.shared_fs.as_deref(),
+                    )
+                    .context("Failed to setup virtio-mem during VM initialization")?;
+                } else {
+                    info!(
+                        sl!(),
+                        "virtio-mem enabled but no memory hotplug region (maxmem) was reserved; skipping virtio-mem setup"
+                    );
+                }
+            }
+            let bridge_count = self.config.device_info.default_bridges;
+            if bridge_count > 0 {
+                qmp.init_pci_bridges(bridge_count);
+            }
+            self.qmp = Some(qmp);
+
+            // Start the virtual machine by restoring it from a VM template if enabled.
+            if self.config.vm_template.boot_from_template {
+                self.boot_from_template()
+                    .await
+                    .context("boot from template")?;
+                self.resume_vm().context("resume vm")?;
+            }
+
+            Ok(())
+        }
+        .await;
+
+        if let Err(err) = initialize {
+            error!(sl!(), "QEMU startup failed: {err:#}");
+            self.cleanup_failed_start().await;
+            return Err(err);
         }
 
         Ok(())
+    }
+
+    async fn cleanup_failed_start(&mut self) {
+        self.qmp = None;
+
+        let mut qemu_process = self.qemu_process.lock().await;
+        let Some(mut child) = qemu_process.take() else {
+            return;
+        };
+
+        if child.id().is_some() {
+            if let Err(err) = child.kill().await {
+                error!(sl!(), "failed to stop QEMU after startup error: {}", err);
+            }
+        }
+        if let Err(err) = child.wait().await {
+            error!(sl!(), "failed to reap QEMU after startup error: {}", err);
+        }
     }
 
     async fn boot_from_template(&mut self) -> Result<()> {
