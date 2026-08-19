@@ -57,8 +57,8 @@ valid_ctlpaths = []
 kernel_params = "@KERNELPARAMS_DB@"
 
 # Path to the firmware.
-# If you want that DB uses the default firmware leave this option empty
-firmware = "@FIRMWAREPATH@"
+# Dragonball is built into runtime-rs and does not use firmware.
+firmware = ""
 
 
 # Default number of vCPUs per SB/VM:
