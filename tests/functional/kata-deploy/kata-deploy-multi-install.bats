@@ -172,3 +172,78 @@ scheduling:
 	refute_match "${rendered}" 'kata-deploy.katacontainers.io/dev: "false"'
 	echo "${rendered}" | grep -q 'katacontainers.io/kata-runtime: "true"'
 }
+
+@test "Helm template: all-runtime verification uses suffixed handlers per architecture" {
+	local pod rendered
+	pod=$(mktemp)
+	cat > "${pod}" <<'EOF'
+apiVersion: v1
+kind: Pod
+metadata:
+  name: verification-template
+spec:
+  restartPolicy: Never
+  containers:
+    - name: verify
+      image: registry.k8s.io/pause:3.10
+EOF
+
+	rendered=$(helm template experimental "${CHART_PATH}" \
+		--set env.multiInstallSuffix=dev \
+		--set shims.disableAll=true \
+		--set shims.clh.enabled=true \
+		--set shims.dragonball.enabled=true \
+		--set shims.qemu.enabled=true \
+		--set shims.qemu-runtime-rs.enabled=true \
+		--set verification.allRuntimeClasses=true \
+		--set-file verification.pod="${pod}" \
+		--show-only templates/verification-job.yaml)
+	rm -f "${pod}"
+
+	local arch runtime
+	for runtime in clh dragonball qemu qemu-runtime-rs; do
+		for arch in amd64 arm64; do
+			echo "${rendered}" | grep -q "\"kata-${runtime}-dev|${arch}\""
+		done
+		refute_match "${rendered}" "\"kata-${runtime}|"
+	done
+
+	echo "${rendered}" | grep -Fq '\"runtimeClassName\":\"${runtime_class}\"'
+	echo "${rendered}" | grep -Fq '\"kubernetes.io/arch\":\"${runtime_arch}\"'
+	echo "${rendered}" | grep -Fq 'kata-deploy.katacontainers.io/dev=true'
+	echo "${rendered}" | grep -Fq 'experimental-kata-deploy-verify-${runtime_index}'
+	echo "${rendered}" | grep -Fq 'involvedObject.uid="${pod_uid}"'
+	echo "${rendered}" | grep -q 'ERROR: RuntimeClass ${runtime_label} could not create a sandbox'
+}
+
+@test "Helm template: single-pod verification preserves the supplied pod" {
+	local pod rendered
+	pod=$(mktemp)
+	cat > "${pod}" <<'EOF'
+apiVersion: v1
+kind: Pod
+metadata:
+  name: custom-verification
+spec:
+  runtimeClassName: kata-custom
+  nodeSelector:
+    example.com/pool: verification
+  restartPolicy: Never
+  containers:
+    - name: verify
+      image: registry.k8s.io/pause:3.10
+EOF
+
+	rendered=$(helm template kata-deploy "${CHART_PATH}" \
+		--set-file verification.pod="${pod}" \
+		--show-only templates/verification-job.yaml)
+	rm -f "${pod}"
+
+	echo "${rendered}" | grep -Fq 'name: custom-verification'
+	echo "${rendered}" | grep -Fq 'runtimeClassName: kata-custom'
+	echo "${rendered}" | grep -Fq 'example.com/pool: verification'
+	echo "${rendered}" | grep -Fq 'kubectl create --dry-run=client --validate=false -f /config/pod-spec.yaml'
+	echo "${rendered}" | grep -Fq 'kubectl apply -n "${VERIFY_NS}" -f /config/pod-spec.yaml'
+	echo "${rendered}" | grep -Fq 'verify_runtime "" "" "${POD_NAME}"'
+	refute_match "${rendered}" 'RUNTIME_MATRIX='
+}
