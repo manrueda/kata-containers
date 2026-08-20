@@ -40,6 +40,7 @@ The **runtime-endpoint** is the CRI of a CRI compliant container manager: it wil
 The **log-level** allows the chose how verbose the logs should be. The default is `info`.
 ### Kata monitor HTTP endpoints
 `kata-monitor` exposes the following endpoints:
+  * `/readyz`             : report whether at least one sandbox storage path is available.
   * `/metrics`             : get Kata sandboxes metrics.
   * `/sandboxes`           : list all the Kata sandboxes running on the host.
   * `/agent-url`           : Get the agent URL of a Kata sandbox.
@@ -53,6 +54,11 @@ The **log-level** allows the chose how verbose the logs should be. The default i
 **NOTE: The debug endpoints are available only if the [Kata Containers configuration file](https://github.com/kata-containers/kata-containers/blob/9d5b03a1b70bbd175237ec4b9f821d6ccee0a1f6/src/runtime/config/configuration-qemu.toml.in#L590-L592) includes** `enable_pprof = true` **in the** `[runtime]` **section**.
 
 The `/metrics` has a query parameter `filter_family`, which filter Kata sandboxes metrics with specific names. If `filter_family` is set to `A` (and `B`, split with `,`), metrics with prefix `A` (and `B`) will only be returned.
+
+The `kata_monitor_sandbox_storage_path_available` metric reports whether each
+configured Go or runtime-rs sandbox storage path is being watched. The
+`/readyz` endpoint returns HTTP 200 when at least one path is available and
+HTTP 503 when every configured path is unavailable.
 
 The `/sandboxes` endpoint lists the _sandbox ID_ of all the detected Kata runtimes. If accessed via a web browser, it provides html links to the endpoints available for each sandbox.
 

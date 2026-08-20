@@ -34,9 +34,10 @@ source "${BATS_TEST_DIRNAME}/../kata-deploy/lib/helm-deploy.bash"
 # proxy latency without dragging the test runtime up.
 KATA_MONITOR_CACHE_TIMEOUT_S="${KATA_MONITOR_CACHE_TIMEOUT_S:-30}"
 
-# Pod name used to give kata-monitor a real sandbox to surface metrics
-# about. Kept fixed so teardown can clean it up unconditionally.
-KATA_MONITOR_PROBE_POD="kata-monitor-probe"
+# Pod names used to give kata-monitor one Go and one runtime-rs sandbox
+# to surface metrics about. Kept fixed so teardown can clean them up.
+KATA_MONITOR_GO_PROBE_POD="kata-monitor-probe-go"
+KATA_MONITOR_RS_PROBE_POD="kata-monitor-probe-runtime-rs"
 
 setup() {
 	ensure_helm
@@ -83,19 +84,21 @@ wait_for_metrics() {
 	return 1
 }
 
-predicate_has_running_shim() {
-	# Match `kata_monitor_running_shim_count <N>` where N >= 1.
-	grep -E '^kata_monitor_running_shim_count [1-9][0-9]* *$' >/dev/null
+predicate_has_two_running_shims() {
+	# Match `kata_monitor_running_shim_count <N>` where N >= 2.
+	grep -E '^kata_monitor_running_shim_count ([2-9]|[1-9][0-9]+) *$' >/dev/null
 }
 
 predicate_no_running_shim() {
 	grep -E '^kata_monitor_running_shim_count 0 *$' >/dev/null
 }
 
-predicate_has_shim_metric() {
-	# Any kata_shim_* metric line with a non-empty sandbox_id label is
-	# enough to prove the per-sandbox scrape path works end-to-end.
-	grep -E '^kata_shim_[a-z_]+\{[^}]*sandbox_id="[0-9a-f-]+' >/dev/null
+predicate_has_two_sandbox_metrics() {
+	# Two distinct sandbox_id labels prove the Go and runtime-rs probe
+	# sandboxes are both scraped.
+	grep -oE 'sandbox_id="[0-9a-f-]+"' \
+		| sort -u \
+		| awk 'END { exit(NR < 2) }'
 }
 
 wait_for_pods_to_exist() {
@@ -123,10 +126,19 @@ wait_for_pods_to_exist() {
 	echo "Installing kata-deploy with monitor.enabled=true ..."
 	echo "  kata-monitor image: ${KATA_MONITOR_IMAGE_REFERENCE}:${KATA_MONITOR_IMAGE_TAG}"
 
-	HELM_TIMEOUT="${helm_timeout}" deploy_kata "" \
+	local mixed_values
+	mixed_values="$(mktemp)"
+	cat > "${mixed_values}" <<EOF
+shims:
+  qemu-runtime-rs:
+    enabled: true
+EOF
+
+	HELM_TIMEOUT="${helm_timeout}" deploy_kata "${mixed_values}" \
 		--set monitor.enabled=true \
 		--set "monitor.image.reference=${KATA_MONITOR_IMAGE_REFERENCE}" \
 		--set "monitor.image.tag=${KATA_MONITOR_IMAGE_TAG}"
+	rm -f "${mixed_values}"
 
 	# deploy_kata's readiness wait is best-effort, so make sure kata-deploy has
 	# really finished here: everything below is written around containerd having
@@ -168,6 +180,11 @@ wait_for_pods_to_exist() {
 		-l app.kubernetes.io/name=kata-monitor \
 		--for=condition=Ready --timeout="${rollout_timeout}"
 
+	local readiness
+	readiness="$(kata_monitor_get /readyz)"
+	echo "${readiness}" | grep -q '^/run/vc/sbs available$'
+	echo "${readiness}" | grep -q '^/run/kata available$'
+
 	local restarts
 	restarts="$(kubectl -n "${HELM_NAMESPACE}" get pods \
 		-l app.kubernetes.io/name=kata-monitor \
@@ -180,18 +197,33 @@ wait_for_pods_to_exist() {
 		}
 	done <<< "${restarts}"
 
-	# Give kata-monitor something real to surface metrics about: a kata
-	# pod that just sleeps. Reuses the same image as kata-deploy.bats's
-	# verification pod for cache-warmth on the runner.
+	# Give kata-monitor one Go and one runtime-rs sandbox to surface.
+	# Both pods just sleep and reuse the kata-deploy verification image
+	# for cache warmth on the runner.
 	local probe_yaml
 	probe_yaml=$(mktemp)
 	cat > "${probe_yaml}" <<EOF
 apiVersion: v1
 kind: Pod
 metadata:
-  name: ${KATA_MONITOR_PROBE_POD}
+  name: ${KATA_MONITOR_GO_PROBE_POD}
 spec:
   runtimeClassName: kata-${KATA_HYPERVISOR}
+  restartPolicy: Never
+  nodeSelector:
+    katacontainers.io/kata-runtime: "true"
+  containers:
+    - name: probe
+      image: quay.io/kata-containers/alpine-bash-curl:latest
+      imagePullPolicy: IfNotPresent
+      command: ["sh", "-c", "sleep 600"]
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ${KATA_MONITOR_RS_PROBE_POD}
+spec:
+  runtimeClassName: kata-qemu-runtime-rs
   restartPolicy: Never
   nodeSelector:
     katacontainers.io/kata-runtime: "true"
@@ -203,24 +235,25 @@ spec:
 EOF
 
 	echo ""
-	echo "Creating kata probe pod ..."
+	echo "Creating Go and runtime-rs kata probe pods ..."
 	kubectl apply -f "${probe_yaml}"
 	rm -f "${probe_yaml}"
 
-	kubectl wait "pod/${KATA_MONITOR_PROBE_POD}" \
+	kubectl wait "pod/${KATA_MONITOR_GO_PROBE_POD}" \
+		"pod/${KATA_MONITOR_RS_PROBE_POD}" \
 		--for=condition=Ready --timeout=300s
 
 	echo ""
 	echo "::group::Probe pod status"
-	kubectl get "pod/${KATA_MONITOR_PROBE_POD}" -o wide
+	kubectl get "pod/${KATA_MONITOR_GO_PROBE_POD}" \
+		"pod/${KATA_MONITOR_RS_PROBE_POD}" -o wide
 	echo "::endgroup::"
 
-	# Now the per-sandbox assertions. Wait for the monitor's cache to
-	# pick the probe up, then prove a shim metric actually lands in the
-	# scrape body.
-	wait_for_metrics predicate_has_running_shim
-	wait_for_metrics predicate_has_shim_metric
-	echo "kata-monitor /metrics surfaced the probe sandbox"
+	# Wait for the monitor's cache to pick up both storage paths, then
+	# prove both sandboxes contribute shim metrics.
+	wait_for_metrics predicate_has_two_running_shims
+	wait_for_metrics predicate_has_two_sandbox_metrics
+	echo "kata-monitor /metrics surfaced both probe sandboxes"
 
 	# /sandboxes is the second public endpoint of kata-monitor; confirm
 	# it lists at least one sandbox while the probe pod is alive.
@@ -229,8 +262,8 @@ EOF
 	echo "::group::/sandboxes response"
 	printf '%s\n' "${sandboxes}"
 	echo "::endgroup::"
-	[[ -n "${sandboxes//[[:space:]]/}" ]] || {
-		echo "/sandboxes returned empty body" >&2
+	[[ "$(echo "${sandboxes}" | awk 'NF { count++ } END { print count + 0 }')" -ge 2 ]] || {
+		echo "/sandboxes returned fewer than two sandboxes" >&2
 		return 1
 	}
 
@@ -238,8 +271,9 @@ EOF
 	# the sandbox out — mirrors is_sandbox_missing_iterate in the
 	# host-level test.
 	echo ""
-	echo "Deleting probe pod and asserting cache invalidates ..."
-	kubectl delete "pod/${KATA_MONITOR_PROBE_POD}" --wait=true --timeout=60s
+	echo "Deleting probe pods and asserting cache invalidates ..."
+	kubectl delete "pod/${KATA_MONITOR_GO_PROBE_POD}" \
+		"pod/${KATA_MONITOR_RS_PROBE_POD}" --wait=true --timeout=60s
 
 	wait_for_metrics predicate_no_running_shim
 	echo "kata-monitor /metrics dropped the probe sandbox after deletion"
@@ -251,7 +285,9 @@ teardown() {
 	# Best-effort cleanup — the @test deletes the probe pod on the
 	# happy path, but a failure between create and delete would leave
 	# it behind.
-	kubectl delete "pod/${KATA_MONITOR_PROBE_POD}" --ignore-not-found --wait=false 2>/dev/null || true
+	kubectl delete "pod/${KATA_MONITOR_GO_PROBE_POD}" \
+		"pod/${KATA_MONITOR_RS_PROBE_POD}" \
+		--ignore-not-found --wait=false 2>/dev/null || true
 
 	uninstall_kata
 }
