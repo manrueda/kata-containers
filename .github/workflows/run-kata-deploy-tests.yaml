@@ -33,26 +33,41 @@ permissions: {}
 
 jobs:
   run-kata-deploy-tests:
-    name: run-kata-deploy-tests
+    name: run-kata-deploy-tests-${{ matrix.arch }}-${{ matrix.vmm }}-${{ matrix.k8s }}
     strategy:
       fail-fast: false
       matrix:
+        arch:
+          - amd64
+          - arm64
         vmm:
           - qemu
+          - qemu-runtime-rs
+          - clh
+          - dragonball
         k8s:
-          - k0s
           - k3s
-          - rke2
-          - microk8s
-          - kubeadm
+        include:
+          - arch: amd64
+            vmm: qemu
+            k8s: k0s
+          - arch: amd64
+            vmm: qemu
+            k8s: rke2
+          - arch: amd64
+            vmm: qemu
+            k8s: microk8s
+          - arch: amd64
+            vmm: qemu
+            k8s: kubeadm
     concurrency:
       group: ${{ github.workflow }}-${{ github.job }}-${{ github.event.pull_request.number || github.ref }}-${{ toJSON(matrix) }}
       cancel-in-progress: true
-    runs-on: ubuntu-26.04
+    runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-26.04' }}
     env:
       DOCKER_REGISTRY: ${{ inputs.registry }}
       DOCKER_REPO: ${{ inputs.repo }}
-      DOCKER_TAG: ${{ inputs.tag }}
+      DOCKER_TAG: ${{ matrix.arch == 'arm64' && inputs['arm64-tag'] || inputs.tag }}
       GH_PR_NUMBER: ${{ inputs.pr-number }}
       KATA_HYPERVISOR: ${{ matrix.vmm }}
       KUBERNETES: ${{ matrix.k8s }}
