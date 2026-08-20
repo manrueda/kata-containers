@@ -54,6 +54,10 @@ use tokio::{
 
 const VSOCK_SCHEME: &str = "vsock";
 
+fn spawn_qemu_command(command: &mut Command, _cmdline: &QemuCmdLine<'_>) -> io::Result<Child> {
+    command.stderr(Stdio::piped()).spawn()
+}
+
 #[derive(Debug)]
 pub struct QemuInner {
     /// sandbox id
@@ -392,8 +396,10 @@ impl QemuInner {
         info!(sl!(), "qemu args: {}", qemu_args.join(" "));
         let mut command = Command::new(&self.config.path);
         command.args(qemu_args);
-        // Extract the state needed after QEMU starts while retaining cmdline's
-        // inherited descriptors through command.spawn().
+
+        // QemuCmdLine borrows self.config. Extract the state needed after QEMU
+        // starts, but keep cmdline alive until spawn so its inherited file
+        // descriptors remain open for the child.
         let ccw_subchannel = cmdline.take_ccw_subchannel();
         let block_fdsets = cmdline.take_block_fdsets();
         let has_memory_hotplug_region = cmdline.has_memory_hotplug_region();
@@ -446,9 +452,9 @@ impl QemuInner {
             .cloned()
             .ok_or_else(|| anyhow!("no exit notify"))?;
 
-        let mut qemu_process = command.stderr(Stdio::piped()).spawn()?;
-        // QEMU inherited its startup descriptors during spawn. Drop the
-        // privileged shim's copies immediately; QEMU owns the fdsets from here.
+        let mut qemu_process = spawn_qemu_command(&mut command, &cmdline)?;
+        // Release the self.config borrow before startup initialization mutably
+        // accesses self. QEMU has inherited all cmdline-owned descriptors.
         drop(cmdline);
         let stderr = qemu_process.stderr.take().unwrap();
         self.qemu_process = Mutex::new(Some(qemu_process));
@@ -1475,6 +1481,43 @@ mod tests {
 
     use super::*;
     use rstest::rstest;
+    use serial_test::serial;
+
+    #[tokio::test]
+    #[serial]
+    async fn test_qemu_cmdline_fds_survive_spawn() {
+        let socket_path = get_qmp_socket_path("fd-lifetime");
+        let _ = fs::remove_file(&socket_path);
+
+        let mut config = HypervisorConfig::default();
+        config.boot_info.vm_rootfs_driver = VIRTIO_BLK_PCI.to_owned();
+        config.boot_info.rootfs_type = "ext4".to_owned();
+        config.cpu_info.default_vcpus = 1.0;
+        config.cpu_info.default_maxvcpus = 1;
+        config.machine_info.machine_type = "q35".to_owned();
+        config.memory_info.default_memory = 2048;
+        let cmdline = QemuCmdLine::new("fd-lifetime", &config).unwrap();
+        let args = cmdline.build().await.unwrap();
+        let qmp_arg = args
+            .windows(2)
+            .find_map(|args| (args[0] == "-qmp").then_some(args[1].as_str()))
+            .unwrap();
+        let qmp_fd = qmp_arg
+            .strip_prefix("unix:fd=")
+            .and_then(|arg| arg.split(',').next())
+            .unwrap();
+
+        let mut command = Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg(format!("test -e /proc/self/fd/{qmp_fd}"));
+
+        let mut child = spawn_qemu_command(&mut command, &cmdline).unwrap();
+        drop(cmdline);
+        assert!(child.wait().await.unwrap().success());
+
+        let _ = fs::remove_file(socket_path);
+    }
 
     #[tokio::test]
     async fn test_network_device_hotplug_capability() {
