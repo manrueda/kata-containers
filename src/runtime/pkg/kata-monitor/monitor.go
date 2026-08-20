@@ -40,8 +40,49 @@ func SetLogger(logger *logrus.Entry) {
 
 // KataMonitor is monitor agent
 type KataMonitor struct {
-	sandboxCache    *sandboxCache
-	runtimeEndpoint string
+	sandboxCache       *sandboxCache
+	runtimeEndpoint    string
+	sandboxFSPaths     []string
+	sandboxFSPathState *sandboxFSPathState
+}
+
+type sandboxFSPathState struct {
+	sync.RWMutex
+	available map[string]bool
+}
+
+func newSandboxFSPathState(paths []string) *sandboxFSPathState {
+	state := &sandboxFSPathState{
+		available: make(map[string]bool, len(paths)),
+	}
+	for _, path := range paths {
+		state.available[path] = false
+		sandboxFSPathAvailable.WithLabelValues(path).Set(0)
+	}
+	return state
+}
+
+func (state *sandboxFSPathState) set(path string, available bool) {
+	state.Lock()
+	state.available[path] = available
+	state.Unlock()
+
+	value := float64(0)
+	if available {
+		value = 1
+	}
+	sandboxFSPathAvailable.WithLabelValues(path).Set(value)
+}
+
+func (state *sandboxFSPathState) snapshot() map[string]bool {
+	state.RLock()
+	defer state.RUnlock()
+
+	paths := make(map[string]bool, len(state.available))
+	for path, available := range state.available {
+		paths[path] = available
+	}
+	return paths
 }
 
 // NewKataMonitor create and return a new KataMonitor instance
@@ -54,8 +95,11 @@ func NewKataMonitor(runtimeEndpoint string) (*KataMonitor, error) {
 		runtimeEndpoint = "unix://" + runtimeEndpoint
 	}
 
+	sandboxFSPaths := getSandboxFSPaths()
 	km := &KataMonitor{
-		runtimeEndpoint: runtimeEndpoint,
+		runtimeEndpoint:    runtimeEndpoint,
+		sandboxFSPaths:     sandboxFSPaths,
+		sandboxFSPathState: newSandboxFSPathState(sandboxFSPaths),
 		sandboxCache: &sandboxCache{
 			Mutex:     &sync.Mutex{},
 			sandboxes: make(map[string]sandboxCRIMetadata),
@@ -113,6 +157,40 @@ func (km *KataMonitor) syncSandboxFSPath(watcher *fsnotify.Watcher, path string,
 	return sandboxes, nil
 }
 
+func (km *KataMonitor) markWatchedPathsUnavailable(watcher *fsnotify.Watcher, watched map[string]struct{}) {
+	for path := range watched {
+		_ = watcher.Remove(path)
+		delete(watched, path)
+		km.sandboxFSPathState.set(path, false)
+	}
+}
+
+func (km *KataMonitor) sandboxExists(id string) bool {
+	for _, path := range km.sandboxFSPaths {
+		info, err := os.Stat(filepath.Join(path, id))
+		if err == nil && info.IsDir() {
+			return true
+		}
+	}
+	return false
+}
+
+func (km *KataMonitor) pruneMissingSandboxes(pending []string) []string {
+	for _, id := range km.sandboxCache.getSandboxList() {
+		if !km.sandboxExists(id) {
+			km.sandboxCache.deleteIfExists(id)
+		}
+	}
+
+	existing := pending[:0]
+	for _, id := range pending {
+		if km.sandboxExists(id) {
+			existing = append(existing, id)
+		}
+	}
+	return existing
+}
+
 // startPodCacheUpdater will boot a thread to manage sandbox cache
 func (km *KataMonitor) startPodCacheUpdater() {
 	sbsWatcher, err := fsnotify.NewWatcher()
@@ -122,7 +200,7 @@ func (km *KataMonitor) startPodCacheUpdater() {
 	}
 	defer sbsWatcher.Close()
 
-	sandboxFSPaths := getSandboxFSPaths()
+	sandboxFSPaths := km.sandboxFSPaths
 	watchedPaths := make(map[string]struct{}, len(sandboxFSPaths))
 	sandboxList := []string{}
 
@@ -130,10 +208,12 @@ func (km *KataMonitor) startPodCacheUpdater() {
 		for _, path := range sandboxFSPaths {
 			added, syncErr := km.syncSandboxFSPath(sbsWatcher, path, watchedPaths)
 			if syncErr != nil {
+				km.sandboxFSPathState.set(path, false)
 				// Path may not exist yet when no sandboxes of that runtime are present.
 				monitorLog.WithError(syncErr).Warnf("cannot monitor %s, retry in %d sec.", path, fsMonitorRetryDelaySeconds)
 				continue
 			}
+			km.sandboxFSPathState.set(path, true)
 			sandboxList = append(sandboxList, added...)
 		}
 	}
@@ -179,11 +259,13 @@ func (km *KataMonitor) startPodCacheUpdater() {
 						"cache update timer fires in %d secs", podCacheRefreshDelaySeconds)
 				}
 
-			case event.Op&fsnotify.Remove == fsnotify.Remove:
+			case event.Op&(fsnotify.Remove|fsnotify.Rename) != 0:
 				// A watched root may disappear (e.g. last sandbox cleaned up the tree).
 				// Drop it from watchedPaths so the retry ticker can re-attach later.
 				if _, ok := watchedPaths[event.Name]; ok {
 					delete(watchedPaths, event.Name)
+					km.sandboxFSPathState.set(event.Name, false)
+					sandboxList = km.pruneMissingSandboxes(sandboxList)
 					monitorLog.WithField("path", event.Name).Warn("sandbox storage path removed; will retry watch")
 					continue
 				}
@@ -195,6 +277,15 @@ func (km *KataMonitor) startPodCacheUpdater() {
 				sandboxList = removeFromSandboxList(sandboxList, id)
 				monitorLog.WithField("pod", id).Info("sandbox cache: removed pod")
 			}
+
+		case watchErr, ok := <-sbsWatcher.Errors:
+			if !ok {
+				monitorLog.Fatal("sandbox fs watcher error channel closed")
+				os.Exit(1)
+			}
+			monitorLog.WithError(watchErr).Error("sandbox fs watcher failed; reattaching all paths")
+			km.markWatchedPathsUnavailable(sbsWatcher, watchedPaths)
+			sandboxList = km.pruneMissingSandboxes(sandboxList)
 
 		case <-watchRetryTicker.C:
 			if len(watchedPaths) < len(sandboxFSPaths) {
@@ -219,6 +310,33 @@ func (km *KataMonitor) startPodCacheUpdater() {
 
 			monitorLog.WithField("sandboxes", km.sandboxCache.getSandboxList()).Trace("dump sandbox cache")
 		}
+	}
+}
+
+// Readiness reports whether at least one configured sandbox storage path is
+// being watched. This keeps Go-only and runtime-rs-only nodes healthy while
+// surfacing the case where kata-monitor cannot discover any sandboxes.
+func (km *KataMonitor) Readiness(w http.ResponseWriter, _ *http.Request) {
+	paths := km.sandboxFSPathState.snapshot()
+	ready := false
+	for _, available := range paths {
+		if available {
+			ready = true
+			break
+		}
+	}
+
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	if !ready {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}
+
+	for _, path := range km.sandboxFSPaths {
+		status := "unavailable"
+		if paths[path] {
+			status = "available"
+		}
+		fmt.Fprintf(w, "%s %s\n", path, status)
 	}
 }
 

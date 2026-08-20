@@ -113,6 +113,11 @@ func main() {
 	m := http.NewServeMux()
 	endpoints = []endpoint{
 		{
+			path:    "/readyz",
+			desc:    "Check whether at least one sandbox storage path is available.",
+			handler: km.Readiness,
+		},
+		{
 			path:    "/metrics",
 			desc:    "Get metrics from sandboxes.",
 			handler: km.ProcessMetricsRequest,

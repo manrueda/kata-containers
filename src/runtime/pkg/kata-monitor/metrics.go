@@ -56,6 +56,12 @@ var (
 		Buckets:   prometheus.ExponentialBuckets(1, 2, 10),
 	})
 
+	sandboxFSPathAvailable = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: promNamespaceMonitor,
+		Name:      "sandbox_storage_path_available",
+		Help:      "Whether kata-monitor can watch a sandbox storage path (1 for available, 0 for unavailable).",
+	}, []string{"path"})
+
 	gzipPool = sync.Pool{
 		New: func() interface{} {
 			return gzip.NewWriter(nil)
@@ -68,6 +74,7 @@ func registerMetrics() {
 	prometheus.MustRegister(scrapeCount)
 	prometheus.MustRegister(scrapeFailedCount)
 	prometheus.MustRegister(scrapeDurationsHistogram)
+	prometheus.MustRegister(sandboxFSPathAvailable)
 }
 
 // ProcessMetricsRequest get metrics from shim/hypervisor/vm/agent and return metrics to client.

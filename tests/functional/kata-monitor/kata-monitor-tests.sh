@@ -101,12 +101,12 @@ start_kata_monitor() {
 		# `--network host` keeps the default 127.0.0.1:8090 bind
 		# reachable from the host-side test code without having to
 		# publish a port. Mount /run/containerd so the monitor can
-		# reach containerd's CRI socket, plus the kata sandbox base
-		# path for the per-sandbox shim-monitor sockets.
+		# reach containerd's CRI socket, plus the Go and runtime-rs
+		# sandbox paths for the per-sandbox shim-monitor sockets.
 
-		# Ensure /run/vc/sbs/ exists on the host so the readonly mount
-		# does not fail before the first kata sandbox is created.
-		sudo mkdir -p /run/vc/sbs
+		# Ensure the sandbox paths exist on the host so the readonly
+		# mounts do not fail before the first sandbox is created.
+		sudo mkdir -p /run/vc/sbs /run/kata
 
 		# shellcheck disable=SC2086
 		sudo docker run --rm -d \
@@ -114,6 +114,7 @@ start_kata_monitor() {
 			--network host \
 			-v /run/containerd:/run/containerd:ro \
 			-v /run/vc/sbs:/run/vc/sbs:ro \
+			-v /run/kata:/run/kata:ro \
 			"${KATA_MONITOR_IMAGE}" \
 			${args} --log-level trace > /dev/null
 		# Stream container logs into the same file the binary path
