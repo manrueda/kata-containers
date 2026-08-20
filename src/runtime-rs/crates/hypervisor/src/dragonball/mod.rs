@@ -14,6 +14,7 @@ mod seccomp;
 pub mod vmm_instance;
 
 use std::collections::HashMap;
+use std::fs::File;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -195,6 +196,11 @@ impl Hypervisor for Dragonball {
     async fn get_ns_path(&self) -> Result<String> {
         let inner = self.inner.read().await;
         inner.get_ns_path().await
+    }
+
+    async fn get_vmm_netns(&self) -> Result<Option<File>> {
+        let inner = self.inner.read().await;
+        inner.get_vmm_netns().map(Some)
     }
 
     async fn check(&self) -> Result<()> {

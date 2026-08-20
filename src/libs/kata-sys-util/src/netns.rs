@@ -20,27 +20,38 @@ pub struct NetnsGuard {
 
 impl NetnsGuard {
     pub fn new(new_netns_path: &str) -> Result<Self> {
-        let old_netns = if !new_netns_path.is_empty() {
-            let current_netns_path = format!("/proc/{}/task/{}/ns/{}", getpid(), gettid(), "net");
-            let old_netns = File::open(&current_netns_path)
-                .with_context(|| format!("open current netns path {}", &current_netns_path))?;
-            let new_netns = File::open(new_netns_path)
-                .with_context(|| format!("open new netns path {}", &new_netns_path))?;
-            setns(&new_netns, CloneFlags::CLONE_NEWNET)
-                .with_context(|| "set netns to new netns")?;
-            info!(
-                sl!(),
-                "set netns from old {:?} to new {:?} tid {}",
-                old_netns,
-                new_netns,
-                gettid().to_string()
-            );
-            Some(old_netns)
-        } else {
+        if new_netns_path.is_empty() {
             warn!(sl!(), "skip to set netns for empty netns path");
-            None
-        };
-        Ok(Self { old_netns })
+            return Ok(Self { old_netns: None });
+        }
+
+        let new_netns = File::open(new_netns_path)
+            .with_context(|| format!("open new netns path {}", &new_netns_path))?;
+        Self::from_file(&new_netns)
+    }
+
+    /// Enter a network namespace through an already-open file descriptor.
+    ///
+    /// The caller may retain this descriptor even after the procfs path used
+    /// to open it disappears, for example when the namespace belongs to a
+    /// thread that has exited.
+    pub fn from_file(new_netns: &File) -> Result<Self> {
+        let current_netns_path = format!("/proc/{}/task/{}/ns/{}", getpid(), gettid(), "net");
+        let old_netns = File::open(&current_netns_path)
+            .with_context(|| format!("open current netns path {}", &current_netns_path))?;
+
+        setns(new_netns, CloneFlags::CLONE_NEWNET).context("set netns to new netns")?;
+        info!(
+            sl!(),
+            "set netns from old {:?} to new {:?} tid {}",
+            old_netns,
+            new_netns,
+            gettid().to_string()
+        );
+
+        Ok(Self {
+            old_netns: Some(old_netns),
+        })
     }
 }
 
@@ -83,6 +94,30 @@ mod tests {
 
         let empty_path = "";
         assert!(NetnsGuard::new(empty_path).unwrap().old_netns.is_none());
+    }
+
+    #[test]
+    fn test_netns_guard_from_file_after_thread_exit() {
+        // setns requires root even when entering the current namespace.
+        skip_if_not_root!();
+
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            let tid = gettid();
+            let path = format!("/proc/{}/task/{}/ns/net", getpid(), tid);
+            let netns = File::open(&path).unwrap();
+            sender.send((netns, path)).unwrap();
+        });
+
+        let (netns, path) = receiver.recv().unwrap();
+        thread.join().unwrap();
+        assert!(
+            !std::path::Path::new(&path).exists(),
+            "thread namespace path should disappear after thread exit"
+        );
+
+        let netns_guard = NetnsGuard::from_file(&netns).unwrap();
+        drop(netns_guard);
     }
 
     #[test]

@@ -47,6 +47,9 @@ const KVM_DEVICE: &str = "/dev/kvm";
 pub struct VmmInstance {
     /// VMM instance info directly accessible from runtime
     vmm_shared_info: Arc<RwLock<InstanceInfo>>,
+    /// Stable reference to the VMM master's network namespace. Dragonball
+    /// runs in a shim thread, so its procfs task path is not a durable handle.
+    vmm_netns: Arc<RwLock<Option<File>>>,
     to_vmm: Option<Sender<VmmRequest>>,
     from_vmm: Option<Receiver<VmmResponse>>,
     to_vmm_fd: EventFd,
@@ -68,6 +71,7 @@ impl VmmInstance {
 
         VmmInstance {
             vmm_shared_info,
+            vmm_netns: Arc::new(RwLock::new(None)),
             to_vmm: None,
             from_vmm: None,
             to_vmm_fd,
@@ -97,6 +101,39 @@ impl VmmInstance {
         let info = info_binding.read().unwrap();
         let result = format!("/proc/{}/task/{}/ns", info.pid, info.master_tid);
         result
+    }
+
+    pub fn get_vmm_netns(&self) -> Result<File> {
+        let info = self
+            .vmm_shared_info
+            .read()
+            .map_err(|_| anyhow!("VMM instance info lock poisoned"))?;
+        let vmm_netns = self
+            .vmm_netns
+            .read()
+            .map_err(|_| anyhow!("VMM netns lock poisoned"))?;
+        let netns = vmm_netns.as_ref().with_context(|| {
+            format!(
+                "VMM netns fd unavailable for pid {} master tid {}",
+                info.pid, info.master_tid
+            )
+        })?;
+
+        netns.try_clone().with_context(|| {
+            format!(
+                "clone VMM netns fd for pid {} master tid {}",
+                info.pid, info.master_tid
+            )
+        })
+    }
+
+    pub(crate) fn clear_vmm_netns(&self) {
+        match self.vmm_netns.write() {
+            Ok(mut netns) => {
+                *netns = None;
+            }
+            Err(_) => warn!(sl!(), "Failed to clear poisoned VMM netns lock"),
+        }
     }
 
     pub fn get_vcpu_tids(&self) -> Vec<(u8, u32)> {
@@ -131,7 +168,13 @@ impl VmmInstance {
         )
         .expect("Failed to start vmm");
         let vmm_shared_info = self.get_shared_info();
+        let vmm_netns = self.vmm_netns.clone();
         let exit_notify = self.exit_notify.take().unwrap();
+
+        *self
+            .vmm_netns
+            .write()
+            .map_err(|_| anyhow!("VMM netns lock poisoned"))? = None;
 
         self.vmm_thread = Some(
             thread::Builder::new()
@@ -148,6 +191,18 @@ impl VmmInstance {
                                 .with_context(|| format!("open netns path {}", &netns_path))?;
                             setns(&netns_fd, CloneFlags::CLONE_NEWNET).context("set netns ")?;
                         }
+
+                        // Open this from the VMM thread after setns. The owned
+                        // descriptor remains valid even if the task exits and
+                        // /proc/<pid>/task/<tid>/ns/net disappears.
+                        let current_netns_path = format!("/proc/self/task/{}/ns/net", cur_tid);
+                        let current_netns = File::open(&current_netns_path).with_context(|| {
+                            format!("open VMM netns path {}", current_netns_path)
+                        })?;
+                        *vmm_netns
+                            .write()
+                            .map_err(|_| anyhow!("VMM netns lock poisoned"))? = Some(current_netns);
+
                         let exit_code =
                             Vmm::run_vmm_event_loop(Arc::new(Mutex::new(vmm)), vmm_service);
                         exit_notify
@@ -404,6 +459,7 @@ impl VmmInstance {
         // vmm is not running, join thread will be hang.
         if self.is_uninitialized() || self.vmm_thread.is_none() {
             debug!(sl!(), "vmm-master thread is uninitialized or has exited.");
+            self.clear_vmm_netns();
             return Ok(());
         }
         debug!(sl!(), "join vmm-master thread exit.");
@@ -411,6 +467,7 @@ impl VmmInstance {
         // vmm_thread must be exited, otherwise there will be other sync issues.
         // unwrap is safe, if vmm_thread is None, impossible run to here.
         self.vmm_thread.take().unwrap().join().ok();
+        self.clear_vmm_netns();
         info!(sl!(), "vmm-master thread join succeed.");
         Ok(())
     }
@@ -480,5 +537,48 @@ impl VmmInstance {
             "After {} attempts, it still doesn't work.",
             REQUEST_RETRY
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::fd::AsRawFd;
+
+    use super::*;
+
+    #[test]
+    fn test_vmm_netns_fd_survives_owner_thread() {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let owner = thread::spawn(move || {
+            let tid = nix::unistd::gettid();
+            let path = format!("/proc/{}/task/{}/ns/net", std::process::id(), tid);
+            let netns = File::open(&path).unwrap();
+            sender.send((netns, path)).unwrap();
+        });
+
+        let (netns, path) = receiver.recv().unwrap();
+        owner.join().unwrap();
+        assert!(
+            !std::path::Path::new(&path).exists(),
+            "thread namespace path should disappear after thread exit"
+        );
+
+        let (exit_notify, _exit_waiter) = mpsc::channel(1);
+        let instance = VmmInstance::new("stable-netns-test", exit_notify);
+        *instance.vmm_netns.write().unwrap() = Some(netns);
+
+        let cloned_netns = instance.get_vmm_netns().unwrap();
+        let retained_target =
+            std::fs::read_link(format!("/proc/self/fd/{}", cloned_netns.as_raw_fd())).unwrap();
+        assert!(
+            retained_target.to_string_lossy().starts_with("net:["),
+            "retained fd should still reference a network namespace"
+        );
+
+        instance.clear_vmm_netns();
+        assert!(
+            instance.get_vmm_netns().is_err(),
+            "cleanup must release the retained namespace"
+        );
     }
 }
