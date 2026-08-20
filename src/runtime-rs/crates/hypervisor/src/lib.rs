@@ -36,7 +36,7 @@ pub mod remote;
 pub mod selinux;
 pub use kernel_param::Param;
 pub mod utils;
-use std::collections::HashMap;
+use std::{collections::HashMap, fs::File};
 
 #[cfg(all(
     feature = "cloud-hypervisor",
@@ -163,6 +163,11 @@ pub trait Hypervisor: std::fmt::Debug + Send + Sync {
     async fn get_pids(&self) -> Result<Vec<u32>>;
     async fn get_vmm_master_tid(&self) -> Result<u32>;
     async fn get_ns_path(&self) -> Result<String>;
+    /// Return a stable reference to the VMM network namespace when the
+    /// hypervisor owns one. External VMMs keep using their procfs path.
+    async fn get_vmm_netns(&self) -> Result<Option<File>> {
+        Ok(None)
+    }
     async fn cleanup(&self) -> Result<()>;
     async fn check(&self) -> Result<()>;
     async fn get_jailer_root(&self) -> Result<String>;

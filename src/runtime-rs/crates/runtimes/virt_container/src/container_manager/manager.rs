@@ -107,8 +107,20 @@ impl ContainerManager for VirtContainerManager {
         // * should be run in vmm namespace (hook path in runtime namespace)
         // * should be run after the vm is started, before container is created, and after CreateRuntime Hooks
         // * spec details: https://github.com/opencontainers/runtime-spec/blob/c1662686cff159595277b79322d0272f5182941b/config.md#createcontainer-hooks
-        let vmm_ns_path = self.hypervisor.get_ns_path().await?;
+        let vmm_ns_path = self.hypervisor.get_ns_path().await.with_context(|| {
+            format!(
+                "create-container hooks: get VMM namespace path for sandbox {} master tid {}",
+                self.sid, vmm_master_tid
+            )
+        })?;
         let vmm_netns_path = format!("{}/{}", vmm_ns_path, "net");
+        let vmm_netns = self.hypervisor.get_vmm_netns().await.with_context(|| {
+            format!(
+                "create-container hooks: get stable VMM netns fd for sandbox {} \
+                     master tid {} (VMM pid/tid path {})",
+                self.sid, vmm_master_tid, vmm_netns_path
+            )
+        })?;
         let state = spec::State {
             version: spec.version().clone(),
             id: config.container_id.clone(),
@@ -120,21 +132,61 @@ impl ContainerManager for VirtContainerManager {
 
         // new scope, CreateContainer hooks in which will execute in a new network namespace
         {
-            let _netns_guard = NetnsGuard::new(&vmm_netns_path).context("vmm netns guard")?;
+            let _netns_guard = match vmm_netns.as_ref() {
+                Some(netns) => NetnsGuard::from_file(netns).with_context(|| {
+                    format!(
+                        "create-container hooks: enter stable VMM netns for sandbox {} \
+                         master tid {} (VMM pid/tid path {})",
+                        self.sid, vmm_master_tid, vmm_netns_path
+                    )
+                }),
+                None => NetnsGuard::new(&vmm_netns_path).with_context(|| {
+                    format!(
+                        "create-container hooks: enter VMM netns fallback path for sandbox {} \
+                         master tid {} (VMM pid/tid path {})",
+                        self.sid, vmm_master_tid, vmm_netns_path
+                    )
+                }),
+            }?;
             if let Some(hooks) = spec.hooks().as_ref() {
                 let mut create_container_hook_states = HookStates::new();
                 create_container_hook_states
-                    .execute_hooks(from_hooks(hooks.create_container()), Some(state))?;
+                    .execute_hooks(from_hooks(hooks.create_container()), Some(state))
+                    .with_context(|| {
+                        format!(
+                            "execute create-container hooks for container {} in sandbox {} \
+                             master tid {} (VMM pid/tid path {})",
+                            config.container_id, self.sid, vmm_master_tid, vmm_netns_path
+                        )
+                    })?;
             }
         }
 
         let mut containers = self.containers.write().await;
         if let Err(e) = container.create(spec).await {
             if let Err(inner_e) = container.cleanup().await {
-                warn!(sl!(), "failed to cleanup container {:?}", inner_e);
+                warn!(
+                    sl!(),
+                    "failed to rollback container {} in sandbox {} after create failure: {:?}",
+                    config.container_id,
+                    self.sid,
+                    inner_e
+                );
+                return Err(e).with_context(|| {
+                    format!(
+                        "create container {} in sandbox {}; per-container rollback also failed: \
+                         {inner_e:#}",
+                        config.container_id, self.sid
+                    )
+                });
             }
 
-            return Err(e);
+            return Err(e).with_context(|| {
+                format!(
+                    "create container {} in sandbox {}; per-container rollback attempted",
+                    config.container_id, self.sid
+                )
+            });
         }
 
         containers.insert(container.container_id.to_string(), container);

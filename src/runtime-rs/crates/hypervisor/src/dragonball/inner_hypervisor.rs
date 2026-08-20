@@ -5,6 +5,7 @@
 //
 
 use std::collections::{HashMap, HashSet};
+use std::fs::File;
 use std::iter::FromIterator;
 
 use anyhow::{anyhow, Context, Ok, Result};
@@ -153,6 +154,9 @@ impl DragonballInner {
     }
 
     pub(crate) async fn cleanup(&self) -> Result<()> {
+        // cleanup may run after the VMM waiter has already marked the sandbox
+        // stopped, bypassing stop_vm(). Release the namespace handle here too.
+        self.vmm_instance.clear_vmm_netns();
         self.cleanup_resource();
         Ok(())
     }
@@ -183,6 +187,10 @@ impl DragonballInner {
     pub(crate) async fn get_ns_path(&self) -> Result<String> {
         let ns_path = self.vmm_instance.get_ns_path();
         Ok(ns_path)
+    }
+
+    pub(crate) fn get_vmm_netns(&self) -> Result<File> {
+        self.vmm_instance.get_vmm_netns()
     }
 
     pub(crate) async fn check(&self) -> Result<()> {
