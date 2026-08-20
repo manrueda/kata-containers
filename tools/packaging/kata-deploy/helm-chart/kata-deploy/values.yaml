@@ -1024,6 +1024,12 @@ verification:
   # Default: 1200s (20 minutes)
   daemonsetTimeout: 1200
 
+  # Validate every enabled standard RuntimeClass on each supported architecture
+  # present in the cluster. The supplied pod is used as a template; verification
+  # sets runtimeClassName, kubernetes.io/arch, and a unique pod name for each run.
+  # Keep disabled to validate only the runtimeClassName already present in pod.
+  allRuntimeClasses: false
+
   # Pod spec for verification (optional)
   # If provided, a verification job will run after install/upgrade.
   # If empty, no verification is performed.

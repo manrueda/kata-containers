@@ -107,6 +107,7 @@ EOF
 	# Deploy kata-deploy using shared helper with verification options
 	HELM_TIMEOUT="${helm_timeout}" deploy_kata "" \
 		--set-file verification.pod="${verification_yaml}" \
+		--set verification.allRuntimeClasses=true \
 		--set verification.timeout="${verification_timeout}" \
 		--set verification.daemonsetTimeout="${daemonset_timeout}"
 
