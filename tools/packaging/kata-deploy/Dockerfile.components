@@ -73,6 +73,7 @@ WORKDIR /kata
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 COPY tools/packaging/kata-deploy/binary ./tools/packaging/kata-deploy/binary
+COPY tools/packaging/kata-deploy/shim-components.json ./tools/packaging/kata-deploy/shim-components.json
 
 # Install target and run tests based on architecture
 # - AMD64/arm64: use musl for fully static binaries

@@ -40,7 +40,8 @@ arch=$(uname -m)
 # Disable provenance and SBOM so each tag is a single image manifest. quay.io rejects
 # pushing multi-arch manifest lists that include attestation manifests ("manifest invalid").
 PLATFORM="linux/${arch}"
-COMMIT_TAG="kata-containers-$(git -C "${REPO_ROOT}" rev-parse HEAD)-${arch}"
+SOURCE_COMMIT="$(git -C "${REPO_ROOT}" rev-parse HEAD)"
+COMMIT_TAG="kata-containers-${SOURCE_COMMIT}-${arch}"
 IMAGE_TAG="${REGISTRY}:${COMMIT_TAG}"
 
 DOCKERFILE="${REPO_ROOT}/tools/packaging/kata-deploy/Dockerfile"
@@ -48,6 +49,7 @@ DOCKERFILE="${REPO_ROOT}/tools/packaging/kata-deploy/Dockerfile"
 echo "Building the kata-deploy image"
 docker buildx build --platform "${PLATFORM}" --provenance false --sbom false \
 	-f "${DOCKERFILE}" \
+	--build-arg "KATA_SOURCE_COMMIT=${SOURCE_COMMIT}" \
 	--tag "${IMAGE_TAG}" --push .
 
 if [[ -n "${TAG}" ]]; then
@@ -56,6 +58,7 @@ if [[ -n "${TAG}" ]]; then
 	echo "Building the ${ADDITIONAL_TAG} image"
 	docker buildx build --platform "${PLATFORM}" --provenance false --sbom false \
 		-f "${DOCKERFILE}" \
+		--build-arg "KATA_SOURCE_COMMIT=${SOURCE_COMMIT}" \
 		--tag "${ADDITIONAL_TAG}" --push .
 fi
 
