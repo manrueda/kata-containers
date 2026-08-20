@@ -10,17 +10,31 @@ FROM alpine:3.22 AS artifact-stage
 
 ARG KATA_ARTIFACTS_DIR=tools/packaging/kata-deploy/kata-artifacts
 ARG DESTINATION=/opt/kata-artifacts
+ARG KATA_SOURCE_COMMIT=unknown
 
 SHELL ["/bin/ash", "-eo", "pipefail", "-c"]
 
-RUN apk add --no-cache zstd
+RUN apk add --no-cache jq zstd
 
 COPY ${KATA_ARTIFACTS_DIR}/kata-static-*.tar.zst ${DESTINATION}/tarballs/
 COPY ${KATA_ARTIFACTS_DIR}/kata-deploy-static-*.tar.zst ${DESTINATION}/tarballs/
 COPY tools/packaging/kata-deploy/shim-components.json ${DESTINATION}/
+COPY tools/packaging/kata-deploy/validate-shim-components.sh /usr/local/bin/
 COPY versions.yaml ${DESTINATION}/
 
 RUN \
+	sh /usr/local/bin/validate-shim-components.sh \
+		"${DESTINATION}/shim-components.json" "${DESTINATION}/tarballs" && \
+	manifest_sha256="$(sha256sum "${DESTINATION}/shim-components.json" | awk '{print $1}')" && \
+	(cd "${DESTINATION}/tarballs" && sha256sum ./*.tar.zst | sort -k2 > "${DESTINATION}/tarballs.sha256") && \
+	printf '%s\n' \
+		"source=https://github.com/kata-containers/kata-containers" \
+		"metadata_source_commit=${KATA_SOURCE_COMMIT}" \
+		"architecture=$(uname -m)" \
+		"manifest=shim-components.json" \
+		"manifest_sha256=${manifest_sha256}" \
+		"archive_digests=tarballs.sha256" \
+		> "${DESTINATION}/payload-provenance.txt" && \
 	mkdir -p /opt/prebuilt && \
 	zstd -dc "${DESTINATION}/tarballs/kata-deploy-static-kata-deploy-binary.tar.zst" | tar -xf - -C /opt/prebuilt && \
 	zstd -dc "${DESTINATION}/tarballs/kata-deploy-static-nydus-snapshotter-for-coco-guest-pull.tar.zst" | tar -xf - -C /opt/prebuilt

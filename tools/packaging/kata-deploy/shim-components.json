@@ -1,8 +1,13 @@
 {
   "_comment": [
     "Maps each runtime class to the component tarballs it requires per architecture.",
+    "requiredComponents lists payload-wide optional features that the installer can enable.",
     "All names correspond directly to kata-static-<name>.tar.zst build artifacts."
   ],
+  "requiredComponents": {
+    "x86_64": ["rootfs-image-devkit-extension"],
+    "aarch64": ["rootfs-image-devkit-extension"]
+  },
   "shims": {
     "qemu": {
       "x86_64":  ["shim-v2-go", "qemu", "virtiofsd", "nydus", "kernel", "kernel-debug", "rootfs-image", "rootfs-initrd"],
@@ -38,7 +43,8 @@
       "x86_64": ["shim-v2-go", "qemu", "virtiofsd", "kernel-nvidia-gpu", "rootfs-image-nvidia-gpu", "ovmf"]
     },
     "qemu-nvidia-gpu-runtime-rs": {
-      "x86_64":  ["shim-v2-rust", "qemu-no-shared-fs", "kernel-nvidia-gpu", "rootfs-image-nvidia", "rootfs-image-nvidia-gpu-extension", "ovmf"]
+      "x86_64":  ["shim-v2-rust", "qemu-no-shared-fs", "kernel-nvidia-gpu", "rootfs-image-nvidia", "rootfs-image-nvidia-gpu-extension", "ovmf"],
+      "aarch64": ["shim-v2-rust", "qemu-no-shared-fs", "kernel-nvidia-gpu", "rootfs-image-nvidia", "rootfs-image-nvidia-gpu-extension", "ovmf"]
     },
     "qemu-nvidia-cpu": {
       "x86_64": ["shim-v2-go", "qemu", "virtiofsd", "kernel-nvidia-gpu", "rootfs-image-nvidia"],

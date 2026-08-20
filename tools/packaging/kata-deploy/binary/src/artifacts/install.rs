@@ -750,50 +750,84 @@ fn current_arch() -> &'static str {
     }
 }
 
-/// Parse shim-components.json and return the union of component tarball names
-/// required by all shims listed in `config.shims_for_arch` for the current arch.
-fn collect_required_tarballs(config: &Config) -> Result<HashSet<String>> {
-    let arch = current_arch();
-    let json_str = fs::read_to_string(SHIM_COMPONENTS_PATH)
-        .with_context(|| format!("Failed to read {SHIM_COMPONENTS_PATH}"))?;
+/// Parse a shim-components.json document and return the union of component
+/// tarball names required by all enabled shims for `arch`.
+///
+/// Every enabled shim must have a non-empty entry for the current architecture.
+/// Treating missing metadata as "no components" allows a different enabled shim
+/// to mask an incomplete payload, leaving a RuntimeClass configured without the
+/// binaries it needs.
+fn collect_required_tarballs_from_manifest(
+    config: &Config,
+    arch: &str,
+    json_str: &str,
+) -> Result<HashSet<String>> {
     let doc: serde_json::Value =
-        serde_json::from_str(&json_str).context("Failed to parse shim-components.json")?;
+        serde_json::from_str(json_str).context("Failed to parse shim-components.json")?;
     let shims_map = doc["shims"]
         .as_object()
         .ok_or_else(|| anyhow::anyhow!("shim-components.json is missing the 'shims' object"))?;
 
     let mut required: HashSet<String> = HashSet::new();
     for shim in &config.shims_for_arch {
-        match shims_map
+        let tarballs = shims_map
             .get(shim.as_str())
             .and_then(|v| v.get(arch))
             .and_then(|v| v.as_array())
-        {
-            Some(tarballs) => {
-                for t in tarballs {
-                    if let Some(name) = t.as_str() {
-                        required.insert(name.to_string());
-                    }
-                }
-            }
-            None => {
-                log::warn!(
-                    "Shim '{}' has no entry for architecture '{}' in shim-components.json; \
-                     no tarballs will be extracted for it",
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Enabled shim '{}' has no component metadata for architecture '{}' \
+                     in shim-components.json",
                     shim,
                     arch
-                );
-            }
+                )
+            })?;
+
+        if tarballs.is_empty() {
+            anyhow::bail!(
+                "Enabled shim '{}' has empty component metadata for architecture '{}' \
+                 in shim-components.json",
+                shim,
+                arch
+            );
+        }
+
+        for tarball in tarballs {
+            let name = tarball
+                .as_str()
+                .filter(|name| !name.is_empty())
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Enabled shim '{}' has invalid component metadata for architecture '{}' \
+                     in shim-components.json",
+                        shim,
+                        arch
+                    )
+                })?;
+            required.insert(name.to_string());
         }
     }
 
     // Generic, not tied to any shim in shim-components.json, so it is pulled in
     // by the devkit flag rather than per-shim membership.
     if config.devkit_enabled {
+        if !matches!(arch, "x86_64" | "aarch64") {
+            anyhow::bail!(
+                "Devkit guest extensions are not available for architecture '{}'",
+                arch
+            );
+        }
         required.insert("rootfs-image-devkit-extension".to_string());
     }
 
     Ok(required)
+}
+
+/// Read shim-components.json and collect components for the current architecture.
+fn collect_required_tarballs(config: &Config) -> Result<HashSet<String>> {
+    let json_str = fs::read_to_string(SHIM_COMPONENTS_PATH)
+        .with_context(|| format!("Failed to read {SHIM_COMPONENTS_PATH}"))?;
+    collect_required_tarballs_from_manifest(config, current_arch(), &json_str)
 }
 
 /// Extract a `.tar.zst` tarball into `dest_dir`, stripping the leading `opt/kata/` prefix
@@ -2034,6 +2068,144 @@ async fn configure_experimental_force_guest_pull(config_file: &Path) -> Result<(
 mod tests {
     use super::*;
     use rstest::rstest;
+
+    #[test]
+    fn test_collect_required_tarballs_supports_arm64_clh_runtime_rs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = prefix_test_config(tmp.path());
+        config.shims_for_arch = vec!["clh-runtime-rs".to_string()];
+        let manifest = r#"{
+            "shims": {
+                "clh-runtime-rs": {
+                    "aarch64": [
+                        "shim-v2-rust",
+                        "cloud-hypervisor",
+                        "virtiofsd",
+                        "kernel"
+                    ]
+                }
+            }
+        }"#;
+
+        let required =
+            collect_required_tarballs_from_manifest(&config, "aarch64", manifest).unwrap();
+
+        for component in ["shim-v2-rust", "cloud-hypervisor", "kernel"] {
+            assert!(
+                required.contains(component),
+                "ARM64 clh-runtime-rs must include {component}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_collect_required_tarballs_unions_mixed_arm64_shims() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = prefix_test_config(tmp.path());
+        config.shims_for_arch = vec!["qemu".to_string(), "clh-runtime-rs".to_string()];
+        let manifest = r#"{
+            "shims": {
+                "qemu": {
+                    "aarch64": ["shim-v2-go", "kernel"]
+                },
+                "clh-runtime-rs": {
+                    "aarch64": ["shim-v2-rust", "cloud-hypervisor", "kernel"]
+                }
+            }
+        }"#;
+
+        let required =
+            collect_required_tarballs_from_manifest(&config, "aarch64", manifest).unwrap();
+
+        assert_eq!(
+            required,
+            ["shim-v2-go", "shim-v2-rust", "cloud-hypervisor", "kernel"]
+                .into_iter()
+                .map(str::to_string)
+                .collect()
+        );
+    }
+
+    #[test]
+    fn test_collect_required_tarballs_rejects_missing_enabled_shim_arch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = prefix_test_config(tmp.path());
+        config.shims_for_arch = vec!["qemu".to_string(), "clh-runtime-rs".to_string()];
+        let manifest = r#"{
+            "shims": {
+                "qemu": {
+                    "aarch64": ["shim-v2-go", "kernel"]
+                },
+                "clh-runtime-rs": {
+                    "x86_64": ["shim-v2-rust", "cloud-hypervisor", "kernel"]
+                }
+            }
+        }"#;
+
+        let error =
+            collect_required_tarballs_from_manifest(&config, "aarch64", manifest).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "Enabled shim 'clh-runtime-rs' has no component metadata for architecture \
+             'aarch64' in shim-components.json"
+        );
+    }
+
+    #[test]
+    fn test_collect_required_tarballs_supports_arm64_gpu_runtime() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = prefix_test_config(tmp.path());
+        config.shims_for_arch = vec!["qemu-nvidia-gpu-runtime-rs".to_string()];
+        let manifest = r#"{
+            "shims": {
+                "qemu-nvidia-gpu-runtime-rs": {
+                    "aarch64": [
+                        "shim-v2-rust",
+                        "qemu-no-shared-fs",
+                        "rootfs-image-nvidia-gpu-extension"
+                    ]
+                }
+            }
+        }"#;
+
+        let required =
+            collect_required_tarballs_from_manifest(&config, "aarch64", manifest).unwrap();
+
+        for component in [
+            "shim-v2-rust",
+            "qemu-no-shared-fs",
+            "rootfs-image-nvidia-gpu-extension",
+        ] {
+            assert!(
+                required.contains(component),
+                "ARM64 GPU runtime needs {component}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_collect_required_tarballs_rejects_unsupported_devkit_arch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = prefix_test_config(tmp.path());
+        config.shims_for_arch = vec!["qemu".to_string()];
+        config.devkit_enabled = true;
+        let manifest = r#"{
+            "shims": {
+                "qemu": {
+                    "s390x": ["shim-v2-go", "qemu", "kernel"]
+                }
+            }
+        }"#;
+
+        let error =
+            collect_required_tarballs_from_manifest(&config, "s390x", manifest).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "Devkit guest extensions are not available for architecture 's390x'"
+        );
+    }
 
     #[rstest]
     #[case("qemu", "qemu")]

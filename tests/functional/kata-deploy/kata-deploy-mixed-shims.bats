@@ -132,6 +132,8 @@ shims:
     enabled: true
   clh:
     enabled: true
+  clh-runtime-rs:
+    enabled: true
   dragonball:
     enabled: true
 defaultShim:
@@ -144,8 +146,8 @@ EOF
 }
 
 @test "Mixed shims share the Kata rootfs in either startup order" {
-	exercise_startup_order forward clh dragonball qemu qemu-runtime-rs
-	exercise_startup_order reverse qemu qemu-runtime-rs dragonball clh
+	exercise_startup_order forward clh clh-runtime-rs dragonball qemu qemu-runtime-rs
+	exercise_startup_order reverse qemu qemu-runtime-rs dragonball clh-runtime-rs clh
 }
 
 teardown_file() {
