@@ -308,6 +308,7 @@ Metrics about monitor itself.
 | `kata_monitor_process_virtual_memory_bytes`: <br> Virtual memory size in bytes. | `GAUGE` | `bytes` |  | 2.0.0 |
 | `kata_monitor_process_virtual_memory_max_bytes`: <br> Maximum amount of virtual memory available in bytes. | `GAUGE` | `bytes` |  | 2.0.0 |
 | `kata_monitor_running_shim_count`: <br> Running shim count(running sandboxes). | `GAUGE` |  |  | 2.0.0 |
+| `kata_monitor_sandbox_storage_path_available`: <br> Whether Kata monitor can watch a sandbox storage path. | `GAUGE` |  | <ul><li>`path` (sandbox storage path)</li></ul> | 4.0.0 |
 | `kata_monitor_scrape_count`: <br> Scape count. | `COUNTER` |  |  | 2.0.0 |
 | `kata_monitor_scrape_durations_histogram_milliseconds`: <br> Time used to scrape from shims | `HISTOGRAM` | `milliseconds` |  | 2.0.0 |
 | `kata_monitor_scrape_failed_count`: <br> Failed scape count. | `COUNTER` |  |  | 2.0.0 |

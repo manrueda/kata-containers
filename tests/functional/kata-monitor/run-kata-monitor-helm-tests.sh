@@ -19,6 +19,7 @@ if [[ -n "${KATA_MONITOR_HELM_TEST_UNION:-}" ]]; then
 	KATA_MONITOR_HELM_TEST_UNION=("${KATA_MONITOR_HELM_TEST_UNION}")
 else
 	KATA_MONITOR_HELM_TEST_UNION=( \
+		"kata-monitor-static.bats" \
 		"kata-monitor.bats" \
 	)
 fi
