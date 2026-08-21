@@ -173,6 +173,10 @@ pub trait Hypervisor: std::fmt::Debug + Send + Sync {
     async fn get_jailer_root(&self) -> Result<String>;
     async fn save_state(&self) -> Result<HypervisorState>;
     async fn capabilities(&self) -> Result<Capabilities>;
+    /// Whether metrics requests may safely use the shared Kata agent channel.
+    fn is_agent_metrics_supported(&self) -> bool {
+        true
+    }
     async fn get_hypervisor_metrics(&self) -> Result<String>;
     async fn set_capabilities(&self, flag: CapabilityBits);
     async fn set_guest_memory_block_size(&self, size: u32);

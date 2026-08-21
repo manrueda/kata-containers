@@ -1753,7 +1753,13 @@ impl agent_ttrpc::AgentService for AgentService {
         trace_rpc_call!(ctx, "get_metrics", req);
         is_allowed(&req).await?;
 
-        let s = get_metrics(&req).map_ttrpc_err(same)?;
+        // Metrics collection performs synchronous procfs and statfs reads. Keep
+        // that work off the async executor so a slow scrape cannot starve
+        // lifecycle, stats, or health RPCs.
+        let s = tokio::task::spawn_blocking(move || get_metrics(&req))
+            .await
+            .map_ttrpc_err(same)?
+            .map_ttrpc_err(same)?;
         let mut metrics = Metrics::new();
         metrics.set_metrics(s);
         Ok(metrics)
