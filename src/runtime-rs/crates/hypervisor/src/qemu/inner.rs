@@ -848,7 +848,7 @@ impl QemuInner {
     }
 
     pub(crate) async fn get_hypervisor_metrics(&self) -> Result<String> {
-        todo!()
+        Ok(String::new())
     }
 
     pub(crate) fn set_capabilities(&mut self, flag: CapabilityBits) {
@@ -1484,6 +1484,16 @@ mod tests {
             .await
             .unwrap()
             .is_network_device_hotplug_supported());
+    }
+
+    #[tokio::test]
+    async fn test_unsupported_hypervisor_metrics_are_empty() {
+        let (exit_notify, _exit_waiter) = mpsc::channel(1);
+        let qemu = QemuInner::new(exit_notify);
+
+        for _ in 0..3 {
+            assert_eq!(qemu.get_hypervisor_metrics().await.unwrap(), "");
+        }
     }
 
     #[rstest]
