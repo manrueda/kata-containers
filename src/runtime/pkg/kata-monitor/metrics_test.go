@@ -7,12 +7,19 @@ package katamonitor
 
 import (
 	"bytes"
+	"io"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/common/expfmt"
+	"github.com/sirupsen/logrus"
+	logrustest "github.com/sirupsen/logrus/hooks/test"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 var (
@@ -36,6 +43,50 @@ go_gc_duration_seconds_count 6491
 ttt 999
 `
 )
+
+func TestMetricsErrorDuringSandboxRemoval(t *testing.T) {
+	logger, hook := logrustest.NewNullLogger()
+	logger.SetLevel(logrus.DebugLevel)
+	previousMonitorLog := monitorLog
+	monitorLog = logger.WithField("source", "kata-monitor")
+	defer func() { monitorLog = previousMonitorLog }()
+
+	sandboxID := "sandbox-removing"
+	sandboxPaths := []string{t.TempDir(), t.TempDir()}
+	sandboxPath := filepath.Join(sandboxPaths[0], sandboxID)
+	require.NoError(t, os.Mkdir(sandboxPath, 0o755))
+
+	logSandboxMetricsError(sandboxID, io.ErrUnexpectedEOF, sandboxPaths)
+	entry := hook.LastEntry()
+	require.NotNil(t, entry)
+	assert.Equal(t, logrus.ErrorLevel, entry.Level)
+	assert.Equal(t, "failed to get metrics for sandbox", entry.Message)
+
+	hook.Reset()
+	readStarted := make(chan struct{})
+	readFailed := make(chan struct{})
+	readFinished := make(chan struct{})
+	go func() {
+		defer close(readFinished)
+		close(readStarted)
+		<-readFailed
+		logSandboxMetricsError(sandboxID, io.ErrUnexpectedEOF, sandboxPaths)
+	}()
+
+	<-readStarted
+	require.NoError(t, os.RemoveAll(sandboxPath))
+	close(readFailed)
+	select {
+	case <-readFinished:
+	case <-time.After(time.Second):
+		t.Fatal("metrics read did not finish")
+	}
+
+	entry = hook.LastEntry()
+	require.NotNil(t, entry)
+	assert.Equal(t, logrus.DebugLevel, entry.Level)
+	assert.Equal(t, "sandbox removed while collecting metrics", entry.Message)
+}
 
 func TestParsePrometheusMetrics(t *testing.T) {
 	assert := assert.New(t)
