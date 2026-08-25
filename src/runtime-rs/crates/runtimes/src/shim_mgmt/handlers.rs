@@ -14,13 +14,17 @@ use bytes::Bytes;
 use common::Sandbox;
 use http_body_util::{BodyExt, Full};
 use hyper::{body::Incoming, Method, Request, Response, StatusCode};
-use std::{str, sync::Arc};
+use std::{future::Future, str, sync::Arc, time::Duration};
+use tokio::sync::Semaphore;
 use url::Url;
 
 use shim_interface::shim_mgmt::{
     AGENT_POLICY_URL, AGENT_URL, DIRECT_VOLUME_PATH_KEY, DIRECT_VOLUME_RESIZE_URL,
     DIRECT_VOLUME_STATS_URL, IP6_TABLE_URL, IP_TABLE_URL, METRICS_URL,
 };
+
+const METRICS_COMPONENT_TIMEOUT: Duration = Duration::from_secs(2);
+static METRICS_SCRAPE_LIMIT: Semaphore = Semaphore::const_new(1);
 
 // main router for response, this works as a multiplexer on
 // http arrival which invokes the corresponding handler function
@@ -156,13 +160,44 @@ async fn direct_volume_resize_handler(
 }
 
 // returns the url for metrics
+async fn bounded_metrics<F>(component: &str, timeout: Duration, metrics: F) -> String
+where
+    F: Future<Output = Result<String>>,
+{
+    match tokio::time::timeout(timeout, metrics).await {
+        Ok(Ok(metrics)) => metrics,
+        Ok(Err(err)) => {
+            warn!(sl!(), "failed to collect {} metrics: {}", component, err);
+            String::new()
+        }
+        Err(_) => {
+            warn!(sl!(), "timed out collecting {} metrics", component);
+            String::new()
+        }
+    }
+}
+
 async fn metrics_url_handler(
     sandbox: Arc<dyn Sandbox>,
     _req: Request<Incoming>,
 ) -> Result<Response<Full<Bytes>>> {
-    // get metrics from agent, hypervisor, and shim
-    let agent_metrics = sandbox.agent_metrics().await.unwrap_or_default();
-    let hypervisor_metrics = sandbox.hypervisor_metrics().await.unwrap_or_default();
+    // Do not stack guest metric RPCs after kata-monitor abandons a slow
+    // request. Agent and hypervisor collection run concurrently and are each
+    // bounded so one component cannot block the management endpoint.
+    let Ok(_permit) = METRICS_SCRAPE_LIMIT.try_acquire() else {
+        // Another scrape already owns the only metrics slot. Return the
+        // immediately available shim data instead of queuing stale requests.
+        let shim_metrics = get_shim_metrics().unwrap_or_default();
+        return Ok(Response::new(Full::new(Bytes::from(shim_metrics))));
+    };
+    let (agent_metrics, hypervisor_metrics) = tokio::join!(
+        bounded_metrics("agent", METRICS_COMPONENT_TIMEOUT, sandbox.agent_metrics()),
+        bounded_metrics(
+            "hypervisor",
+            METRICS_COMPONENT_TIMEOUT,
+            sandbox.hypervisor_metrics()
+        )
+    );
     let shim_metrics = get_shim_metrics().unwrap_or_default();
 
     Ok(Response::new(Full::new(Bytes::from(format!(
@@ -186,5 +221,28 @@ async fn set_agent_policy_handler(
             Ok(Response::new(Full::new(Bytes::from(""))))
         }
         _ => Err(anyhow!("Set agent policy only takes PUT method")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_bounded_metrics_returns_empty_on_timeout() {
+        let metrics =
+            bounded_metrics("test", Duration::from_millis(10), std::future::pending()).await;
+
+        assert!(metrics.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_bounded_metrics_preserves_successful_data() {
+        let metrics = bounded_metrics("test", Duration::from_secs(1), async {
+            Ok("metric 1\n".to_string())
+        })
+        .await;
+
+        assert_eq!(metrics, "metric 1\n");
     }
 }

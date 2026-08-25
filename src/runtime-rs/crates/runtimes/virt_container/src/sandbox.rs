@@ -989,6 +989,21 @@ fn oci_spec_vfio_device_paths() -> Vec<String> {
         .collect()
 }
 
+async fn collect_agent_metrics<F, Fut>(supported: bool, fetch: F) -> Result<String>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<agent::MetricsResponse>>,
+{
+    if !supported {
+        return Ok(String::new());
+    }
+
+    fetch()
+        .await
+        .map_err(|err| anyhow!("failed to get agent metrics {:?}", err))
+        .map(|resp| resp.metrics)
+}
+
 #[async_trait]
 impl Sandbox for VirtSandbox {
     #[instrument(name = "sb: start")]
@@ -1514,11 +1529,10 @@ impl Sandbox for VirtSandbox {
     }
 
     async fn agent_metrics(&self) -> Result<String> {
-        self.agent
-            .get_metrics(agent::Empty::new())
-            .await
-            .map_err(|err| anyhow!("failed to get agent metrics {:?}", err))
-            .map(|resp| resp.metrics)
+        collect_agent_metrics(self.hypervisor.is_agent_metrics_supported(), || {
+            self.agent.get_metrics(agent::Empty::new())
+        })
+        .await
     }
 
     async fn hypervisor_metrics(&self) -> Result<String> {
@@ -1671,5 +1685,48 @@ impl Persist for VirtSandbox {
             factory: None,
             cancel_token: CancellationToken::default(),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn test_unsupported_agent_metrics_do_not_use_agent_channel() {
+        let fetch_count = Arc::new(AtomicUsize::new(0));
+        let request = || {
+            let fetch_count = fetch_count.clone();
+            collect_agent_metrics(false, move || {
+                fetch_count.fetch_add(1, Ordering::SeqCst);
+                std::future::pending::<Result<agent::MetricsResponse>>()
+            })
+        };
+
+        let (first, second, third) = tokio::time::timeout(Duration::from_millis(100), async {
+            tokio::join!(request(), request(), request())
+        })
+        .await
+        .expect("concurrent metrics requests must complete without using the agent channel");
+
+        for result in [first, second, third] {
+            assert_eq!(result.unwrap(), "");
+        }
+        assert_eq!(fetch_count.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn test_supported_agent_metrics_are_collected() {
+        let metrics = collect_agent_metrics(true, || async {
+            Ok(agent::MetricsResponse {
+                metrics: "agent_metric 1\n".to_string(),
+            })
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(metrics, "agent_metric 1\n");
     }
 }

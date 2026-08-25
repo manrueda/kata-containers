@@ -222,6 +222,12 @@ impl Hypervisor for Dragonball {
         inner.capabilities().await
     }
 
+    fn is_agent_metrics_supported(&self) -> bool {
+        // Agent metrics can wedge Dragonball's shared HybridVsock channel,
+        // blocking lifecycle and stats RPCs. Keep monitoring host-side.
+        false
+    }
+
     async fn get_hypervisor_metrics(&self) -> Result<String> {
         let inner = self.inner.read().await;
         inner.get_hypervisor_metrics().await
@@ -314,5 +320,15 @@ pub(crate) fn build_dragonball_network_config(
         }),
         use_shared_irq: nconfig.use_shared_irq,
         use_generic_irq: nconfig.use_generic_irq,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_dragonball_disables_agent_metrics() {
+        assert!(!Dragonball::new().is_agent_metrics_supported());
     }
 }
