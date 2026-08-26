@@ -141,7 +141,9 @@ func (dm *deviceManager) createDevice(devInfo config.DeviceInfo) (dev api.Device
 		if devInfo.DriverOptions == nil {
 			devInfo.DriverOptions = make(map[string]string)
 		}
-		devInfo.DriverOptions[config.BlockDriverOpt] = dm.blockDriver
+		if _, ok := devInfo.DriverOptions[config.BlockDriverOpt]; !ok {
+			devInfo.DriverOptions[config.BlockDriverOpt] = dm.blockDriver
+		}
 		return drivers.NewBlockDevice(&devInfo), nil
 	} else {
 		deviceLogger().WithField("device", devInfo.HostPath).Info("Device has not been passed to the container")

@@ -207,6 +207,18 @@ impl VolumeResource {
         Ok(())
     }
 
+    pub async fn guest_volume_stats_path(&self, host_volume_path: &str) -> Option<String> {
+        let inner = self.inner.read().await;
+        for disk in &inner.ephemeral_disks {
+            if host_volume_path == disk.source_path
+                || host_volume_path == disk.disk_path.display().to_string()
+            {
+                return Some(disk.guest_stats_path.clone());
+            }
+        }
+        None
+    }
+
     pub async fn dump(&self) {
         let inner = self.inner.read().await;
         for v in &inner.volumes {
