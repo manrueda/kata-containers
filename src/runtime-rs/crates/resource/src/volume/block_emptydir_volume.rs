@@ -19,6 +19,7 @@ use hypervisor::{
     BlockConfigModern, BlockDeviceAio,
 };
 use kata_sys_util::k8s::is_disk_empty_dir;
+use kata_types::config::hypervisor::{VIRTIO_BLK_PCI, VIRTIO_SCSI};
 use kata_types::config::{EMPTYDIR_MODE_BLOCK_ENCRYPTED, EMPTYDIR_MODE_BLOCK_PLAIN};
 use kata_types::mount::{
     add_volume_mount_info, is_volume_mounted, DirectVolumeMountInfo,
@@ -39,11 +40,13 @@ const METADATA_FS_GROUP: &str = "fsGroup";
 const DISCARD_MOUNT_OPTION: &str = "discard";
 
 /// Information about an ephemeral disk created on the host, needed for
-/// sandbox-level cleanup.
+/// sandbox-level cleanup and volume statistics mapping.
 #[derive(Debug, Clone)]
 pub(crate) struct EphemeralDiskInfo {
     pub disk_path: PathBuf,
     pub source_path: String,
+    /// Guest path passed to the agent for volume statistics queries.
+    pub guest_stats_path: String,
 }
 
 #[derive(Clone)]
@@ -103,9 +106,11 @@ impl BlockEmptyDirVolume {
         }
 
         let blkdev_info = get_block_device_info(d).await;
+        let block_driver =
+            block_emptydir_block_driver(discard_unmap, &blkdev_info.block_device_driver);
         let block_config = BlockConfigModern {
             path_on_host: disk_path.display().to_string(),
-            driver_option: blkdev_info.block_device_driver,
+            driver_option: block_driver,
             blkdev_aio: BlockDeviceAio::new(&blkdev_info.block_device_aio),
             num_queues: blkdev_info.num_queues,
             queue_size: blkdev_info.queue_size,
@@ -162,6 +167,7 @@ impl BlockEmptyDirVolume {
         let disk_info = EphemeralDiskInfo {
             disk_path,
             source_path: source,
+            guest_stats_path: agent_mount_point,
         };
 
         Ok(Self {
@@ -265,6 +271,18 @@ pub(crate) fn is_block_emptydir_mode(emptydir_mode: &str) -> bool {
     emptydir_mode == EMPTYDIR_MODE_BLOCK_ENCRYPTED || emptydir_mode == EMPTYDIR_MODE_BLOCK_PLAIN
 }
 
+/// Block-backed emptyDir volumes rely on guest discard to punch holes in the
+/// host sparse `disk.img` after file deletion or overwrite. QEMU's default
+/// virtio-scsi frontend does not expose discard, so virtio-blk is selected when
+/// discard is required.
+fn block_emptydir_block_driver(discard_unmap: bool, default_driver: &str) -> String {
+    if discard_unmap && default_driver == VIRTIO_SCSI {
+        VIRTIO_BLK_PCI.to_string()
+    } else {
+        default_driver.to_string()
+    }
+}
+
 fn get_filesystem_capacity(path: &Path) -> Result<u64> {
     let stat = statfs(path).with_context(|| format!("statfs {:?}", path))?;
     let total = stat.blocks() as u64 * stat.block_size() as u64;
@@ -277,6 +295,24 @@ fn get_filesystem_capacity(path: &Path) -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kata_types::config::hypervisor::VIRTIO_BLK_CCW;
+
+    #[test]
+    fn block_emptydir_uses_virtio_blk_when_discard_requires_it() {
+        assert_eq!(
+            block_emptydir_block_driver(true, VIRTIO_SCSI),
+            VIRTIO_BLK_PCI
+        );
+        assert_eq!(block_emptydir_block_driver(false, VIRTIO_SCSI), VIRTIO_SCSI);
+        assert_eq!(
+            block_emptydir_block_driver(true, VIRTIO_BLK_PCI),
+            VIRTIO_BLK_PCI
+        );
+        assert_eq!(
+            block_emptydir_block_driver(true, VIRTIO_BLK_CCW),
+            VIRTIO_BLK_CCW
+        );
+    }
 
     #[test]
     fn block_plain_emptydir_requests_filesystem_creation_and_discard() {

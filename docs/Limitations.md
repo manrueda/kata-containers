@@ -183,6 +183,12 @@ additional encryption and integrity metadata overhead. In testing with a
 2.9 TB logical filesystem, this additional overhead was approximately 50 MB,
 compared with approximately 2.5 GB of total metadata allocation.
 
+For `block-plain` volumes, the runtime mounts the sparse backing image with the
+`discard` option and hot-plugs it through a virtio-blk device when the
+hypervisor default is virtio-scsi. Guest ext4 then issues TRIM on deleted or
+overwritten blocks, which QEMU maps to host `discard=unmap` on the backing file
+so kubelet sees reclaimed allocation in `disk.img`.
+
 Current operational mitigations are to provide enough `sizeLimit` headroom for
 filesystem metadata  (i.e. such that `sizeLimit` is greater than 0.08% of the
 host filesystem size) or place kubelet's volume data on a smaller dedicated

@@ -223,6 +223,14 @@ impl ResourceManager {
         let inner = self.inner.read().await;
         inner.cleanup().await
     }
+
+    pub async fn guest_volume_stats_path(&self, host_volume_path: &str) -> Option<String> {
+        let inner = self.inner.read().await;
+        inner
+            .volume_resource
+            .guest_volume_stats_path(host_volume_path)
+            .await
+    }
 }
 
 #[async_trait]

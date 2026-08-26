@@ -710,6 +710,12 @@ func (c *Container) createBlockDevices(ctx context.Context) error {
 		di, err := c.createDeviceInfo(c.mounts[i].Source, c.mounts[i].Destination, c.mounts[i].ReadOnly, isBlockFile)
 		if err == nil && di != nil {
 			di.DiscardUnmap = c.mounts[i].BlockDeviceCreateFs && slices.Contains(c.mounts[i].Options, blockVolumeDiscardOption)
+			if di.DiscardUnmap {
+				if di.DriverOptions == nil {
+					di.DriverOptions = make(map[string]string)
+				}
+				di.DriverOptions[config.BlockDriverOpt] = blockEmptyDirBlockDriver(c.sandbox.config.HypervisorConfig.BlockDeviceDriver)
+			}
 
 			b, err := c.sandbox.devManager.NewDevice(*di)
 			if err != nil {
@@ -874,6 +880,21 @@ func (c *Container) createVirtualVolumeDevices() ([]config.DeviceInfo, error) {
 		}
 	}
 	return deviceInfos, nil
+}
+
+// blockEmptyDirBlockDriver selects the hypervisor block driver for a
+// block-backed emptyDir that needs guest discard support. QEMU's default
+// virtio-scsi frontend does not expose discard to the guest, so virtio-blk is
+// used instead when discard is required.
+func blockEmptyDirBlockDriver(hypervisorDriver string) string {
+	switch hypervisorDriver {
+	case config.VirtioSCSI:
+		return config.VirtioBlock
+	case config.VirtioBlockCCW:
+		return config.VirtioBlockCCW
+	default:
+		return hypervisorDriver
+	}
 }
 
 // getFilesystemCapacity return the total size in bytes of the filesystem

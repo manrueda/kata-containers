@@ -433,3 +433,9 @@ func TestConfigValid(t *testing.T) {
 	result = config.valid()
 	assert.True(result)
 }
+
+func TestBlockEmptyDirBlockDriver(t *testing.T) {
+	assert.Equal(t, config.VirtioBlock, blockEmptyDirBlockDriver(config.VirtioSCSI))
+	assert.Equal(t, config.VirtioBlock, blockEmptyDirBlockDriver(config.VirtioBlock))
+	assert.Equal(t, config.VirtioBlockCCW, blockEmptyDirBlockDriver(config.VirtioBlockCCW))
+}

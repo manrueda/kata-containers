@@ -1487,8 +1487,13 @@ impl Sandbox for VirtSandbox {
     }
 
     async fn direct_volume_stats(&self, volume_guest_path: &str) -> Result<String> {
+        let guest_path = self
+            .resource_manager
+            .guest_volume_stats_path(volume_guest_path)
+            .await
+            .unwrap_or_else(|| volume_guest_path.to_string());
         let req: agent::VolumeStatsRequest = VolumeStatsRequest {
-            volume_guest_path: volume_guest_path.to_string(),
+            volume_guest_path: guest_path,
         };
         let result = self
             .agent
