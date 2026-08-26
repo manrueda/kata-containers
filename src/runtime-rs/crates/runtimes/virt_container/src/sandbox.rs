@@ -151,6 +151,7 @@ pub struct VirtSandbox {
     shm_size: u64,
     factory: Option<Factory>,
     cancel_token: CancellationToken,
+    oom_published: Arc<Mutex<HashSet<String>>>,
 }
 
 impl std::fmt::Debug for VirtSandbox {
@@ -197,7 +198,26 @@ impl VirtSandbox {
             sandbox_config: Some(sandbox_config),
             factory: Some(factory),
             cancel_token,
+            oom_published: Arc::new(Mutex::new(HashSet::new())),
         })
+    }
+
+    async fn publish_task_oom(&self, container_id: &str) -> Result<()> {
+        let mut published = self.oom_published.lock().await;
+        if !published.insert(container_id.to_string()) {
+            return Ok(());
+        }
+        drop(published);
+
+        warn!(sl!(), "send oom event for container {}", container_id);
+        let event = TaskOOM {
+            container_id: container_id.to_string(),
+            ..Default::default()
+        };
+        let msg = Message::new(Action::Event(Arc::new(event)));
+        let lock_sender = self.msg_sender.lock().await;
+        lock_sender.send(msg).await.context("send oom event")?;
+        Ok(())
     }
 
     pub fn get_agent(&self) -> Arc<dyn Agent> {
@@ -1180,6 +1200,7 @@ impl Sandbox for VirtSandbox {
         let agent = self.agent.clone();
         let sender = self.msg_sender.clone();
         let cancel_token = self.cancel_token.clone();
+        let oom_published = self.oom_published.clone();
 
         info!(sl!(), "oom watcher start");
         tokio::spawn(async move {
@@ -1193,10 +1214,16 @@ impl Sandbox for VirtSandbox {
                     res = agent.get_oom_event(agent::Empty::new()) => {
                         match res.context("get oom event") {
                             Ok(resp) => {
-                                let cid = &resp.container_id;
+                                let cid = resp.container_id;
+                                let mut published = oom_published.lock().await;
+                                if !published.insert(cid.clone()) {
+                                    continue;
+                                }
+                                drop(published);
+
                                 warn!(sl!(), "send oom event for container {}", &cid);
                                 let event = TaskOOM {
-                                    container_id: cid.to_string(),
+                                    container_id: cid,
                                     ..Default::default()
                                 };
                                 let msg = Message::new(Action::Event(Arc::new(event)));
@@ -1204,7 +1231,7 @@ impl Sandbox for VirtSandbox {
                                 if let Err(err) = lock_sender.send(msg).await.context("send event") {
                                     error!(
                                         sl!(),
-                                        "failed to send oom event for {} error {:?}", cid, err
+                                        "failed to send oom event error {:?}", err
                                     );
                                 }
                             }
@@ -1468,6 +1495,10 @@ impl Sandbox for VirtSandbox {
             eid.to_string()
         };
 
+        if exit_status.oom_killed {
+            self.publish_task_oom(cid).await?;
+        }
+
         let event = TaskExit {
             container_id: cid.to_string(),
             id,
@@ -1689,6 +1720,7 @@ impl Persist for VirtSandbox {
             shm_size: DEFAULT_SHM_SIZE,
             factory: None,
             cancel_token: CancellationToken::default(),
+            oom_published: Arc::new(Mutex::new(HashSet::new())),
         })
     }
 }

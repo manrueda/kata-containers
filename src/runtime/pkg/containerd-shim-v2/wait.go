@@ -47,7 +47,8 @@ func wait(ctx context.Context, s *service, c *container, execID string) (int32, 
 		processID = execs.id
 	}
 
-	ret, err := s.sandbox.WaitProcess(ctx, c.id, processID)
+	waitStatus, err := s.sandbox.WaitProcess(ctx, c.id, processID)
+	ret := waitStatus.ExitCode
 	if err != nil {
 		shimLog.WithError(err).WithFields(logrus.Fields{
 			"container": c.id,
@@ -58,6 +59,10 @@ func wait(ctx context.Context, s *service, c *container, execID string) (int32, 
 		if ret == 0 {
 			ret = exitCode255
 		}
+	}
+
+	if waitStatus.OOMKilled {
+		publishTaskOOM(s, c)
 	}
 
 	timeStamp := time.Now()
@@ -186,6 +191,34 @@ func watchSandbox(ctx context.Context, s *service) {
 	// No need to send async events here.
 }
 
+func publishTaskOOM(s *service, c *container) {
+	c.oomMu.Lock()
+	if c.oomPublished {
+		c.oomMu.Unlock()
+		return
+	}
+	c.oomPublished = true
+	c.oomMu.Unlock()
+
+	// write oom file for CRI-O
+	if oci.IsCRIOContainerManager(c.spec) {
+		oomPath := path.Join(c.bundle, "oom")
+		shimLog.Infof("write oom file to notify CRI-O: %s", oomPath)
+
+		f, err := os.OpenFile(oomPath, os.O_CREATE, 0666)
+		if err != nil {
+			shimLog.WithError(err).Warnf("failed to write oom file %s", oomPath)
+		} else {
+			f.Close()
+		}
+	}
+
+	// publish event for containerd
+	s.send(&events.TaskOOM{
+		ContainerID: c.id,
+	})
+}
+
 func watchOOMEvents(ctx context.Context, s *service) {
 	if s.sandbox == nil {
 		return
@@ -207,23 +240,12 @@ func watchOOMEvents(ctx context.Context, s *service) {
 				continue
 			}
 
-			// write oom file for CRI-O
-			if c, ok := s.containers[containerID]; ok && oci.IsCRIOContainerManager(c.spec) {
-				oomPath := path.Join(c.bundle, "oom")
-				shimLog.Infof("write oom file to notify CRI-O: %s", oomPath)
-
-				f, err := os.OpenFile(oomPath, os.O_CREATE, 0666)
-				if err != nil {
-					shimLog.WithError(err).Warnf("failed to write oom file %s", oomPath)
-				} else {
-					f.Close()
-				}
+			c, ok := s.containers[containerID]
+			if !ok {
+				shimLog.WithField("container", containerID).Warn("received OOM event for unknown container")
+				continue
 			}
-
-			// publish event for containerd
-			s.send(&events.TaskOOM{
-				ContainerID: containerID,
-			})
+			publishTaskOOM(s, c)
 		}
 	}
 }

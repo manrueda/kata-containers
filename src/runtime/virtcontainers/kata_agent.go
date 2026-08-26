@@ -2434,7 +2434,7 @@ func (k *kataAgent) check(ctx context.Context) error {
 	return err
 }
 
-func (k *kataAgent) waitProcess(ctx context.Context, c *Container, processID string) (int32, error) {
+func (k *kataAgent) waitProcess(ctx context.Context, c *Container, processID string) (ProcessWaitStatus, error) {
 	span, ctx := katatrace.Trace(ctx, k.Logger(), "waitProcess", kataAgentTracingTags)
 	defer span.End()
 
@@ -2444,12 +2444,16 @@ func (k *kataAgent) waitProcess(ctx context.Context, c *Container, processID str
 	})
 	if err != nil {
 		if err.Error() == context.DeadlineExceeded.Error() {
-			return 0, grpcStatus.Errorf(codes.DeadlineExceeded, "WaitProcessRequest timed out")
+			return ProcessWaitStatus{}, grpcStatus.Errorf(codes.DeadlineExceeded, "WaitProcessRequest timed out")
 		}
-		return 0, err
+		return ProcessWaitStatus{}, err
 	}
 
-	return resp.(*grpc.WaitProcessResponse).Status, nil
+	waitResp := resp.(*grpc.WaitProcessResponse)
+	return ProcessWaitStatus{
+		ExitCode:  waitResp.Status,
+		OOMKilled: waitResp.OomKilled,
+	}, nil
 }
 
 func (k *kataAgent) writeProcessStdin(ctx context.Context, c *Container, ProcessID string, data []byte) (int, error) {

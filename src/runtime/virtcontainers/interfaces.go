@@ -57,7 +57,7 @@ type VCSandbox interface {
 	ResumeContainer(ctx context.Context, containerID string) error
 	EnterContainer(ctx context.Context, containerID string, cmd types.Cmd) (VCContainer, *Process, error)
 	UpdateContainer(ctx context.Context, containerID string, resources specs.LinuxResources) error
-	WaitProcess(ctx context.Context, containerID, processID string) (int32, error)
+	WaitProcess(ctx context.Context, containerID, processID string) (ProcessWaitStatus, error)
 	SignalProcess(ctx context.Context, containerID, processID string, signal syscall.Signal, all bool) error
 	WinsizeProcess(ctx context.Context, containerID, processID string, height, width uint32) error
 	IOStream(containerID, processID string) (io.WriteCloser, io.Reader, io.Reader, error)

@@ -1763,10 +1763,10 @@ func (c *Container) enter(ctx context.Context, cmd types.Cmd) (*Process, error) 
 	return process, nil
 }
 
-func (c *Container) wait(ctx context.Context, processID string) (int32, error) {
+func (c *Container) wait(ctx context.Context, processID string) (ProcessWaitStatus, error) {
 	if c.state.State != types.StateReady &&
 		c.state.State != types.StateRunning {
-		return 0, fmt.Errorf("Container not ready or running, " +
+		return ProcessWaitStatus{}, fmt.Errorf("Container not ready or running, " +
 			"impossible to wait")
 	}
 

@@ -814,6 +814,7 @@ impl From<agent::WaitProcessResponse> for WaitProcessResponse {
     fn from(from: agent::WaitProcessResponse) -> Self {
         Self {
             status: from.status,
+            oom_killed: from.oom_killed,
         }
     }
 }

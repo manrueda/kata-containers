@@ -245,7 +245,7 @@ impl Process {
             }
 
             let mut exit_status = exit_status.write().await;
-            exit_status.update_exit_code(resp.status);
+            exit_status.update_exit(resp.status, resp.oom_killed);
             drop(exit_status);
 
             let mut status = status.write().await;
@@ -401,18 +401,22 @@ impl Process {
             info!(logger, "begin wait process");
             // If wait_process fails (e.g., VM died), we still set status to Stopped
             // This ensures that subsequent Kill() calls see the process as already stopped and return success.
-            let exit_code = match agent.wait_process(req).await {
+            match agent.wait_process(req).await {
                 Ok(ret) => {
                     info!(logger, "end wait process exit code {}", ret.status);
-                    ret.status
+                    let mut exit_status = exit_status.write().await;
+                    exit_status.update_exit(ret.status, ret.oom_killed);
+                    drop(exit_status);
                 }
                 Err(e) => {
                     // Don't return early - continue to set status to Stopped.
                     // Use UNKNOWN_EXIT_STATUS (255) to match containerd's convention.
                     error!(logger, "failed to wait process {:?}", e);
-                    UNKNOWN_EXIT_STATUS
+                    let mut exit_status = exit_status.write().await;
+                    exit_status.update_exit_code(UNKNOWN_EXIT_STATUS);
+                    drop(exit_status);
                 }
-            };
+            }
 
             let containers = containers.read().await;
             let container_id = &process.container_id.container_id;
@@ -429,10 +433,6 @@ impl Process {
                     "Failed to stop process, since container {} not found", container_id
                 );
             }
-
-            let mut exit_status = exit_status.write().await;
-            exit_status.update_exit_code(exit_code);
-            drop(exit_status);
 
             let mut status = status.write().await;
             *status = ProcessStatus::Stopped;

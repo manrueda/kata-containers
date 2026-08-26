@@ -307,6 +307,7 @@ pub struct ProcessStateInfo {
 pub struct ProcessExitStatus {
     pub exit_code: i32,
     pub exit_time: Option<std::time::SystemTime>,
+    pub oom_killed: bool,
 }
 
 impl ProcessExitStatus {
@@ -316,6 +317,12 @@ impl ProcessExitStatus {
 
     pub fn update_exit_code(&mut self, exit_code: i32) {
         self.exit_code = exit_code;
+        self.exit_time = Some(std::time::SystemTime::now());
+    }
+
+    pub fn update_exit(&mut self, exit_code: i32, oom_killed: bool) {
+        self.exit_code = exit_code;
+        self.oom_killed = oom_killed;
         self.exit_time = Some(std::time::SystemTime::now());
     }
 }

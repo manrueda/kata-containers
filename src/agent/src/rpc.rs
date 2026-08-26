@@ -418,22 +418,31 @@ impl AgentService {
 
     #[instrument]
     async fn do_start_container(&self, req: protocols::agent::StartContainerRequest) -> Result<()> {
-        let mut s = self.sandbox.lock().await;
-        let sid = s.id.clone();
         let cid = req.container_id.clone();
 
-        let ctr = s
-            .get_container(&cid)
-            .ok_or_else(|| anyhow!("Invalid container id"))?;
-
-        if sid != cid {
-            // start oom event loop
-            if let Ok(cg_path) = ctr.cgroup_manager.as_ref().get_cgroup_path("memory") {
-                let rx = notifier::notify_oom(cid.as_str(), cg_path.to_string()).await?;
-                s.run_oom_event_monitor(rx, cid.clone()).await;
+        let cg_path = {
+            let mut s = self.sandbox.lock().await;
+            if s.id == cid {
+                None
+            } else {
+                let ctr = s
+                    .get_container(&cid)
+                    .ok_or_else(|| anyhow!("Invalid container id"))?;
+                ctr.cgroup_manager
+                    .as_ref()
+                    .get_cgroup_path("memory")
+                    .ok()
+                    .map(|path| path.to_string())
             }
+        };
+
+        if let Some(cg_path) = cg_path {
+            let rx = notifier::notify_oom(cid.as_str(), cg_path).await?;
+            let sandbox = self.sandbox.clone();
+            Sandbox::run_oom_event_monitor(sandbox, rx, cid.clone()).await;
         }
 
+        let mut s = self.sandbox.lock().await;
         let ctr = s
             .get_container(&cid)
             .ok_or_else(|| anyhow!("Invalid container id"))?;
@@ -689,6 +698,7 @@ impl AgentService {
                     .recv()
                     .await
                     .ok_or_else(|| anyhow!("Failed to receive exit code"))?;
+                resp.oom_killed = ctr.oom_killed;
 
                 return Ok(resp);
             }
@@ -701,6 +711,7 @@ impl AgentService {
         p.cleanup_process_stream();
 
         resp.status = p.exit_code;
+        resp.oom_killed = ctr.oom_killed;
         // broadcast exit code to all parallel watchers
         for s in p.exit_watchers.iter_mut() {
             // Just ignore errors in case any watcher quits unexpectedly

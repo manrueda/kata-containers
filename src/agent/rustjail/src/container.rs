@@ -261,6 +261,8 @@ pub struct LinuxContainer {
     pub uid_map_path: String,
     pub gid_map_path: String,
     pub processes: HashMap<String, Process>,
+    /// Set when the container memory cgroup reports an OOM kill.
+    pub oom_killed: bool,
     pub status: ContainerStatus,
     pub created: SystemTime,
     pub logger: Logger,
@@ -1798,6 +1800,7 @@ impl LinuxContainer {
             gid_map_path: "".to_string(),
             config,
             processes: HashMap::new(),
+            oom_killed: false,
             created: SystemTime::now(),
             init_process_pid: -1,
             init_process_start_time: SystemTime::now()

@@ -138,8 +138,8 @@ func (n *mockAgent) statsContainer(ctx context.Context, sandbox *Sandbox, c Cont
 }
 
 // waitProcess is the Noop agent process waiter. It does nothing.
-func (n *mockAgent) waitProcess(ctx context.Context, c *Container, processID string) (int32, error) {
-	return 0, nil
+func (n *mockAgent) waitProcess(ctx context.Context, c *Container, processID string) (ProcessWaitStatus, error) {
+	return ProcessWaitStatus{}, nil
 }
 
 // removeStaleVirtiofsShareMounts is the Noop agent removeStaleVirtiofsShareMounts implementation. It does nothing.
