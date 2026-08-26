@@ -101,6 +101,13 @@ predicate_has_two_sandbox_metrics() {
 		| awk 'END { exit(NR < 2) }'
 }
 
+predicate_has_hypervisor_vmrss_for_both_sandboxes() {
+	# Both Go and runtime-rs QEMU must expose per-sandbox VMM RSS.
+	grep -E 'kata_hypervisor_proc_status\{.*item="vmrss"' \
+		| grep -c 'sandbox_id=' \
+		| awk '{ exit($1 < 2) }'
+}
+
 wait_for_pods_to_exist() {
 	local selector="$1"
 	local deadline=$((SECONDS + 120))
@@ -253,7 +260,8 @@ EOF
 	# prove both sandboxes contribute shim metrics.
 	wait_for_metrics predicate_has_two_running_shims
 	wait_for_metrics predicate_has_two_sandbox_metrics
-	echo "kata-monitor /metrics surfaced both probe sandboxes"
+	wait_for_metrics predicate_has_hypervisor_vmrss_for_both_sandboxes
+	echo "kata-monitor /metrics surfaced both probe sandboxes with hypervisor vmrss"
 
 	# /sandboxes is the second public endpoint of kata-monitor; confirm
 	# it lists at least one sandbox while the probe pod is alive.

@@ -10,9 +10,9 @@ use crate::device::topology::PCIePort;
 use crate::qemu::cmdline_generator::VfioDeviceConfig;
 use crate::qemu::qmp::get_qmp_socket_path;
 use crate::{
-    device::driver::ProtectionDeviceConfig, hypervisor_persist::HypervisorState, selinux,
-    HypervisorConfig, MemoryConfig, VcpuThreadIds, VsockDevice, HYPERVISOR_QEMU, KATA_BLK_DEV_TYPE,
-    KATA_CCW_DEV_TYPE, KATA_NVDIMM_DEV_TYPE, KATA_SCSI_DEV_TYPE,
+    device::driver::ProtectionDeviceConfig, hypervisor_persist::HypervisorState, proc_metrics,
+    selinux, HypervisorConfig, MemoryConfig, VcpuThreadIds, VsockDevice, HYPERVISOR_QEMU,
+    KATA_BLK_DEV_TYPE, KATA_CCW_DEV_TYPE, KATA_NVDIMM_DEV_TYPE, KATA_SCSI_DEV_TYPE,
 };
 
 use crate::utils::{
@@ -802,7 +802,13 @@ impl QemuInner {
 
     pub(crate) async fn get_pids(&self) -> Result<Vec<u32>> {
         info!(sl!(), "QemuInner::get_pids()");
-        todo!()
+        if let Some(qemu_process) = self.qemu_process.lock().await.as_ref() {
+            if let Some(qemu_pid) = qemu_process.id() {
+                return Ok(vec![qemu_pid]);
+            }
+        }
+
+        Ok(vec![])
     }
 
     pub(crate) async fn check(&self) -> Result<()> {
@@ -848,7 +854,15 @@ impl QemuInner {
     }
 
     pub(crate) async fn get_hypervisor_metrics(&self) -> Result<String> {
-        Ok(String::new())
+        let Some(qemu_process) = self.qemu_process.lock().await.as_ref() else {
+            return Ok(String::new());
+        };
+
+        let Some(qemu_pid) = qemu_process.id() else {
+            return Ok(String::new());
+        };
+
+        proc_metrics::get_hypervisor_metrics(qemu_pid)
     }
 
     pub(crate) fn set_capabilities(&mut self, flag: CapabilityBits) {
@@ -1487,13 +1501,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_unsupported_hypervisor_metrics_are_empty() {
+    async fn test_hypervisor_metrics_are_empty_without_qemu_process() {
         let (exit_notify, _exit_waiter) = mpsc::channel(1);
         let qemu = QemuInner::new(exit_notify);
 
         for _ in 0..3 {
             assert_eq!(qemu.get_hypervisor_metrics().await.unwrap(), "");
         }
+    }
+
+    #[tokio::test]
+    async fn test_get_pids_are_empty_without_qemu_process() {
+        let (exit_notify, _exit_waiter) = mpsc::channel(1);
+        let qemu = QemuInner::new(exit_notify);
+
+        assert!(qemu.get_pids().await.unwrap().is_empty());
     }
 
     #[rstest]

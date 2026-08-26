@@ -11,6 +11,7 @@ logging::logger_with_subsystem!(sl, "hypervisor");
 
 pub mod device;
 pub mod hypervisor_persist;
+mod proc_metrics;
 pub use device::driver::*;
 pub use device::pci_path::PciPath;
 use device::DeviceType;
