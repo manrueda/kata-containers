@@ -156,6 +156,8 @@ message WaitProcessRequest {
 
 message WaitProcessResponse {
 	int32 status = 1;
+	// True when the waited process exited because its memory cgroup OOM-killed it.
+	bool oom_killed = 2;
 }
 
 message UpdateContainerRequest {

@@ -438,16 +438,23 @@ impl Sandbox {
     }
 
     #[instrument]
-    pub async fn run_oom_event_monitor(&self, mut rx: Receiver<String>, container_id: String) {
-        let logger = self.logger.clone();
-        let tx = match self.event_tx.as_ref() {
-            Some(v) => v.clone(),
-            None => {
-                error!(
-                    logger,
-                    "sandbox.event_tx not found in run_oom_event_monitor"
-                );
-                return;
+    pub async fn run_oom_event_monitor(
+        sandbox: Arc<Mutex<Sandbox>>,
+        mut rx: Receiver<String>,
+        container_id: String,
+    ) {
+        let (tx, logger) = {
+            let s = sandbox.lock().await;
+            let logger = s.logger.clone();
+            match s.event_tx.as_ref() {
+                Some(v) => (v.clone(), logger),
+                None => {
+                    error!(
+                        logger,
+                        "sandbox.event_tx not found in run_oom_event_monitor"
+                    );
+                    return;
+                }
             }
         };
 
@@ -459,6 +466,12 @@ impl Sandbox {
                     return;
                 }
                 info!(logger, "got an OOM event {:?}", event);
+                {
+                    let mut s = sandbox.lock().await;
+                    if let Some(ctr) = s.get_container(&container_id) {
+                        ctr.oom_killed = true;
+                    }
+                }
                 if let Err(e) = tx.send(container_id.clone()).await {
                     error!(logger, "failed to send message: {:?}", e);
                 }
@@ -1358,5 +1371,38 @@ mod tests {
                 assert_eq!(test_result_val, result_val, "{msg}");
             }
         }
+    }
+
+    #[tokio::test]
+    async fn test_run_oom_event_monitor_setup_without_caller_lock() {
+        let logger = slog::Logger::root(slog::Discard, o!());
+        let sandbox = Arc::new(Mutex::new(Sandbox::new(&logger).unwrap()));
+        let (_tx, rx) = channel::<String>(1);
+
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            Sandbox::run_oom_event_monitor(sandbox, rx, "workload-container".into()),
+        )
+        .await
+        .expect("run_oom_event_monitor setup timed out");
+    }
+
+    #[tokio::test]
+    async fn test_run_oom_event_monitor_setup_blocks_when_caller_holds_lock() {
+        let logger = slog::Logger::root(slog::Discard, o!());
+        let sandbox = Arc::new(Mutex::new(Sandbox::new(&logger).unwrap()));
+        let (_tx, rx) = channel::<String>(1);
+
+        let _guard = sandbox.lock().await;
+        let result = tokio::time::timeout(
+            Duration::from_millis(100),
+            Sandbox::run_oom_event_monitor(sandbox.clone(), rx, "workload-container".into()),
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "run_oom_event_monitor must not be called while the caller holds the sandbox lock"
+        );
     }
 }

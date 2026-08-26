@@ -480,14 +480,14 @@ func (s *Sandbox) Monitor(ctx context.Context) (chan error, error) {
 }
 
 // WaitProcess waits on a container process and return its exit code
-func (s *Sandbox) WaitProcess(ctx context.Context, containerID, processID string) (int32, error) {
+func (s *Sandbox) WaitProcess(ctx context.Context, containerID, processID string) (ProcessWaitStatus, error) {
 	if s.state.State != types.StateRunning {
-		return 0, errSandboxNotRunning
+		return ProcessWaitStatus{}, errSandboxNotRunning
 	}
 
 	c, err := s.findContainer(containerID)
 	if err != nil {
-		return 0, err
+		return ProcessWaitStatus{}, err
 	}
 
 	return c.wait(ctx, processID)

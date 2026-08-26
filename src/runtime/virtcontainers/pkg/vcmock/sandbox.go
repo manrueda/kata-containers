@@ -167,8 +167,8 @@ func (s *Sandbox) UpdateContainer(ctx context.Context, containerID string, resou
 }
 
 // WaitProcess implements the VCSandbox function of the same name.
-func (s *Sandbox) WaitProcess(ctx context.Context, containerID, processID string) (int32, error) {
-	return 0, nil
+func (s *Sandbox) WaitProcess(ctx context.Context, containerID, processID string) (vc.ProcessWaitStatus, error) {
+	return vc.ProcessWaitStatus{}, nil
 }
 
 // SignalProcess implements the VCSandbox function of the same name.

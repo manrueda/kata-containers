@@ -20,6 +20,12 @@ import (
 
 type newAgentFuncKey struct{}
 
+// ProcessWaitStatus holds the exit status returned by the agent for a waited process.
+type ProcessWaitStatus struct {
+	ExitCode  int32
+	OOMKilled bool
+}
+
 type newAgentFuncType func() agent
 
 // getAgentFunc used to pass mock agent creation func to CreateSandbox passed in `ctx`
@@ -116,7 +122,7 @@ type agent interface {
 	updateContainer(ctx context.Context, sandbox *Sandbox, c Container, resources specs.LinuxResources) error
 
 	// waitProcess will wait for the exit code of a process
-	waitProcess(ctx context.Context, c *Container, processID string) (int32, error)
+	waitProcess(ctx context.Context, c *Container, processID string) (ProcessWaitStatus, error)
 
 	// onlineCPUMem will online CPUs and Memory inside the Sandbox.
 	// This function should be called after hot adding vCPUs or Memory.

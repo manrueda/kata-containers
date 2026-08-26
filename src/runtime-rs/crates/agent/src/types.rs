@@ -375,6 +375,7 @@ pub struct StatsContainerResponse {
 #[derive(PartialEq, Clone, Default, Debug)]
 pub struct WaitProcessResponse {
     pub status: i32,
+    pub oom_killed: bool,
 }
 
 #[derive(PartialEq, Clone, Default)]
