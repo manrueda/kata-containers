@@ -56,7 +56,12 @@ impl FcInner {
 
     pub(crate) async fn remove_device(&mut self, device: DeviceType) -> Result<()> {
         info!(sl(), "Remove Device {} ", device);
-        Ok(())
+        match device {
+            DeviceType::BlockModern(_) => Err(anyhow!(
+                "Firecracker does not support block device hot-unplug"
+            )),
+            _ => Ok(()),
+        }
     }
 
     pub(crate) async fn update_device(&mut self, device: DeviceType) -> Result<()> {

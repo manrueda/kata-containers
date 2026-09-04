@@ -156,6 +156,12 @@ pub trait Hypervisor: std::fmt::Debug + Send + Sync {
     async fn remove_device(&self, device: DeviceType) -> Result<()>;
     async fn update_device(&self, device: DeviceType) -> Result<()>;
 
+    /// Returns whether a block-device add continues to completion after its
+    /// caller is canceled. The default preserves synchronous backend behavior.
+    fn block_device_add_is_independently_owned(&self) -> bool {
+        false
+    }
+
     // utils
     async fn get_agent_socket(&self) -> Result<String>;
     async fn disconnect(&self);

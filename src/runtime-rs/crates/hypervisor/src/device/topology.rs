@@ -727,8 +727,8 @@ impl PCIeTopology {
     }
 
     pub fn release_bus_for_device(&mut self, device_id: &str) -> Result<()> {
-        let bus = match self.reserved_bus.remove(device_id) {
-            Some(b) => b,
+        let bus = match self.reserved_bus.get(device_id) {
+            Some(bus) => bus.clone(),
             None => return Ok(()),
         };
 
@@ -736,11 +736,17 @@ impl PCIeTopology {
         let swdp_prefix = PCIePortBusPrefix::SwitchDownstreamPort.to_string();
 
         if bus.0.starts_with(&rp_prefix) {
-            self.release_root_port(&bus.0);
+            self.release_root_port(&bus.0)?;
         } else if bus.0.starts_with(&swdp_prefix) {
-            self.release_switch_down_port(&bus.0);
+            self.release_switch_down_port(&bus.0)?;
+        } else {
+            return Err(anyhow!(
+                "reserved PCIe bus {} for device {device_id} has an unknown port type",
+                bus.0
+            ));
         }
 
+        self.reserved_bus.remove(device_id);
         Ok(())
     }
 
@@ -794,26 +800,34 @@ impl PCIeTopology {
         None
     }
 
-    fn release_root_port(&mut self, bus: &str) {
-        if let Some(id) = bus.strip_prefix("rp").and_then(|s| s.parse::<u32>().ok()) {
-            if let Some(rp) = self.pcie_port_devices.get_mut(&id) {
-                rp.allocated = false;
-            }
-        }
+    fn release_root_port(&mut self, bus: &str) -> Result<()> {
+        let id = bus
+            .strip_prefix("rp")
+            .and_then(|value| value.parse::<u32>().ok())
+            .ok_or_else(|| anyhow!("invalid PCIe root port bus {bus}"))?;
+        let root_port = self
+            .pcie_port_devices
+            .get_mut(&id)
+            .ok_or_else(|| anyhow!("PCIe root port {bus} does not exist"))?;
+        root_port.allocated = false;
+        Ok(())
     }
 
-    fn release_switch_down_port(&mut self, bus: &str) {
-        if let Some(id) = bus.strip_prefix("swdp").and_then(|s| s.parse::<u32>().ok()) {
-            for rp in self.pcie_port_devices.values_mut() {
-                if let Some(sw) = rp.connected_switch.as_mut() {
-                    if let Some(dp) = sw.switch_ports.get_mut(&id) {
-                        dp.allocated = false;
-                        dp.connected_device = None;
-                        break;
-                    }
+    fn release_switch_down_port(&mut self, bus: &str) -> Result<()> {
+        let id = bus
+            .strip_prefix("swdp")
+            .and_then(|value| value.parse::<u32>().ok())
+            .ok_or_else(|| anyhow!("invalid PCIe switch downstream bus {bus}"))?;
+        for root_port in self.pcie_port_devices.values_mut() {
+            if let Some(pcie_switch) = root_port.connected_switch.as_mut() {
+                if let Some(down_port) = pcie_switch.switch_ports.get_mut(&id) {
+                    down_port.allocated = false;
+                    down_port.connected_device = None;
+                    return Ok(());
                 }
             }
         }
+        Err(anyhow!("PCIe switch downstream port {bus} does not exist"))
     }
 }
 

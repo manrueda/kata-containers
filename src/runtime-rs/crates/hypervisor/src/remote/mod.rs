@@ -109,6 +109,11 @@ impl Hypervisor for Remote {
         inner.update_device(device).await
     }
 
+    #[cfg(test)]
+    fn block_device_add_is_independently_owned(&self) -> bool {
+        true
+    }
+
     async fn get_agent_socket(&self) -> Result<String> {
         let inner = self.inner.read().await;
         inner.get_agent_socket().await
@@ -225,5 +230,43 @@ impl Persist for Remote {
             inner: Arc::new(RwLock::new(inner)),
             exit_waiter: Mutex::new((exit_waiter, 0)),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Remote;
+    use crate::device::driver::{BlockConfigModern, BlockDeviceModernHandle};
+    use crate::device::Device;
+    use crate::{qemu::Qemu, Hypervisor};
+    use std::future::Future;
+    use std::task::{Context, Poll, Waker};
+
+    #[test]
+    fn block_device_add_is_not_independently_owned_by_default() {
+        assert!(!Qemu::new().block_device_add_is_independently_owned());
+    }
+
+    #[actix_rt::test]
+    async fn canceled_independently_owned_block_add_retries_without_new_reference() {
+        let hypervisor = Remote::new();
+        let inner = hypervisor.inner.write().await;
+        let mut device =
+            BlockDeviceModernHandle::new("test-device".to_string(), BlockConfigModern::default());
+        let shared = device.arc();
+        let mut topology = None;
+        let mut first_attach = Box::pin(device.attach(&mut topology, &hypervisor));
+        let mut context = Context::from_waker(Waker::noop());
+
+        assert!(matches!(
+            first_attach.as_mut().poll(&mut context),
+            Poll::Pending
+        ));
+        drop(first_attach);
+        assert_eq!(shared.lock().await.attach_count, 1);
+
+        drop(inner);
+        device.attach(&mut topology, &hypervisor).await.unwrap();
+        assert_eq!(shared.lock().await.attach_count, 1);
     }
 }

@@ -12,6 +12,7 @@ use crate::device::util::do_decrease_count;
 use crate::device::util::do_increase_count;
 use crate::device::Device;
 use crate::device::DeviceType;
+use crate::device::{device_state_in_doubt, DeviceStateInDoubt};
 use crate::Hypervisor as hypervisor;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -22,7 +23,7 @@ pub const VIRTIO_BLOCK_MMIO: &str = "virtio-blk-mmio";
 pub const VIRTIO_BLOCK_CCW: &str = "virtio-blk-ccw";
 pub const VIRTIO_PMEM: &str = "virtio-pmem";
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum BlockDeviceAio {
     // IoUring is the Linux io_uring I/O implementation.
     #[default]
@@ -97,7 +98,7 @@ impl VmdkConfig {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct BlockConfigModern {
     /// Actual host path for a raw block source; every backend consumes this
     /// value according to its block transport. When `vmdk` is present, QEMU is
@@ -116,6 +117,10 @@ pub struct BlockConfigModern {
 
     /// Enables discard/unmap support for this block device.
     pub discard_unmap: bool,
+
+    /// Retains the device identity when the backend returns an unclassified
+    /// attach error that might represent a completed operation.
+    pub retain_on_unclassified_attach_error: bool,
 
     /// Don't close `path_on_host` file when dropping the device.
     pub no_drop: bool,
@@ -192,6 +197,7 @@ pub struct BlockDeviceModern {
 #[derive(Debug, Clone)]
 pub struct BlockDeviceModernHandle {
     inner: Arc<Mutex<BlockDeviceModern>>,
+    attach_pending: bool,
 }
 
 impl BlockDeviceModernHandle {
@@ -202,6 +208,7 @@ impl BlockDeviceModernHandle {
                 attach_count: 0,
                 config,
             })),
+            attach_pending: false,
         }
     }
 
@@ -229,23 +236,57 @@ impl Device for BlockDeviceModernHandle {
         _pcie_topo: &mut Option<&mut PCIeTopology>,
         h: &dyn hypervisor,
     ) -> Result<()> {
-        // increase attach count, skip attach the device if the device is already attached
-        if self
-            .increase_attach_count()
-            .await
-            .context("failed to increase attach count")?
-        {
-            return Ok(());
+        if !self.attach_pending {
+            // Increase the attach count and skip the hypervisor operation if
+            // another owner already attached this device.
+            if self
+                .increase_attach_count()
+                .await
+                .context("failed to increase attach count")?
+            {
+                return Ok(());
+            }
         }
 
-        if let Err(e) = h.add_device(DeviceType::BlockModern(self.arc())).await {
-            error!(sl!(), "failed to attach block device: {:?}", e);
-            self.decrease_attach_count().await?;
-
-            return Err(e);
+        // An independently owned backend completes this operation even if
+        // this future is canceled. Mark it pending before the cancellation
+        // point so a same-device retry joins that operation instead of
+        // treating the reference count as proof of attachment.
+        if h.block_device_add_is_independently_owned() {
+            self.attach_pending = true;
         }
 
-        Ok(())
+        match h.add_device(DeviceType::BlockModern(self.arc())).await {
+            Ok(_) => {
+                self.attach_pending = false;
+                Ok(())
+            }
+            Err(error) if device_state_in_doubt(&error).is_some() => {
+                self.attach_pending = true;
+                Err(error)
+            }
+            Err(error)
+                if self
+                    .inner
+                    .lock()
+                    .await
+                    .config
+                    .retain_on_unclassified_attach_error =>
+            {
+                self.attach_pending = true;
+                let device_id = self.device_id().await;
+                Err(error.context(DeviceStateInDoubt::new(
+                    device_id,
+                    "unclassified block-device attach failure retained for reconciliation",
+                )))
+            }
+            Err(error) => {
+                self.attach_pending = false;
+                error!(sl!(), "failed to attach block device: {:?}", error);
+                self.decrease_attach_count().await?;
+                Err(error)
+            }
+        }
     }
 
     async fn detach(

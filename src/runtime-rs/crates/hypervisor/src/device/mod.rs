@@ -32,6 +32,34 @@ pub use self::tap::{Error as TapError, Tap};
 pub mod topology;
 pub mod util;
 
+#[derive(Debug, thiserror::Error)]
+#[error("device {device_id} operation remains unresolved: {reason}")]
+pub struct DeviceStateInDoubt {
+    device_id: String,
+    reason: String,
+}
+
+impl DeviceStateInDoubt {
+    pub fn new(device_id: impl Into<String>, reason: impl Into<String>) -> Self {
+        Self {
+            device_id: device_id.into(),
+            reason: reason.into(),
+        }
+    }
+
+    pub fn device_id(&self) -> &str {
+        &self.device_id
+    }
+}
+
+pub fn device_state_in_doubt(error: &anyhow::Error) -> Option<&DeviceStateInDoubt> {
+    error.downcast_ref::<DeviceStateInDoubt>().or_else(|| {
+        error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<DeviceStateInDoubt>())
+    })
+}
+
 #[derive(Debug)]
 pub enum DeviceConfig {
     BlockCfgModern(BlockConfigModern),

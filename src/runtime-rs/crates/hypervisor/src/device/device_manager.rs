@@ -28,6 +28,7 @@ use crate::{
 };
 
 use super::{
+    device_state_in_doubt,
     topology::PCIeTopology,
     util::{get_host_path, get_virt_drive_name, DEVICE_TYPE_BLOCK},
     Device, DeviceConfig, DeviceType,
@@ -35,22 +36,30 @@ use super::{
 
 pub type ArcMutexDevice = Arc<Mutex<dyn Device>>;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DeviceRemoval {
+    Detached,
+    ReferenceReleased,
+}
+
 macro_rules! declare_index {
     ($self:ident, $index:ident, $released_index:ident) => {{
-        let current_index = if let Some(index) = $self.$released_index.pop() {
-            index
+        if let Some(index) = $self.$released_index.pop() {
+            Ok(index)
         } else {
-            $self.$index
-        };
-        $self.$index += 1;
-        Ok(current_index)
+            let current_index = $self.$index;
+            $self.$index += 1;
+            Ok(current_index)
+        }
     }};
 }
 
 macro_rules! release_index {
     ($self:ident, $index:ident, $released_index:ident) => {{
-        $self.$released_index.push($index);
-        $self.$released_index.sort_by(|a, b| b.cmp(a));
+        if !$self.$released_index.contains(&$index) {
+            $self.$released_index.push($index);
+            $self.$released_index.sort_by(|a, b| b.cmp(a));
+        }
     }};
 }
 
@@ -147,6 +156,10 @@ impl DeviceManager {
             .await;
         // handle attach error
         if let Err(e) = result {
+            if device_state_in_doubt(&e).is_some() {
+                return Err(e);
+            }
+
             match device_guard.get_device_info().await {
                 DeviceType::Vfio(device) => {
                     // safe here:
@@ -183,15 +196,24 @@ impl DeviceManager {
     }
 
     pub async fn try_remove_device(&mut self, device_id: &str) -> Result<()> {
+        self.try_remove_device_with_outcome(device_id)
+            .await
+            .map(|_| ())
+    }
+
+    pub async fn try_remove_device_with_outcome(
+        &mut self,
+        device_id: &str,
+    ) -> Result<DeviceRemoval> {
         if let Some(dev) = self.devices.get(device_id) {
             let mut device_guard = dev.lock().await;
+            let mut removal = DeviceRemoval::Detached;
             let result = match device_guard
                 .detach(&mut self.pcie_topology.as_mut(), self.hypervisor.as_ref())
                 .await
             {
                 Ok(index) => {
                     if let Some(i) = index {
-                        // release the declared device index
                         let is_pmem = match device_guard.get_device_info().await {
                             DeviceType::BlockModern(dev) => {
                                 dev.lock().await.config.driver_option == *KATA_NVDIMM_DEV_TYPE
@@ -199,14 +221,18 @@ impl DeviceManager {
                             _ => false,
                         };
                         self.shared_info.release_device_index(i, is_pmem);
+                    } else if matches!(
+                        device_guard.get_device_info().await,
+                        DeviceType::BlockModern(_)
+                    ) {
+                        removal = DeviceRemoval::ReferenceReleased;
                     }
-                    Ok(())
+                    Ok(removal)
                 }
                 Err(e) => Err(e),
             };
 
-            // if detach success, remove it from device manager
-            if result.is_ok() {
+            if matches!(result, Ok(DeviceRemoval::Detached)) {
                 drop(device_guard);
                 self.devices.remove(device_id);
             }
@@ -220,6 +246,31 @@ impl DeviceManager {
         ))
     }
 
+    pub async fn release_block_device_after_vm_stop(&mut self, device_id: &str) -> Result<bool> {
+        let Some(device) = self.devices.get(device_id).cloned() else {
+            return Ok(false);
+        };
+        let config = {
+            let device_info = device.lock().await.get_device_info().await;
+            let DeviceType::BlockModern(block) = device_info else {
+                return Err(anyhow!(
+                    "device {device_id} is not a BlockModern device and cannot be force-released"
+                ));
+            };
+            let config = block.lock().await.config.clone();
+            config
+        };
+        if let Some(topology) = self.pcie_topology.as_mut() {
+            topology
+                .release_bus_for_device(device_id)
+                .with_context(|| format!("release PCIe reservation for device {device_id}"))?;
+        }
+        self.devices.remove(device_id);
+        self.shared_info
+            .release_device_index(config.index, config.driver_option == *KATA_NVDIMM_DEV_TYPE);
+        Ok(true)
+    }
+
     async fn get_device_info(&self, device_id: &str) -> Result<DeviceType> {
         if let Some(dev) = self.devices.get(device_id) {
             return Ok(dev.lock().await.get_device_info().await);
@@ -229,6 +280,10 @@ impl DeviceManager {
             "device with specified ID hasn't been created. {}",
             device_id
         ))
+    }
+
+    pub fn contains_device(&self, device_id: &str) -> bool {
+        self.devices.contains_key(device_id)
     }
 
     async fn find_device(&self, host_path: String) -> Option<String> {
@@ -611,25 +666,38 @@ pub async fn do_handle_device(
     d: &RwLock<DeviceManager>,
     dev_info: &DeviceConfig,
 ) -> Result<DeviceType> {
+    do_handle_device_with_id(d, dev_info, |_| {}).await
+}
+
+/// Reports the registered device ID before awaiting the backend attach.
+pub async fn do_handle_device_with_id<F>(
+    d: &RwLock<DeviceManager>,
+    dev_info: &DeviceConfig,
+    device_registered: F,
+) -> Result<DeviceType>
+where
+    F: FnOnce(&str),
+{
     let device_id = d
         .write()
         .await
         .new_device(dev_info)
         .await
-        .context("failed to create device")?;
+        .with_context(|| format!("failed to create device for {dev_info:?}"))?;
+    device_registered(&device_id);
 
     d.write()
         .await
         .try_add_device(&device_id)
         .await
-        .context("failed to add device")?;
+        .with_context(|| format!("failed to add device {device_id}"))?;
 
     let device_info = d
         .read()
         .await
         .get_device_info(&device_id)
         .await
-        .context("failed to get device info")?;
+        .with_context(|| format!("failed to get device info for {device_id}"))?;
 
     Ok(device_info)
 }
@@ -653,6 +721,10 @@ pub async fn get_block_device_info(d: &RwLock<DeviceManager>) -> BlockDeviceInfo
 
 pub async fn get_shared_fs_info(d: &RwLock<DeviceManager>) -> SharedFsInfo {
     d.read().await.get_shared_fs_info().await
+}
+
+pub async fn find_device_id(d: &RwLock<DeviceManager>, host_path: &str) -> Option<String> {
+    d.read().await.find_device(host_path.to_string()).await
 }
 
 /// Returns the APQN list for a cold-plugged VFIO-AP device whose
@@ -687,17 +759,73 @@ pub async fn find_cold_plugged_vfio_ap(
 
 #[cfg(test)]
 mod tests {
-    use super::DeviceManager;
+    use super::{ArcMutexDevice, DeviceManager, SharedInfo};
     use crate::{
-        device::{device_manager::get_block_device_info, DeviceConfig, DeviceType},
+        device::{
+            device_manager::get_block_device_info,
+            topology::{PCIePort, PCIeTopology},
+            util::DEVICE_TYPE_BLOCK,
+            Device, DeviceConfig, DeviceStateInDoubt, DeviceType,
+        },
         qemu::Qemu,
-        BlockConfigModern, KATA_BLK_DEV_TYPE,
+        BlockConfigModern, BlockDeviceModern, Hypervisor, KATA_BLK_DEV_TYPE,
     };
     use anyhow::{anyhow, Context, Result};
+    use async_trait::async_trait;
     use kata_types::config::hypervisor::TopologyConfigInfo;
-    use std::sync::Arc;
+    use std::{collections::HashSet, sync::Arc};
     use tests_utils::load_test_config;
-    use tokio::sync::RwLock;
+    use tokio::sync::{Mutex, RwLock};
+
+    #[derive(Debug)]
+    struct SharedTestDevice {
+        block: Arc<Mutex<BlockDeviceModern>>,
+        references: u8,
+        attach_in_doubt: bool,
+    }
+
+    #[async_trait]
+    impl Device for SharedTestDevice {
+        async fn attach(
+            &mut self,
+            _pcie_topo: &mut Option<&mut PCIeTopology>,
+            _h: &dyn Hypervisor,
+        ) -> Result<()> {
+            if self.attach_in_doubt {
+                Err(anyhow::Error::new(DeviceStateInDoubt::new(
+                    "pending-block",
+                    "injected pending attach",
+                )))
+            } else {
+                Ok(())
+            }
+        }
+
+        async fn detach(
+            &mut self,
+            _pcie_topo: &mut Option<&mut PCIeTopology>,
+            _h: &dyn Hypervisor,
+        ) -> Result<Option<u64>> {
+            self.references -= 1;
+            Ok((self.references == 0).then_some(0))
+        }
+
+        async fn update(&mut self, _h: &dyn Hypervisor) -> Result<()> {
+            Ok(())
+        }
+
+        async fn get_device_info(&self) -> DeviceType {
+            DeviceType::BlockModern(self.block.clone())
+        }
+
+        async fn increase_attach_count(&mut self) -> Result<bool> {
+            Ok(false)
+        }
+
+        async fn decrease_attach_count(&mut self) -> Result<bool> {
+            Ok(false)
+        }
+    }
 
     async fn new_device_manager() -> Result<Arc<RwLock<DeviceManager>>> {
         let hypervisor_name: &str = "qemu";
@@ -748,5 +876,268 @@ mod tests {
         } else {
             assert_eq!(1, 0)
         }
+    }
+
+    #[actix_rt::test]
+    async fn test_block_identity_allocation_through_eighth_device() {
+        let dm = new_device_manager().await.unwrap();
+        let mut ids = HashSet::new();
+        let mut paths = HashSet::new();
+
+        let root = DeviceConfig::BlockCfgModern(BlockConfigModern {
+            path_on_host: "/dev/test-root".to_string(),
+            driver_option: "virtio-blk-pci".to_string(),
+            ..Default::default()
+        });
+        let root_id = dm.write().await.new_device(&root).await.unwrap();
+        assert!(ids.insert(root_id.clone()));
+        let DeviceType::BlockModern(root) =
+            dm.read().await.get_device_info(&root_id).await.unwrap()
+        else {
+            panic!("expected BlockModern root device");
+        };
+        paths.insert(root.lock().await.config.virt_path.clone());
+
+        for index in 0..8 {
+            let dev_info = DeviceConfig::BlockCfgModern(BlockConfigModern {
+                path_on_host: format!("/dev/test-block-{index}"),
+                driver_option: "virtio-blk-pci".to_string(),
+                ..Default::default()
+            });
+            let device_id = dm.write().await.new_device(&dev_info).await.unwrap();
+            assert!(ids.insert(device_id.clone()));
+
+            let device = dm.read().await.get_device_info(&device_id).await.unwrap();
+            let DeviceType::BlockModern(device) = device else {
+                panic!("expected BlockModern device");
+            };
+            let device = device.lock().await;
+            assert_eq!(device.config.index, index + 1);
+            assert!(paths.insert(device.config.virt_path.clone()));
+        }
+
+        assert_eq!(ids.len(), 9);
+        assert_eq!(paths.len(), 9);
+        assert!(paths.contains("/dev/vdi"));
+    }
+
+    #[actix_rt::test]
+    async fn test_failed_block_identity_is_reused() {
+        let mut shared = SharedInfo::new().await;
+        assert_eq!(shared.declare_device_index(false).unwrap(), 0);
+        assert_eq!(shared.declare_device_index(false).unwrap(), 1);
+        let failed = shared.declare_device_index(false).unwrap();
+        assert_eq!(failed, 2);
+
+        shared.release_device_index(failed, false);
+
+        assert_eq!(shared.declare_device_index(false).unwrap(), failed);
+        assert_eq!(shared.declare_device_index(false).unwrap(), 3);
+    }
+
+    #[actix_rt::test]
+    async fn test_reused_block_identity_preserves_fresh_virt_path_sequence() {
+        let dm = new_device_manager().await.unwrap();
+        let mut dm = dm.write().await;
+
+        assert_eq!(
+            dm.get_dev_virt_path(DEVICE_TYPE_BLOCK, false).unwrap(),
+            Some((0, "/dev/vda".to_string()))
+        );
+        assert_eq!(
+            dm.get_dev_virt_path(DEVICE_TYPE_BLOCK, false).unwrap(),
+            Some((1, "/dev/vdb".to_string()))
+        );
+        assert_eq!(
+            dm.get_dev_virt_path(DEVICE_TYPE_BLOCK, false).unwrap(),
+            Some((2, "/dev/vdc".to_string()))
+        );
+
+        dm.shared_info.release_device_index(2, false);
+        assert_eq!(
+            dm.get_dev_virt_path(DEVICE_TYPE_BLOCK, false).unwrap(),
+            Some((2, "/dev/vdc".to_string()))
+        );
+        assert_eq!(
+            dm.get_dev_virt_path(DEVICE_TYPE_BLOCK, false).unwrap(),
+            Some((3, "/dev/vdd".to_string()))
+        );
+    }
+
+    #[actix_rt::test]
+    async fn test_shared_device_stays_registered_until_final_detach() {
+        let dm = new_device_manager().await.unwrap();
+        let device_id = "shared-block".to_string();
+        let block = Arc::new(Mutex::new(BlockDeviceModern {
+            device_id: device_id.clone(),
+            attach_count: 2,
+            config: BlockConfigModern {
+                driver_option: KATA_BLK_DEV_TYPE.to_string(),
+                ..Default::default()
+            },
+        }));
+        let device: ArcMutexDevice = Arc::new(Mutex::new(SharedTestDevice {
+            block,
+            references: 2,
+            attach_in_doubt: false,
+        }));
+        dm.write().await.devices.insert(device_id.clone(), device);
+
+        dm.write()
+            .await
+            .try_remove_device(&device_id)
+            .await
+            .unwrap();
+        assert!(dm.read().await.devices.contains_key(&device_id));
+
+        dm.write()
+            .await
+            .try_remove_device(&device_id)
+            .await
+            .unwrap();
+        assert!(!dm.read().await.devices.contains_key(&device_id));
+    }
+
+    #[actix_rt::test]
+    async fn test_unresolved_attach_retains_device_identity_and_path() {
+        let dm = new_device_manager().await.unwrap();
+        let mut dm = dm.write().await;
+        let index = dm.shared_info.declare_device_index(false).unwrap();
+        let device_id = "pending-block".to_string();
+        let block = Arc::new(Mutex::new(BlockDeviceModern {
+            device_id: device_id.clone(),
+            attach_count: 1,
+            config: BlockConfigModern {
+                index,
+                virt_path: "/dev/vda".to_string(),
+                driver_option: KATA_BLK_DEV_TYPE.to_string(),
+                ..Default::default()
+            },
+        }));
+        let device: ArcMutexDevice = Arc::new(Mutex::new(SharedTestDevice {
+            block,
+            references: 1,
+            attach_in_doubt: true,
+        }));
+        dm.devices.insert(device_id.clone(), device);
+
+        let error = dm.try_add_device(&device_id).await.unwrap_err();
+        assert!(crate::device::device_state_in_doubt(&error).is_some());
+        assert!(dm.devices.contains_key(&device_id));
+        assert_eq!(dm.shared_info.declare_device_index(false).unwrap(), 1);
+
+        dm.shared_info.release_device_index(1, false);
+        dm.try_remove_device(&device_id).await.unwrap();
+        assert!(!dm.devices.contains_key(&device_id));
+        assert_eq!(dm.shared_info.declare_device_index(false).unwrap(), 0);
+    }
+
+    #[actix_rt::test]
+    async fn test_vm_stop_force_releases_unresolved_block_identity() {
+        let dm = new_device_manager().await.unwrap();
+        let mut dm = dm.write().await;
+        let index = dm.shared_info.declare_device_index(false).unwrap();
+        let device_id = "stopped-vm-block".to_string();
+        let block = Arc::new(Mutex::new(BlockDeviceModern {
+            device_id: device_id.clone(),
+            attach_count: 1,
+            config: BlockConfigModern {
+                index,
+                virt_path: "/dev/vda".to_string(),
+                driver_option: KATA_BLK_DEV_TYPE.to_string(),
+                ..Default::default()
+            },
+        }));
+        let device: ArcMutexDevice = Arc::new(Mutex::new(SharedTestDevice {
+            block,
+            references: 1,
+            attach_in_doubt: true,
+        }));
+        dm.devices.insert(device_id.clone(), device);
+
+        assert!(dm
+            .release_block_device_after_vm_stop(&device_id)
+            .await
+            .unwrap());
+        assert!(!dm.devices.contains_key(&device_id));
+        assert_eq!(dm.shared_info.declare_device_index(false).unwrap(), 0);
+    }
+
+    #[actix_rt::test]
+    async fn test_vm_stop_release_converges_pcie_and_block_ownership() {
+        let dm = new_device_manager().await.unwrap();
+        let mut dm = dm.write().await;
+        let index = dm.shared_info.declare_device_index(false).unwrap();
+        let device_id = "stopped-vm-pcie-block".to_string();
+        let block = Arc::new(Mutex::new(BlockDeviceModern {
+            device_id: device_id.clone(),
+            attach_count: 1,
+            config: BlockConfigModern {
+                index,
+                virt_path: "/dev/vda".to_string(),
+                driver_option: KATA_BLK_DEV_TYPE.to_string(),
+                ..Default::default()
+            },
+        }));
+        let device: ArcMutexDevice = Arc::new(Mutex::new(SharedTestDevice {
+            block,
+            references: 1,
+            attach_in_doubt: true,
+        }));
+        dm.devices.insert(device_id.clone(), device);
+
+        let topology = dm.pcie_topology.as_mut().unwrap();
+        topology.add_root_ports_on_bus(1).unwrap();
+        let reservation = topology
+            .reserve_bus_for_device(&device_id, PCIePort::RootPort)
+            .unwrap()
+            .unwrap();
+        let root_port_id = reservation
+            .0
+            .strip_prefix("rp")
+            .unwrap()
+            .parse::<u32>()
+            .unwrap();
+        assert!(topology.reserved_bus.contains_key(&device_id));
+        assert!(topology.pcie_port_devices[&root_port_id].allocated);
+        topology.reserved_bus.insert(
+            device_id.clone(),
+            ("invalid-port".to_string(), reservation.1, reservation.2),
+        );
+        let error = dm
+            .release_block_device_after_vm_stop(&device_id)
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("unknown port type"));
+        assert!(dm.devices.contains_key(&device_id));
+        assert!(!dm.shared_info.released_block_index.contains(&index));
+        dm.pcie_topology
+            .as_mut()
+            .unwrap()
+            .reserved_bus
+            .insert(device_id.clone(), reservation);
+
+        assert!(dm
+            .release_block_device_after_vm_stop(&device_id)
+            .await
+            .unwrap());
+        let topology = dm.pcie_topology.as_ref().unwrap();
+        assert!(!topology.reserved_bus.contains_key(&device_id));
+        assert!(!topology.pcie_port_devices[&root_port_id].allocated);
+        assert!(!dm.devices.contains_key(&device_id));
+
+        assert!(!dm
+            .release_block_device_after_vm_stop(&device_id)
+            .await
+            .unwrap());
+        assert!(!dm
+            .pcie_topology
+            .as_ref()
+            .unwrap()
+            .reserved_bus
+            .contains_key(&device_id));
+        assert!(!dm.pcie_topology.as_ref().unwrap().pcie_port_devices[&root_port_id].allocated);
+        assert!(!dm.devices.contains_key(&device_id));
+        assert_eq!(dm.shared_info.declare_device_index(false).unwrap(), index);
     }
 }
