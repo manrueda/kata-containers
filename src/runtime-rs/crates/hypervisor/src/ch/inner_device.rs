@@ -54,6 +54,65 @@ pub(super) struct OwnedNetworkConfig {
     pub(super) fds: Vec<OwnedFd>,
 }
 
+#[cfg(test)]
+#[derive(Debug)]
+pub(super) struct ApiRequest {
+    pub(super) request_line: String,
+    pub(super) body: serde_json::Value,
+}
+
+#[cfg(test)]
+pub(super) fn read_request(socket: &mut std::os::unix::net::UnixStream) -> ApiRequest {
+    use std::io::Read;
+
+    let mut headers = Vec::new();
+    loop {
+        let mut byte = [0_u8; 1];
+        socket.read_exact(&mut byte).unwrap();
+        headers.push(byte[0]);
+        if headers.ends_with(b"\r\n\r\n") {
+            break;
+        }
+    }
+
+    let headers = String::from_utf8(headers).unwrap();
+    let content_length = headers
+        .lines()
+        .find_map(|line| line.strip_prefix("Content-Length: "))
+        .map(|length| length.parse::<usize>().unwrap())
+        .unwrap_or_default();
+    let mut body = vec![0_u8; content_length];
+    socket.read_exact(&mut body).unwrap();
+
+    ApiRequest {
+        request_line: headers.lines().next().unwrap().to_string(),
+        body: if body.is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::from_slice(&body).unwrap()
+        },
+    }
+}
+
+#[cfg(test)]
+pub(super) fn write_response(
+    socket: &mut std::os::unix::net::UnixStream,
+    status: &str,
+    body: Option<&str>,
+) {
+    use std::io::Write;
+
+    let response = match body {
+        Some(body) => format!(
+            "HTTP/1.1 {status}\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        ),
+        None => format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\n\r\n"),
+    };
+    socket.write_all(response.as_bytes()).unwrap();
+    socket.flush().unwrap();
+}
+
 impl CloudHypervisorInner {
     pub(crate) async fn add_device(&mut self, device: DeviceType) -> Result<DeviceType> {
         if self.state != VmmState::VmRunning {
@@ -746,6 +805,31 @@ impl TryFrom<ShareFsSettings> for FsConfig {
 mod tests {
     use super::*;
     use crate::Address;
+    use std::os::unix::net::UnixStream;
+    use std::thread;
+    use std::time::Duration;
+
+    fn block_device(device_id: &str, ordinal: usize) -> Arc<Mutex<BlockDeviceModern>> {
+        Arc::new(Mutex::new(BlockDeviceModern {
+            device_id: device_id.to_string(),
+            config: BlockConfigModern {
+                path_on_host: format!("/var/lib/kata/emptydir-{ordinal}/disk.img"),
+                driver_option: crate::KATA_BLK_DEV_TYPE.to_string(),
+                num_queues: 2,
+                queue_size: 256,
+                discard_unmap: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        }))
+    }
+
+    fn inner_with_socket(socket: UnixStream) -> CloudHypervisorInner {
+        CloudHypervisorInner {
+            api_socket: ch_config::ch_api::ApiSocket::new(Some(socket)),
+            ..Default::default()
+        }
+    }
 
     #[test]
     fn test_networkconfig_to_netconfig() {
@@ -784,5 +868,275 @@ mod tests {
         let net = NetConfig::try_from(cfg);
         assert!(net.is_ok());
         assert_eq!(net.unwrap(), expected);
+    }
+
+    #[tokio::test]
+    async fn mismatched_add_identity_rolls_back_returned_vmm_id() {
+        let (client, mut server_socket) = UnixStream::pair().unwrap();
+        server_socket
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let server = thread::spawn(move || {
+            let add = read_request(&mut server_socket);
+            write_response(
+                &mut server_socket,
+                "200",
+                Some(r#"{"id":"vmm-volume-4","bdf":"0000:00:09.0"}"#),
+            );
+            let rollback = read_request(&mut server_socket);
+            write_response(&mut server_socket, "204", None);
+            (add, rollback)
+        });
+        let mut inner = inner_with_socket(client);
+        let device = block_device("volume-4", 4);
+
+        let error = inner.handle_block_device(device.clone()).await.unwrap_err();
+
+        assert!(format!("{error:#}")
+            .contains("returned device identity vmm-volume-4 for block device volume-4"));
+        assert!(inner.device_ids.is_empty());
+        assert!(device.lock().await.config.pci_path.is_none());
+        let (add, rollback) = server.join().unwrap();
+        assert_eq!(add.body["id"], "volume-4");
+        assert_eq!(rollback.body, serde_json::json!({"id": "vmm-volume-4"}));
+    }
+
+    #[tokio::test]
+    async fn invalid_add_response_rolls_back_stable_vmm_identity() {
+        let (client, mut server_socket) = UnixStream::pair().unwrap();
+        server_socket
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let server = thread::spawn(move || {
+            let add = read_request(&mut server_socket);
+            write_response(&mut server_socket, "200", Some(r#"{"invalid":true}"#));
+            let rollback = read_request(&mut server_socket);
+            write_response(&mut server_socket, "204", None);
+            (add, rollback)
+        });
+        let mut inner = inner_with_socket(client);
+        let device = block_device("volume-4", 4);
+
+        let error = inner.handle_block_device(device.clone()).await.unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("rolled back partially attached runtime block device volume-4"));
+        assert!(format!("{error:#}").contains("returned invalid identity"));
+        assert!(inner.device_ids.is_empty());
+        assert!(device.lock().await.config.pci_path.is_none());
+        let (_, rollback) = server.join().unwrap();
+        assert_eq!(
+            rollback.request_line,
+            "PUT /api/v1/vm.remove-device HTTP/1.1"
+        );
+        assert_eq!(rollback.body, serde_json::json!({"id": "volume-4"}));
+    }
+
+    #[tokio::test]
+    async fn failed_mismatched_identity_rollback_retries_returned_vmm_id() {
+        let (client, mut server_socket) = UnixStream::pair().unwrap();
+        server_socket
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let first_server = thread::spawn(move || {
+            let add = read_request(&mut server_socket);
+            write_response(
+                &mut server_socket,
+                "200",
+                Some(r#"{"id":"vmm-volume-5","bdf":"0000:00:0a.0"}"#),
+            );
+            let rollback = read_request(&mut server_socket);
+            write_response(
+                &mut server_socket,
+                "500",
+                Some(r#"["device remains busy"]"#),
+            );
+            (add, rollback)
+        });
+        let mut inner = inner_with_socket(client);
+        let device = block_device("volume-5", 5);
+
+        let error = inner.handle_block_device(device.clone()).await.unwrap_err();
+        assert!(crate::device::device_state_in_doubt(&error).is_some());
+        assert_eq!(
+            inner.device_ids.get("volume-5"),
+            Some(&"vmm-volume-5".to_string())
+        );
+        let (add, rollback) = first_server.join().unwrap();
+        assert_eq!(add.body["id"], "volume-5");
+        assert_eq!(rollback.body, serde_json::json!({"id": "vmm-volume-5"}));
+
+        let (retry_client, mut retry_server_socket) = UnixStream::pair().unwrap();
+        let retry_server = thread::spawn(move || {
+            let retry = read_request(&mut retry_server_socket);
+            write_response(
+                &mut retry_server_socket,
+                "404",
+                Some(r#"["device is already absent"]"#),
+            );
+            retry
+        });
+        inner.api_socket.replace(retry_client, None).await;
+        inner
+            .remove_device(DeviceType::BlockModern(device.clone()))
+            .await
+            .unwrap();
+
+        assert!(inner.device_ids.is_empty());
+        assert!(device.lock().await.config.pci_path.is_none());
+        assert_eq!(
+            retry_server.join().unwrap().body,
+            serde_json::json!({"id": "vmm-volume-5"})
+        );
+    }
+
+    #[tokio::test]
+    async fn lost_add_response_keeps_stable_identity_for_cleanup() {
+        let (client, mut server_socket) = UnixStream::pair().unwrap();
+        let add_server = thread::spawn(move || read_request(&mut server_socket));
+        let mut inner = inner_with_socket(client);
+        let device = block_device("volume-lost", 6);
+
+        let error = inner.handle_block_device(device.clone()).await.unwrap_err();
+        assert!(crate::device::device_state_in_doubt(&error).is_some());
+        assert_eq!(
+            inner.device_ids.get("volume-lost"),
+            Some(&"volume-lost".to_string())
+        );
+        let add = add_server.join().unwrap();
+        assert_eq!(add.body["id"], "volume-lost");
+
+        let (cleanup_client, mut cleanup_server_socket) = UnixStream::pair().unwrap();
+        let cleanup_server = thread::spawn(move || {
+            let cleanup = read_request(&mut cleanup_server_socket);
+            write_response(&mut cleanup_server_socket, "204", None);
+            cleanup
+        });
+        inner.api_socket.replace(cleanup_client, None).await;
+        inner
+            .remove_device(DeviceType::BlockModern(device))
+            .await
+            .unwrap();
+
+        assert!(inner.device_ids.is_empty());
+        assert_eq!(
+            cleanup_server.join().unwrap().body,
+            serde_json::json!({"id": "volume-lost"})
+        );
+    }
+
+    #[tokio::test]
+    async fn never_dispatched_add_releases_request_identity() {
+        let mut inner = CloudHypervisorInner::default();
+        let device = block_device("volume-never-dispatched", 6);
+
+        let error = inner.handle_block_device(device).await.unwrap_err();
+
+        assert!(ch_config::ch_api::is_api_command_not_dispatched(&error));
+        assert!(crate::device::device_state_in_doubt(&error).is_none());
+        assert!(inner.device_ids.is_empty());
+    }
+
+    #[tokio::test]
+    async fn block_remove_without_mapping_uses_stable_identity_and_accepts_not_found() {
+        let (client, mut server_socket) = UnixStream::pair().unwrap();
+        let server = thread::spawn(move || {
+            let remove = read_request(&mut server_socket);
+            write_response(
+                &mut server_socket,
+                "404",
+                Some(r#"["device is already absent"]"#),
+            );
+            remove
+        });
+        let mut inner = inner_with_socket(client);
+        let device = block_device("stable-volume", 7);
+
+        inner
+            .remove_device(DeviceType::BlockModern(device.clone()))
+            .await
+            .unwrap();
+
+        assert!(inner.device_ids.is_empty());
+        assert!(device.lock().await.config.pci_path.is_none());
+        assert_eq!(
+            server.join().unwrap().body,
+            serde_json::json!({"id": "stable-volume"})
+        );
+    }
+
+    #[tokio::test]
+    async fn non_block_remove_without_mapping_remains_strict() {
+        let mut inner = CloudHypervisorInner::default();
+
+        let error = inner
+            .inner_remove_device("missing-vfio", None)
+            .await
+            .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("Cloud Hypervisor device identity is missing"));
+    }
+
+    #[tokio::test]
+    async fn definite_add_and_remove_failures_keep_precise_context() {
+        let (client, mut server_socket) = UnixStream::pair().unwrap();
+        let attach_server = thread::spawn(move || {
+            let request = read_request(&mut server_socket);
+            write_response(
+                &mut server_socket,
+                "500",
+                Some(r#"["backing file is busy"]"#),
+            );
+            request
+        });
+        let mut inner = inner_with_socket(client);
+        let device = block_device("volume-6", 6);
+
+        let attach_error = inner.handle_block_device(device.clone()).await.unwrap_err();
+        let attach_error = format!("{attach_error:#}");
+        assert!(attach_error.contains("failed to attach block device volume-6"));
+        assert!(attach_error.contains("/var/lib/kata/emptydir-6/disk.img"));
+        assert!(attach_error.contains("backing file is busy"));
+        assert!(inner.device_ids.is_empty());
+        attach_server.join().unwrap();
+
+        let (client, mut server_socket) = UnixStream::pair().unwrap();
+        let detach_server = thread::spawn(move || {
+            read_request(&mut server_socket);
+            write_response(
+                &mut server_socket,
+                "200",
+                Some(r#"{"id":"volume-7","bdf":"0000:00:0c.0"}"#),
+            );
+            let remove = read_request(&mut server_socket);
+            write_response(
+                &mut server_socket,
+                "500",
+                Some(r#"["device is still in use"]"#),
+            );
+            remove
+        });
+        let mut inner = inner_with_socket(client);
+        let device = block_device("volume-7", 7);
+        inner.handle_block_device(device.clone()).await.unwrap();
+
+        let detach_error = inner
+            .remove_device(DeviceType::BlockModern(device.clone()))
+            .await
+            .unwrap_err();
+        let detach_error = format!("{detach_error:#}");
+        assert!(
+            detach_error.contains("failed to detach runtime device volume-7 (VMM device volume-7)")
+        );
+        assert!(detach_error.contains("device is still in use"));
+        assert_eq!(
+            inner.device_ids.get("volume-7"),
+            Some(&"volume-7".to_string())
+        );
+        assert!(device.lock().await.config.pci_path.is_some());
+        detach_server.join().unwrap();
     }
 }

@@ -542,6 +542,64 @@ impl CloudHypervisor {
         let mut inner = self.inner.write().await;
         inner.set_hypervisor_config(config)
     }
+
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub(crate) async fn set_test_api_socket(&self, socket: std::os::unix::net::UnixStream) {
+        let mut inner = self.inner.write().await;
+        inner.api_socket.replace(socket, None).await;
+        inner.state = crate::VmmState::VmRunning;
+        let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+        inner.shutdown_tx = Some(shutdown_tx);
+        inner.logger_task = Some(tokio::spawn(async move {
+            let _ = shutdown_rx.changed().await;
+            Ok(())
+        }));
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn set_test_panic_after_spawn(&self, enabled: bool) {
+        self.inner.write().await.panic_after_spawn = enabled;
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn set_test_cleanup_uncertain(&self, enabled: bool) {
+        self.inner.write().await.report_cleanup_uncertain = enabled;
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn set_test_process_cleanup_faults(
+        &self,
+        faults: impl IntoIterator<Item = inner::ProcessCleanupFault>,
+    ) {
+        let process = self
+            .inner
+            .read()
+            .await
+            .process
+            .clone()
+            .expect("Cloud Hypervisor process is present");
+        process
+            .lock()
+            .await
+            .as_mut()
+            .expect("Cloud Hypervisor child is present")
+            .cleanup_faults
+            .extend(faults);
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn set_test_api_unavailable(&self) {
+        let mut inner = self.inner.write().await;
+        inner.api_socket = ch_config::ch_api::ApiSocket::new(None);
+        inner.state = crate::VmmState::VmRunning;
+    }
+
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub(crate) async fn test_device_ids(&self) -> HashMap<String, String> {
+        self.inner.read().await.device_ids.clone()
+    }
 }
 
 impl Default for CloudHypervisor {
@@ -747,5 +805,1116 @@ impl Persist for CloudHypervisor {
             block_adds: Arc::new(Mutex::new(BlockAddState::default())),
             exit_waiter: Mutex::new((exit_waiter, 0)),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::inner_device::{read_request, write_response, ApiRequest};
+    use super::*;
+    use crate::device::device_manager::{do_handle_device, DeviceManager};
+    use crate::device::driver::VIRTIO_BLOCK_PCI;
+    use crate::device::DeviceConfig;
+    use crate::{BlockConfigModern, BlockDeviceModern};
+    use std::future::Future;
+    use std::os::unix::net::UnixStream;
+    use std::task::{Context as TaskContext, Poll, Waker};
+    use std::thread;
+    use std::time::Duration;
+
+    fn block_device(device_id: &str, path: &str) -> DeviceType {
+        DeviceType::BlockModern(Arc::new(Mutex::new(BlockDeviceModern {
+            device_id: device_id.to_string(),
+            config: BlockConfigModern {
+                path_on_host: path.to_string(),
+                driver_option: crate::KATA_BLK_DEV_TYPE.to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        })))
+    }
+
+    fn poll_once<F: Future>(future: std::pin::Pin<&mut F>) -> Poll<F::Output> {
+        let mut context = TaskContext::from_waker(Waker::noop());
+        future.poll(&mut context)
+    }
+
+    fn block_config(path: &str) -> DeviceConfig {
+        DeviceConfig::BlockCfgModern(BlockConfigModern {
+            path_on_host: path.to_string(),
+            driver_option: VIRTIO_BLOCK_PCI.to_string(),
+            ..Default::default()
+        })
+    }
+
+    #[cfg(target_os = "linux")]
+    fn sleeping_launcher(directory: &std::path::Path) -> std::path::PathBuf {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+
+        let launcher_path = directory.join("fake-cloud-hypervisor");
+        fs::write(&launcher_path, "#!/bin/sh\nexec sleep 30\n").unwrap();
+        fs::set_permissions(&launcher_path, fs::Permissions::from_mode(0o755)).unwrap();
+        launcher_path
+    }
+
+    #[cfg(target_os = "linux")]
+    fn blocking_launcher(directory: &std::path::Path) -> std::path::PathBuf {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+
+        let launcher_path = directory.join("blocking-cloud-hypervisor");
+        fs::write(&launcher_path, "#!/bin/sh\nexec tail -f /dev/null\n").unwrap();
+        fs::set_permissions(&launcher_path, fs::Permissions::from_mode(0o755)).unwrap();
+        launcher_path
+    }
+
+    async fn stop_test_hypervisor(socket: UnixStream) -> Arc<CloudHypervisor> {
+        let hypervisor = Arc::new(CloudHypervisor::new());
+        hypervisor.set_test_api_socket(socket).await;
+        hypervisor
+    }
+
+    async fn wait_for_thread_signal(
+        receiver: std::sync::mpsc::Receiver<()>,
+        message: &'static str,
+    ) {
+        tokio::task::spawn_blocking(move || receiver.recv_timeout(Duration::from_secs(2)))
+            .await
+            .expect("signal waiter panicked")
+            .expect(message);
+    }
+
+    #[tokio::test]
+    async fn canceled_stop_during_add_drain_still_shuts_down() {
+        let (client, mut server_socket) = UnixStream::pair().unwrap();
+        let (add_seen_tx, add_seen_rx) = std::sync::mpsc::channel();
+        let (release_add_tx, release_add_rx) = std::sync::mpsc::channel();
+        let (shutdown_seen_tx, shutdown_seen_rx) = std::sync::mpsc::channel();
+        let server = thread::spawn(move || {
+            let add = read_request(&mut server_socket);
+            add_seen_tx.send(()).unwrap();
+            release_add_rx.recv().unwrap();
+            write_response(
+                &mut server_socket,
+                "200",
+                Some(r#"{"id":"canceled-drain","bdf":"0000:00:05.0"}"#),
+            );
+            let shutdown = read_request(&mut server_socket);
+            shutdown_seen_tx.send(()).unwrap();
+            write_response(&mut server_socket, "204", None);
+            (add, shutdown)
+        });
+        let hypervisor = stop_test_hypervisor(client).await;
+
+        let add_hypervisor = hypervisor.clone();
+        let add = tokio::spawn(async move {
+            add_hypervisor
+                .add_device(block_device(
+                    "canceled-drain",
+                    "/var/lib/kata/canceled-drain/disk.img",
+                ))
+                .await
+        });
+        wait_for_thread_signal(add_seen_rx, "add request was not received").await;
+
+        let mut stop = Box::pin(hypervisor.stop_vm());
+        assert!(poll_once(stop.as_mut()).is_pending());
+        drop(stop);
+
+        release_add_tx.send(()).unwrap();
+        add.await.unwrap().unwrap();
+        wait_for_thread_signal(
+            shutdown_seen_rx,
+            "shutdown was abandoned when its caller was canceled",
+        )
+        .await;
+        let (add_request, _) = server.join().unwrap();
+        assert_eq!(add_request.body["id"], "canceled-drain");
+    }
+
+    #[tokio::test]
+    async fn canceled_stop_waiting_for_inner_lock_still_shuts_down() {
+        let (client, mut server_socket) = UnixStream::pair().unwrap();
+        let (shutdown_seen_tx, shutdown_seen_rx) = std::sync::mpsc::channel();
+        let server = thread::spawn(move || {
+            let shutdown = read_request(&mut server_socket);
+            shutdown_seen_tx.send(()).unwrap();
+            write_response(&mut server_socket, "204", None);
+            shutdown
+        });
+        let hypervisor = stop_test_hypervisor(client).await;
+        let inner_guard = hypervisor.inner.write().await;
+
+        let mut stop = Box::pin(hypervisor.stop_vm());
+        assert!(poll_once(stop.as_mut()).is_pending());
+        drop(stop);
+        drop(inner_guard);
+
+        wait_for_thread_signal(
+            shutdown_seen_rx,
+            "shutdown was abandoned while waiting for the inner lock",
+        )
+        .await;
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn definite_stop_failure_reopens_block_add_admission() {
+        let hypervisor = Arc::new(CloudHypervisor::new());
+        hypervisor.set_test_api_unavailable().await;
+
+        let stop_error = hypervisor.stop_vm().await.unwrap_err();
+        assert!(ch_config::ch_api::is_api_command_not_dispatched(
+            &stop_error
+        ));
+
+        let (client, mut server_socket) = UnixStream::pair().unwrap();
+        let server = thread::spawn(move || {
+            let add = read_request(&mut server_socket);
+            write_response(
+                &mut server_socket,
+                "200",
+                Some(r#"{"id":"after-stop-failure","bdf":"0000:00:05.0"}"#),
+            );
+            add
+        });
+        hypervisor.set_test_api_socket(client).await;
+
+        hypervisor
+            .add_device(block_device(
+                "after-stop-failure",
+                "/var/lib/kata/after-stop-failure/disk.img",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(server.join().unwrap().body["id"], "after-stop-failure");
+
+        let start_error = hypervisor.start_vm(1).await.unwrap_err();
+        assert!(start_error.to_string().contains("already running"));
+    }
+
+    #[tokio::test]
+    async fn ambiguous_stop_failure_keeps_block_add_admission_closed() {
+        let (client, mut server_socket) = UnixStream::pair().unwrap();
+        let server = thread::spawn(move || {
+            let shutdown = read_request(&mut server_socket);
+            drop(server_socket);
+            shutdown
+        });
+        let hypervisor = stop_test_hypervisor(client).await;
+
+        let stop_error = hypervisor.stop_vm().await.unwrap_err();
+        assert!(!ch_config::ch_api::is_api_command_not_dispatched(
+            &stop_error
+        ));
+        server.join().unwrap();
+
+        let (replacement, _server_socket) = UnixStream::pair().unwrap();
+        hypervisor.set_test_api_socket(replacement).await;
+        let add_error = hypervisor
+            .add_device(block_device(
+                "after-ambiguous-stop",
+                "/var/lib/kata/after-ambiguous-stop/disk.img",
+            ))
+            .await
+            .unwrap_err();
+        assert!(add_error.to_string().contains("VM stop has begun"));
+
+        let start_error = hypervisor.start_vm(1).await.unwrap_err();
+        assert!(start_error
+            .to_string()
+            .contains("previous VM shutdown is unresolved"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn successful_stop_terminally_rejects_restart_without_spawning() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+
+        let (client, mut server_socket) = UnixStream::pair().unwrap();
+        let server = thread::spawn(move || {
+            let shutdown = read_request(&mut server_socket);
+            write_response(&mut server_socket, "204", None);
+            shutdown
+        });
+        let hypervisor = stop_test_hypervisor(client).await;
+        hypervisor.stop_vm().await.unwrap();
+        server.join().unwrap();
+        assert!(
+            !hypervisor
+                .inner
+                .read()
+                .await
+                .has_active_epoch_resources()
+                .await
+        );
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let marker_path = temp_dir.path().join("spawned");
+        let launcher_path = temp_dir.path().join("must-not-spawn");
+        fs::write(
+            &launcher_path,
+            format!("#!/bin/sh\ntouch '{}'\n", marker_path.display()),
+        )
+        .unwrap();
+        fs::set_permissions(&launcher_path, fs::Permissions::from_mode(0o755)).unwrap();
+        hypervisor.inner.write().await.config.path = launcher_path.to_string_lossy().into_owned();
+
+        let error = hypervisor.start_vm(1).await.unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("sandbox lifecycle cannot restart"));
+        assert!(!marker_path.exists());
+        let state = hypervisor.block_adds.lock().await;
+        assert!(state.cleanup_unresolved.is_none());
+        let stopped = state.stop.clone().unwrap();
+        drop(state);
+        assert!(matches!(stopped.wait().await, VmOperationOutcome::Success));
+    }
+
+    #[tokio::test]
+    async fn concurrent_stop_callers_share_failure() {
+        let (client, mut server_socket) = UnixStream::pair().unwrap();
+        let (shutdown_seen_tx, shutdown_seen_rx) = std::sync::mpsc::channel();
+        let (release_shutdown_tx, release_shutdown_rx) = std::sync::mpsc::channel();
+        let server = thread::spawn(move || {
+            let shutdown = read_request(&mut server_socket);
+            shutdown_seen_tx.send(()).unwrap();
+            release_shutdown_rx.recv().unwrap();
+            write_response(&mut server_socket, "500", Some(r#"["shutdown refused"]"#));
+            shutdown
+        });
+        let hypervisor = stop_test_hypervisor(client).await;
+
+        let first_hypervisor = hypervisor.clone();
+        let first = tokio::spawn(async move { first_hypervisor.stop_vm().await });
+        wait_for_thread_signal(shutdown_seen_rx, "shutdown request was not received").await;
+        let mut second = Box::pin(hypervisor.stop_vm());
+        assert!(
+            poll_once(second.as_mut()).is_pending(),
+            "second stop did not join the active stop operation"
+        );
+        release_shutdown_tx.send(()).unwrap();
+
+        assert!(first.await.unwrap().is_err());
+        assert!(second.await.is_err());
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn canceled_start_worker_finishes_and_releases_its_epoch() {
+        let hypervisor = Arc::new(CloudHypervisor::new());
+        hypervisor.set_test_api_unavailable().await;
+        let inner_guard = hypervisor.inner.write().await;
+
+        let mut start = Box::pin(hypervisor.start_vm(1));
+        assert!(poll_once(start.as_mut()).is_pending());
+        let operation = hypervisor.block_adds.lock().await.start.clone().unwrap();
+        drop(start);
+        drop(inner_guard);
+
+        let VmOperationOutcome::Failure(error) = operation.wait().await else {
+            panic!("expected repeated start failure");
+        };
+        assert!(error.to_string().contains("already running"));
+        assert!(hypervisor.block_adds.lock().await.start.is_none());
+
+        let repeated_error = hypervisor.start_vm(1).await.unwrap_err();
+        assert!(repeated_error.to_string().contains("already running"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn post_spawn_start_panic_reaps_process_and_allows_initial_retry() {
+        use std::path::Path;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let launcher_path = sleeping_launcher(temp_dir.path());
+
+        let hypervisor = Arc::new(CloudHypervisor::new());
+        {
+            let mut inner = hypervisor.inner.write().await;
+            inner.id = format!("post-spawn-panic-{}", std::process::id());
+            inner.config.path = launcher_path.to_string_lossy().into_owned();
+        }
+        hypervisor.set_test_panic_after_spawn(true).await;
+
+        let error = hypervisor.start_vm(1).await.unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("spawned process resources were cleaned"));
+        let pid = hypervisor.inner.read().await.last_spawned_pid.unwrap();
+        assert!(!Path::new(&format!("/proc/{pid}")).exists());
+        assert!(!hypervisor.inner.read().await.has_active_process_resources());
+        assert!(hypervisor
+            .block_adds
+            .lock()
+            .await
+            .cleanup_unresolved
+            .is_none());
+
+        hypervisor.set_test_panic_after_spawn(false).await;
+        let retry_error = hypervisor.start_vm(1).await.unwrap_err();
+        assert!(retry_error.to_string().contains("comms setup failed"));
+        assert!(!hypervisor.inner.read().await.has_active_process_resources());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn unresolved_cleanup_retries_share_only_each_active_attempt() {
+        use std::path::Path;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let launcher_path = sleeping_launcher(temp_dir.path());
+        let hypervisor = Arc::new(CloudHypervisor::new());
+        {
+            let mut inner = hypervisor.inner.write().await;
+            inner.id = format!("uncertain-start-cleanup-{}", std::process::id());
+            inner.config.path = launcher_path.to_string_lossy().into_owned();
+        }
+        hypervisor.set_test_panic_after_spawn(true).await;
+        hypervisor.set_test_cleanup_uncertain(true).await;
+
+        let error = hypervisor.start_vm(1).await.unwrap_err();
+        assert!(error.to_string().contains("cleanup remains unresolved"));
+        let pid = hypervisor.inner.read().await.last_spawned_pid.unwrap();
+        assert!(Path::new(&format!("/proc/{pid}")).exists());
+        assert!(hypervisor
+            .block_adds
+            .lock()
+            .await
+            .cleanup_unresolved
+            .is_some());
+
+        let retry_error = hypervisor.start_vm(1).await.unwrap_err();
+        assert!(retry_error
+            .to_string()
+            .contains("process cleanup remains unresolved"));
+
+        let inner_guard = hypervisor.inner.write().await;
+        let mut first_stop = Box::pin(hypervisor.stop_vm());
+        assert!(poll_once(first_stop.as_mut()).is_pending());
+        let first_operation = hypervisor.block_adds.lock().await.stop.clone().unwrap();
+        let mut first_joiner = Box::pin(hypervisor.stop_vm());
+        assert!(poll_once(first_joiner.as_mut()).is_pending());
+        assert!(Arc::ptr_eq(
+            hypervisor.block_adds.lock().await.stop.as_ref().unwrap(),
+            &first_operation
+        ));
+        drop(inner_guard);
+
+        assert!(first_stop.await.is_err());
+        assert!(first_joiner.await.is_err());
+        assert!(hypervisor.block_adds.lock().await.stop.is_none());
+        assert!(Path::new(&format!("/proc/{pid}")).exists());
+
+        hypervisor.set_test_cleanup_uncertain(false).await;
+        let inner_guard = hypervisor.inner.write().await;
+        let mut second_stop = Box::pin(hypervisor.stop_vm());
+        assert!(poll_once(second_stop.as_mut()).is_pending());
+        let second_operation = hypervisor.block_adds.lock().await.stop.clone().unwrap();
+        assert!(!Arc::ptr_eq(&first_operation, &second_operation));
+        let mut second_joiner = Box::pin(hypervisor.stop_vm());
+        assert!(poll_once(second_joiner.as_mut()).is_pending());
+        assert!(Arc::ptr_eq(
+            hypervisor.block_adds.lock().await.stop.as_ref().unwrap(),
+            &second_operation
+        ));
+        drop(inner_guard);
+
+        second_stop.await.unwrap();
+        second_joiner.await.unwrap();
+        assert!(!Path::new(&format!("/proc/{pid}")).exists());
+        assert!(!hypervisor.inner.read().await.has_active_process_resources());
+        assert!(
+            !hypervisor
+                .inner
+                .read()
+                .await
+                .has_active_epoch_resources()
+                .await
+        );
+
+        hypervisor.stop_vm().await.unwrap();
+        assert!(Arc::ptr_eq(
+            hypervisor.block_adds.lock().await.stop.as_ref().unwrap(),
+            &second_operation
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn concurrent_stop_callers_share_injected_kill_failure_and_retry() {
+        use std::path::Path;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let launcher_path = blocking_launcher(temp_dir.path());
+        let hypervisor = Arc::new(CloudHypervisor::new());
+        {
+            let mut inner = hypervisor.inner.write().await;
+            inner.id = format!("kill-retry-{}", std::process::id());
+            inner.config.path = launcher_path.to_string_lossy().into_owned();
+        }
+        hypervisor.set_test_panic_after_spawn(true).await;
+        hypervisor.set_test_cleanup_uncertain(true).await;
+        let start_error = hypervisor.start_vm(1).await.unwrap_err();
+        assert!(start_error
+            .to_string()
+            .contains("cleanup remains unresolved"));
+        let (pid, original_process) = {
+            let inner = hypervisor.inner.read().await;
+            (inner.pid.unwrap(), inner.process.clone().unwrap())
+        };
+        hypervisor.set_test_cleanup_uncertain(false).await;
+        hypervisor
+            .set_test_process_cleanup_faults([inner::ProcessCleanupFault::StartKill])
+            .await;
+
+        let inner_guard = hypervisor.inner.write().await;
+        let mut first_stop = Box::pin(hypervisor.stop_vm());
+        assert!(poll_once(first_stop.as_mut()).is_pending());
+        let first_operation = hypervisor.block_adds.lock().await.stop.clone().unwrap();
+        let mut first_joiner = Box::pin(hypervisor.stop_vm());
+        assert!(poll_once(first_joiner.as_mut()).is_pending());
+        assert!(Arc::ptr_eq(
+            hypervisor.block_adds.lock().await.stop.as_ref().unwrap(),
+            &first_operation
+        ));
+        drop(inner_guard);
+
+        assert!(
+            format!("{:#}", first_stop.await.unwrap_err()).contains("injected start_kill failure")
+        );
+        assert!(format!("{:#}", first_joiner.await.unwrap_err())
+            .contains("injected start_kill failure"));
+        assert!(hypervisor.block_adds.lock().await.stop.is_none());
+        assert!(Path::new(&format!("/proc/{pid}")).exists());
+        assert!(Arc::ptr_eq(
+            hypervisor.inner.read().await.process.as_ref().unwrap(),
+            &original_process
+        ));
+
+        let inner_guard = hypervisor.inner.write().await;
+        let mut retry = Box::pin(hypervisor.stop_vm());
+        assert!(poll_once(retry.as_mut()).is_pending());
+        let retry_operation = hypervisor.block_adds.lock().await.stop.clone().unwrap();
+        assert!(!Arc::ptr_eq(&first_operation, &retry_operation));
+        let mut retry_joiner = Box::pin(hypervisor.stop_vm());
+        assert!(poll_once(retry_joiner.as_mut()).is_pending());
+        assert!(Arc::ptr_eq(
+            hypervisor.block_adds.lock().await.stop.as_ref().unwrap(),
+            &retry_operation
+        ));
+        drop(inner_guard);
+
+        retry.await.unwrap();
+        retry_joiner.await.unwrap();
+        assert!(!Path::new(&format!("/proc/{pid}")).exists());
+        assert!(!hypervisor.inner.read().await.has_active_process_resources());
+        assert!(
+            !hypervisor
+                .inner
+                .read()
+                .await
+                .has_active_epoch_resources()
+                .await
+        );
+    }
+
+    #[tokio::test]
+    async fn pause_and_resume_do_not_change_block_add_admission() {
+        let (client, mut server_socket) = UnixStream::pair().unwrap();
+        let server = thread::spawn(move || {
+            let pause = read_request(&mut server_socket);
+            write_response(&mut server_socket, "204", None);
+            let resume = read_request(&mut server_socket);
+            write_response(&mut server_socket, "204", None);
+            (pause, resume)
+        });
+        let hypervisor = stop_test_hypervisor(client).await;
+        hypervisor.block_adds.lock().await.admission_open = false;
+
+        hypervisor.pause_vm().await.unwrap();
+        assert!(!hypervisor.block_adds.lock().await.admission_open);
+        hypervisor.resume_vm().await.unwrap();
+        assert!(!hypervisor.block_adds.lock().await.admission_open);
+        let (pause, resume) = server.join().unwrap();
+        assert_eq!(pause.request_line, "PUT /api/v1/vm.pause HTTP/1.1");
+        assert_eq!(resume.request_line, "PUT /api/v1/vm.resume HTTP/1.1");
+    }
+
+    #[tokio::test]
+    async fn stop_winning_before_admission_rejects_new_block_add() {
+        let (client, mut server_socket) = UnixStream::pair().unwrap();
+        let (shutdown_seen_tx, shutdown_seen_rx) = std::sync::mpsc::channel();
+        let (release_shutdown_tx, release_shutdown_rx) = std::sync::mpsc::channel();
+        let server = thread::spawn(move || {
+            let shutdown = read_request(&mut server_socket);
+            shutdown_seen_tx.send(()).unwrap();
+            release_shutdown_rx.recv().unwrap();
+            write_response(&mut server_socket, "204", None);
+            shutdown
+        });
+        let hypervisor = stop_test_hypervisor(client).await;
+
+        let stop_hypervisor = hypervisor.clone();
+        let stop = tokio::spawn(async move { stop_hypervisor.stop_vm().await });
+        tokio::task::spawn_blocking(move || shutdown_seen_rx.recv().unwrap())
+            .await
+            .unwrap();
+
+        let error = hypervisor
+            .add_device(block_device(
+                "late-device",
+                "/var/lib/kata/late-device/disk.img",
+            ))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("VM stop has begun"));
+        assert!(device_state_in_doubt(&error).is_none());
+
+        release_shutdown_tx.send(()).unwrap();
+        stop.await.unwrap().unwrap();
+        server.join().unwrap();
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum AdmittedAddCase {
+        Success,
+        DefiniteFailure,
+        AmbiguousFailure,
+    }
+
+    impl AdmittedAddCase {
+        fn device_id(self) -> &'static str {
+            match self {
+                Self::Success => "admitted-success",
+                Self::DefiniteFailure => "definite-failure",
+                Self::AmbiguousFailure => "ambiguous-add",
+            }
+        }
+    }
+
+    async fn assert_admitted_add_completes_before_stop(case: AdmittedAddCase) {
+        let (client, mut server_socket) = UnixStream::pair().unwrap();
+        let (add_seen_tx, add_seen_rx) = std::sync::mpsc::channel();
+        let (release_add_tx, release_add_rx) = std::sync::mpsc::channel();
+        let server = thread::spawn(move || {
+            let add = read_request(&mut server_socket);
+            add_seen_tx.send(()).unwrap();
+            release_add_rx.recv().unwrap();
+            let rollback = match case {
+                AdmittedAddCase::Success => {
+                    let response =
+                        format!(r#"{{"id":"{}","bdf":"0000:00:05.0"}}"#, case.device_id());
+                    write_response(&mut server_socket, "200", Some(&response));
+                    None
+                }
+                AdmittedAddCase::DefiniteFailure => {
+                    write_response(
+                        &mut server_socket,
+                        "500",
+                        Some(r#"["backing file is busy"]"#),
+                    );
+                    None
+                }
+                AdmittedAddCase::AmbiguousFailure => {
+                    write_response(
+                        &mut server_socket,
+                        "200",
+                        Some(r#"{"id":"unexpected-vmm-id","bdf":"0000:00:07.0"}"#),
+                    );
+                    let rollback = read_request(&mut server_socket);
+                    write_response(
+                        &mut server_socket,
+                        "500",
+                        Some(r#"["device remains busy"]"#),
+                    );
+                    Some(rollback)
+                }
+            };
+            let shutdown = read_request(&mut server_socket);
+            write_response(&mut server_socket, "204", None);
+            (add, rollback, shutdown)
+        });
+        let hypervisor = stop_test_hypervisor(client).await;
+        let device_id = case.device_id();
+
+        let add_hypervisor = hypervisor.clone();
+        let add = tokio::spawn(async move {
+            add_hypervisor
+                .add_device(block_device(
+                    device_id,
+                    &format!("/var/lib/kata/{device_id}/disk.img"),
+                ))
+                .await
+        });
+        wait_for_thread_signal(add_seen_rx, "add request was not received").await;
+
+        let mut stop = Box::pin(hypervisor.stop_vm());
+        assert!(
+            poll_once(stop.as_mut()).is_pending(),
+            "stop completed before the admitted {:?}",
+            case
+        );
+
+        release_add_tx.send(()).unwrap();
+        let add_result = add.await.unwrap();
+        match case {
+            AdmittedAddCase::Success => {
+                add_result.unwrap();
+            }
+            AdmittedAddCase::DefiniteFailure => {
+                let error = add_result.unwrap_err();
+                assert!(device_state_in_doubt(&error).is_none());
+            }
+            AdmittedAddCase::AmbiguousFailure => {
+                let error = add_result.unwrap_err();
+                assert!(device_state_in_doubt(&error).is_some());
+            }
+        };
+        stop.await.unwrap();
+        let (_, rollback, _) = server.join().unwrap();
+        if let Some(rollback) = rollback {
+            assert_eq!(rollback.body["id"], "unexpected-vmm-id");
+            let device_ids = hypervisor.test_device_ids().await;
+            assert!(!device_ids.contains_key(device_id));
+        }
+    }
+
+    #[tokio::test]
+    async fn admitted_add_outcomes_complete_before_stop() {
+        for case in [
+            AdmittedAddCase::Success,
+            AdmittedAddCase::DefiniteFailure,
+            AdmittedAddCase::AmbiguousFailure,
+        ] {
+            assert_admitted_add_completes_before_stop(case).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn admitted_worker_queued_behind_inner_lock_precedes_stop_transition() {
+        let (client, mut server_socket) = UnixStream::pair().unwrap();
+        let server = thread::spawn(move || {
+            let add = read_request(&mut server_socket);
+            write_response(
+                &mut server_socket,
+                "200",
+                Some(r#"{"id":"queued-worker","bdf":"0000:00:06.0"}"#),
+            );
+            let shutdown = read_request(&mut server_socket);
+            write_response(&mut server_socket, "204", None);
+            (add, shutdown)
+        });
+        let hypervisor = stop_test_hypervisor(client).await;
+        let inner_guard = hypervisor.inner.write().await;
+
+        let device = block_device("queued-worker", "/var/lib/kata/queued-worker/disk.img");
+        let mut add = Box::pin(hypervisor.add_device(device));
+        assert!(poll_once(add.as_mut()).is_pending());
+
+        let mut stop = Box::pin(hypervisor.stop_vm());
+        assert!(
+            poll_once(stop.as_mut()).is_pending(),
+            "stop completed while the admitted worker was queued"
+        );
+        drop(inner_guard);
+
+        add.await.unwrap();
+        stop.await.unwrap();
+        let (add_request, _) = server.join().unwrap();
+        assert_eq!(add_request.body["id"], "queued-worker");
+    }
+
+    #[tokio::test]
+    async fn never_dispatched_block_add_releases_manager_ownership_and_index() {
+        let hypervisor = Arc::new(CloudHypervisor::new());
+        let mut config = HypervisorConfig::default();
+        config.blockdev_info.block_device_driver = VIRTIO_BLOCK_PCI.to_string();
+        hypervisor.set_hypervisor_config(config).await;
+        hypervisor.set_test_api_unavailable().await;
+        let device_manager =
+            RwLock::new(DeviceManager::new(hypervisor.clone(), None).await.unwrap());
+
+        let path = "/var/lib/kata/never-dispatched/disk.img";
+        let error = do_handle_device(&device_manager, &block_config(path))
+            .await
+            .unwrap_err();
+
+        assert!(ch_config::ch_api::is_api_command_not_dispatched(&error));
+        assert!(crate::device::device_state_in_doubt(&error).is_none());
+        let (client, mut server_socket) = UnixStream::pair().unwrap();
+        let server = thread::spawn(move || {
+            let add = read_request(&mut server_socket);
+            let id = add.body["id"].as_str().unwrap();
+            let response = format!(r#"{{"id":"{id}","bdf":"0000:00:05.0"}}"#);
+            write_response(&mut server_socket, "200", Some(&response));
+            let _remove = read_request(&mut server_socket);
+            write_response(&mut server_socket, "204", None);
+        });
+        hypervisor.set_test_api_socket(client).await;
+
+        let replacement = do_handle_device(&device_manager, &block_config(path))
+            .await
+            .unwrap();
+        let DeviceType::BlockModern(replacement) = replacement else {
+            panic!("expected BlockModern device");
+        };
+        let replacement = replacement.lock().await;
+        let replacement_id = replacement.device_id.clone();
+        assert_eq!(replacement.config.index, 0);
+        drop(replacement);
+
+        device_manager
+            .write()
+            .await
+            .try_remove_device(&replacement_id)
+            .await
+            .unwrap();
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn canceled_queued_block_add_retry_waits_for_original_completion() {
+        let (client, mut server_socket) = UnixStream::pair().unwrap();
+        let (blocker_seen_tx, blocker_seen_rx) = std::sync::mpsc::channel();
+        let (release_blocker_tx, release_blocker_rx) = std::sync::mpsc::channel();
+        let server = thread::spawn(move || {
+            let blocker = read_request(&mut server_socket);
+            blocker_seen_tx.send(()).unwrap();
+            release_blocker_rx.recv().unwrap();
+            write_response(
+                &mut server_socket,
+                "200",
+                Some(r#"{"id":"blocker","bdf":"0000:00:05.0"}"#),
+            );
+
+            let add = read_request(&mut server_socket);
+            let id = add.body["id"].as_str().unwrap();
+            let response = format!(r#"{{"id":"{id}","bdf":"0000:00:06.0"}}"#);
+            write_response(&mut server_socket, "200", Some(&response));
+
+            let remove = read_request(&mut server_socket);
+            write_response(&mut server_socket, "204", None);
+            (blocker, add, remove)
+        });
+
+        let hypervisor = Arc::new(CloudHypervisor::new());
+        let mut config = HypervisorConfig::default();
+        config.blockdev_info.block_device_driver = VIRTIO_BLOCK_PCI.to_string();
+        hypervisor.set_hypervisor_config(config).await;
+        hypervisor.set_test_api_socket(client).await;
+
+        let blocker_hypervisor = hypervisor.clone();
+        let blocker = tokio::spawn(async move {
+            blocker_hypervisor
+                .add_device(block_device("blocker", "/var/lib/kata/blocker/disk.img"))
+                .await
+        });
+        tokio::task::spawn_blocking(move || blocker_seen_rx.recv().unwrap())
+            .await
+            .unwrap();
+
+        let device_manager = Arc::new(RwLock::new(
+            DeviceManager::new(hypervisor.clone(), None).await.unwrap(),
+        ));
+        let path = "/var/lib/kata/canceled-queued/disk.img";
+        let canceled_config = block_config(path);
+        let mut canceled = Box::pin(do_handle_device(device_manager.as_ref(), &canceled_config));
+        assert!(poll_once(canceled.as_mut()).is_pending());
+        drop(canceled);
+
+        let retry_manager = device_manager.clone();
+        let retry_config = block_config(path);
+        let mut retry = Box::pin(do_handle_device(retry_manager.as_ref(), &retry_config));
+        assert!(
+            poll_once(retry.as_mut()).is_pending(),
+            "same-path retry returned before the original queued attach completed"
+        );
+
+        release_blocker_tx.send(()).unwrap();
+        blocker.await.unwrap().unwrap();
+        let retried = retry.await.unwrap();
+        let DeviceType::BlockModern(retried) = retried else {
+            panic!("expected BlockModern device");
+        };
+        let device_id = retried.lock().await.device_id.clone();
+
+        device_manager
+            .write()
+            .await
+            .try_remove_device(&device_id)
+            .await
+            .unwrap();
+        let (_, add, remove) = server.join().unwrap();
+        assert_eq!(add.body["id"], device_id);
+        assert_eq!(remove.body["id"], device_id);
+    }
+
+    #[tokio::test]
+    async fn canceled_dispatched_block_add_retry_waits_for_original_completion() {
+        let (client, mut server_socket) = UnixStream::pair().unwrap();
+        let (add_seen_tx, add_seen_rx) = std::sync::mpsc::channel();
+        let (close_tx, close_rx) = std::sync::mpsc::channel();
+        let server = thread::spawn(move || {
+            let add = read_request(&mut server_socket);
+            add_seen_tx
+                .send(add.body["id"].as_str().unwrap().to_string())
+                .unwrap();
+            close_rx.recv().unwrap();
+            add
+        });
+
+        let hypervisor = Arc::new(CloudHypervisor::new());
+        let mut config = HypervisorConfig::default();
+        config.blockdev_info.block_device_driver = VIRTIO_BLOCK_PCI.to_string();
+        hypervisor.set_hypervisor_config(config).await;
+        hypervisor.set_test_api_socket(client).await;
+        let device_manager = Arc::new(RwLock::new(
+            DeviceManager::new(hypervisor.clone(), None).await.unwrap(),
+        ));
+
+        let path = "/var/lib/kata/canceled-dispatched/disk.img";
+        let canceled_config = block_config(path);
+        let mut canceled = Box::pin(do_handle_device(device_manager.as_ref(), &canceled_config));
+        assert!(poll_once(canceled.as_mut()).is_pending());
+        let dispatched_id = tokio::task::spawn_blocking(move || add_seen_rx.recv().unwrap())
+            .await
+            .unwrap();
+        drop(canceled);
+
+        let retry_manager = device_manager.clone();
+        let retry_config = block_config(path);
+        let mut retry = Box::pin(do_handle_device(retry_manager.as_ref(), &retry_config));
+        assert!(
+            poll_once(retry.as_mut()).is_pending(),
+            "same-path retry returned before the original dispatched attach completed"
+        );
+
+        close_tx.send(()).unwrap();
+        let error = retry.await.unwrap_err();
+        assert!(crate::device::device_state_in_doubt(&error).is_some());
+        assert!(device_manager.read().await.contains_device(&dispatched_id));
+        server.join().unwrap();
+
+        let (cleanup_client, mut cleanup_socket) = UnixStream::pair().unwrap();
+        let cleanup_server = thread::spawn(move || {
+            let remove_pending = read_request(&mut cleanup_socket);
+            write_response(&mut cleanup_socket, "204", None);
+            remove_pending
+        });
+        hypervisor.set_test_api_socket(cleanup_client).await;
+        device_manager
+            .write()
+            .await
+            .try_remove_device(&dispatched_id)
+            .await
+            .unwrap();
+        assert!(!device_manager.read().await.contains_device(&dispatched_id));
+
+        let remove_pending = cleanup_server.join().unwrap();
+        assert_eq!(remove_pending.body["id"], dispatched_id);
+    }
+
+    #[tokio::test]
+    async fn retry_joins_admitted_add_while_stop_admission_is_closed() {
+        let (client, mut server_socket) = UnixStream::pair().unwrap();
+        let (add_seen_tx, add_seen_rx) = std::sync::mpsc::channel();
+        let (release_add_tx, release_add_rx) = std::sync::mpsc::channel();
+        let server = thread::spawn(move || {
+            let add = read_request(&mut server_socket);
+            add_seen_tx
+                .send(add.body["id"].as_str().unwrap().to_string())
+                .unwrap();
+            release_add_rx.recv().unwrap();
+            let device_id = add.body["id"].as_str().unwrap();
+            let response = format!(r#"{{"id":"{device_id}","bdf":"0000:00:08.0"}}"#);
+            write_response(&mut server_socket, "200", Some(&response));
+
+            let shutdown = read_request(&mut server_socket);
+            write_response(&mut server_socket, "500", Some(r#"["shutdown refused"]"#));
+            let remove = read_request(&mut server_socket);
+            write_response(&mut server_socket, "204", None);
+            (add, shutdown, remove)
+        });
+
+        let hypervisor = stop_test_hypervisor(client).await;
+        let mut config = HypervisorConfig::default();
+        config.blockdev_info.block_device_driver = VIRTIO_BLOCK_PCI.to_string();
+        hypervisor.set_hypervisor_config(config).await;
+        let device_manager = Arc::new(RwLock::new(
+            DeviceManager::new(hypervisor.clone(), None).await.unwrap(),
+        ));
+        let path = "/var/lib/kata/retry-during-stop/disk.img";
+        let canceled_config = block_config(path);
+        let mut canceled = Box::pin(do_handle_device(device_manager.as_ref(), &canceled_config));
+        assert!(poll_once(canceled.as_mut()).is_pending());
+        let device_id = tokio::task::spawn_blocking(move || add_seen_rx.recv().unwrap())
+            .await
+            .unwrap();
+        let operation = hypervisor
+            .block_adds
+            .lock()
+            .await
+            .operations
+            .get(&device_id)
+            .unwrap()
+            .clone();
+        drop(canceled);
+
+        let mut stop = Box::pin(hypervisor.stop_vm());
+        assert!(poll_once(stop.as_mut()).is_pending());
+
+        let mismatch = hypervisor
+            .add_device(block_device(
+                &device_id,
+                "/var/lib/kata/retry-during-stop/different.img",
+            ))
+            .await
+            .unwrap_err();
+        assert!(device_state_in_doubt(&mismatch).is_some());
+        assert!(Arc::ptr_eq(
+            hypervisor
+                .block_adds
+                .lock()
+                .await
+                .operations
+                .get(&device_id)
+                .unwrap(),
+            &operation
+        ));
+
+        let retry_config = block_config(path);
+        let mut retry = Box::pin(do_handle_device(device_manager.as_ref(), &retry_config));
+        assert!(
+            poll_once(retry.as_mut()).is_pending(),
+            "retry returned before its admitted add completed"
+        );
+
+        release_add_tx.send(()).unwrap();
+        let retried = retry.await.unwrap();
+        assert!(stop.await.is_err());
+        let DeviceType::BlockModern(retried) = retried else {
+            panic!("expected BlockModern device");
+        };
+        let BlockAddOutcome::Success(original) = operation.wait().await else {
+            panic!("expected successful original add");
+        };
+        let DeviceType::BlockModern(original) = *original else {
+            panic!("expected original BlockModern device");
+        };
+        assert!(Arc::ptr_eq(&original, &retried));
+
+        let retried_guard = retried.lock().await;
+        assert_eq!(retried_guard.device_id, device_id);
+        assert_eq!(retried_guard.attach_count, 1);
+        assert_eq!(retried_guard.config.index, 0);
+        assert_eq!(retried_guard.config.path_on_host, path);
+        assert_eq!(
+            retried_guard.config.pci_path.as_ref().unwrap().to_string(),
+            "08"
+        );
+        drop(retried_guard);
+
+        device_manager
+            .write()
+            .await
+            .try_remove_device(&device_id)
+            .await
+            .unwrap();
+        let (add, _, remove) = server.join().unwrap();
+        assert_eq!(add.body["id"], device_id);
+        assert_eq!(remove.body["id"], device_id);
+    }
+
+    #[tokio::test]
+    async fn block_lifecycle_integrates_driver_through_eighth_volume() {
+        for count in [1_usize, 4, 8] {
+            let (client, mut server_socket) = UnixStream::pair().unwrap();
+            server_socket
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let server = thread::spawn(move || {
+                let mut add_requests = Vec::new();
+                for ordinal in 0..count {
+                    let request = read_request(&mut server_socket);
+                    let id = request.body["id"].as_str().unwrap();
+                    let response =
+                        format!(r#"{{"id":"{id}","bdf":"0000:00:{:02x}.0"}}"#, ordinal + 5);
+                    write_response(&mut server_socket, "200", Some(&response));
+                    add_requests.push(request);
+                }
+
+                let mut remove_requests = Vec::new();
+                for _ in 0..count {
+                    let request = read_request(&mut server_socket);
+                    write_response(&mut server_socket, "204", None);
+                    remove_requests.push(request);
+                }
+                (add_requests, remove_requests)
+            });
+
+            let hypervisor = Arc::new(CloudHypervisor::new());
+            let mut config = HypervisorConfig::default();
+            config.blockdev_info.block_device_driver = VIRTIO_BLOCK_PCI.to_string();
+            hypervisor.set_hypervisor_config(config).await;
+            hypervisor.set_test_api_socket(client).await;
+            let device_manager =
+                RwLock::new(DeviceManager::new(hypervisor.clone(), None).await.unwrap());
+            let mut device_ids = Vec::new();
+
+            for ordinal in 0..count {
+                let path = format!("/var/lib/kata/emptydir-{ordinal}/disk.img");
+                let device = do_handle_device(
+                    &device_manager,
+                    &DeviceConfig::BlockCfgModern(BlockConfigModern {
+                        path_on_host: path,
+                        driver_option: VIRTIO_BLOCK_PCI.to_string(),
+                        num_queues: 2,
+                        queue_size: 256,
+                        discard_unmap: true,
+                        ..Default::default()
+                    }),
+                )
+                .await
+                .unwrap();
+                let DeviceType::BlockModern(device) = device else {
+                    panic!("expected BlockModern device");
+                };
+                let device_guard = device.lock().await;
+                let device_id = device_guard.device_id.clone();
+                let pci_path = device_guard.config.pci_path.as_ref().unwrap().to_string();
+
+                assert_eq!(device_guard.config.index, ordinal as u64);
+                assert_eq!(pci_path, format!("{:02x}", ordinal + 5));
+                drop(device_guard);
+                device_ids.push(device_id);
+            }
+
+            for device_id in device_ids.iter().rev() {
+                device_manager
+                    .write()
+                    .await
+                    .try_remove_device(device_id)
+                    .await
+                    .unwrap();
+            }
+            let (add_requests, remove_requests): (Vec<ApiRequest>, Vec<ApiRequest>) =
+                server.join().unwrap();
+            assert_eq!(add_requests.len(), count);
+            for (ordinal, request) in add_requests.iter().enumerate() {
+                assert_eq!(request.body["id"], device_ids[ordinal]);
+            }
+            assert_eq!(remove_requests.len(), count);
+            for (ordinal, request) in remove_requests.iter().enumerate() {
+                assert_eq!(
+                    request.body,
+                    serde_json::json!({"id": device_ids[count - ordinal - 1]})
+                );
+            }
+        }
     }
 }

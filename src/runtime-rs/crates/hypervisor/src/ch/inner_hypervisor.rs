@@ -1459,6 +1459,7 @@ fn get_ch_vcpu_tids(proc_path: &str) -> Result<HashMap<u32, u32>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ch::inner_device::{read_request, write_response};
     use kata_sys_util::protection::SevSnpDetails;
 
     #[cfg(target_arch = "x86_64")]
@@ -1469,7 +1470,421 @@ mod tests {
     use test_utils::{assert_result, skip_if_not_root};
 
     use std::fs::{self, File};
+    use std::io::Read;
+    use std::os::fd::OwnedFd;
+    use std::thread;
     use tempfile::Builder;
+
+    async fn assert_descriptor_peer_closed(mut peer: UnixStream) {
+        tokio::task::spawn_blocking(move || {
+            peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            let mut byte = [0_u8; 1];
+            assert_eq!(peer.read(&mut byte).unwrap(), 0);
+        })
+        .await
+        .unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    fn write_test_launcher(directory: &Path, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let launcher_path = directory.join("fake-cloud-hypervisor");
+        fs::write(&launcher_path, body).unwrap();
+        fs::set_permissions(&launcher_path, fs::Permissions::from_mode(0o755)).unwrap();
+        launcher_path
+    }
+
+    #[derive(Debug)]
+    struct FakeProcessHandle {
+        identity: usize,
+        start_kill_results: std::collections::VecDeque<std::io::Result<()>>,
+        try_wait_results: std::collections::VecDeque<std::io::Result<Option<i32>>>,
+        wait_results: std::collections::VecDeque<std::io::Result<i32>>,
+        calls: Arc<std::sync::Mutex<Vec<&'static str>>>,
+    }
+
+    impl ProcessHandle for FakeProcessHandle {
+        fn start_kill(&mut self) -> std::io::Result<()> {
+            self.calls.lock().unwrap().push("start_kill");
+            self.start_kill_results
+                .pop_front()
+                .expect("missing start_kill result")
+        }
+
+        fn try_wait(&mut self) -> std::io::Result<Option<i32>> {
+            self.calls.lock().unwrap().push("try_wait");
+            self.try_wait_results
+                .pop_front()
+                .expect("missing try_wait result")
+        }
+
+        fn wait(&mut self) -> ProcessWait<'_> {
+            self.calls.lock().unwrap().push("wait");
+            let result = self.wait_results.pop_front().expect("missing wait result");
+            Box::pin(async move { result })
+        }
+    }
+
+    fn cleanup_error(message: &'static str) -> std::io::Error {
+        std::io::Error::other(message)
+    }
+
+    #[tokio::test]
+    async fn live_start_kill_failure_preserves_exact_handle_for_retry() {
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut process = Some(FakeProcessHandle {
+            identity: 42,
+            start_kill_results: [Err(cleanup_error("injected start_kill failure"))].into(),
+            try_wait_results: [Ok(None)].into(),
+            wait_results: [].into(),
+            calls: calls.clone(),
+        });
+
+        let error = terminate_owned_process(&mut process, None)
+            .await
+            .unwrap_err();
+
+        assert!(format!("{error:#}").contains("injected start_kill failure"));
+        assert_eq!(process.as_ref().unwrap().identity, 42);
+        assert_eq!(*calls.lock().unwrap(), ["start_kill", "try_wait"]);
+
+        {
+            let process = process.as_mut().unwrap();
+            process.start_kill_results.push_back(Ok(()));
+            process.wait_results.push_back(Ok(9));
+        }
+        let (exit_notify, mut exit_waiter) = mpsc::channel(1);
+
+        terminate_owned_process(&mut process, Some(&exit_notify))
+            .await
+            .unwrap();
+        assert!(process.is_none());
+        assert_eq!(exit_waiter.recv().await, Some(9));
+    }
+
+    #[tokio::test]
+    async fn start_kill_error_after_natural_exit_is_successfully_reaped() {
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut process = Some(FakeProcessHandle {
+            identity: 7,
+            start_kill_results: [Err(cleanup_error("process already exited"))].into(),
+            try_wait_results: [Ok(Some(7))].into(),
+            wait_results: [].into(),
+            calls: calls.clone(),
+        });
+        let (exit_notify, mut exit_waiter) = mpsc::channel(1);
+
+        terminate_owned_process(&mut process, Some(&exit_notify))
+            .await
+            .unwrap();
+
+        assert!(process.is_none());
+        assert_eq!(exit_waiter.recv().await, Some(7));
+        assert_eq!(*calls.lock().unwrap(), ["start_kill", "try_wait"]);
+    }
+
+    #[tokio::test]
+    async fn start_kill_and_try_wait_failures_preserve_exact_handle_for_retry() {
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut process = Some(FakeProcessHandle {
+            identity: 8,
+            start_kill_results: [Err(cleanup_error("injected start_kill failure")), Ok(())].into(),
+            try_wait_results: [Err(cleanup_error("injected try_wait failure"))].into(),
+            wait_results: [Ok(8)].into(),
+            calls: calls.clone(),
+        });
+
+        let error = terminate_owned_process(&mut process, None)
+            .await
+            .unwrap_err();
+
+        assert!(format!("{error:#}").contains("injected start_kill failure"));
+        assert!(format!("{error:#}").contains("injected try_wait failure"));
+        assert_eq!(process.as_ref().unwrap().identity, 8);
+        assert_eq!(*calls.lock().unwrap(), ["start_kill", "try_wait"]);
+
+        let (exit_notify, mut exit_waiter) = mpsc::channel(1);
+        terminate_owned_process(&mut process, Some(&exit_notify))
+            .await
+            .unwrap();
+
+        assert!(process.is_none());
+        assert_eq!(exit_waiter.recv().await, Some(8));
+        assert_eq!(
+            *calls.lock().unwrap(),
+            ["start_kill", "try_wait", "start_kill", "wait"]
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_failure_preserves_exact_handle_for_retry() {
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut process = Some(FakeProcessHandle {
+            identity: 99,
+            start_kill_results: [Ok(()), Ok(())].into(),
+            try_wait_results: [].into(),
+            wait_results: [Err(cleanup_error("injected wait failure")), Ok(0)].into(),
+            calls: calls.clone(),
+        });
+
+        let error = terminate_owned_process(&mut process, None)
+            .await
+            .unwrap_err();
+
+        assert!(format!("{error:#}").contains("injected wait failure"));
+        assert_eq!(process.as_ref().unwrap().identity, 99);
+
+        terminate_owned_process(&mut process, None).await.unwrap();
+        assert!(process.is_none());
+        assert_eq!(
+            *calls.lock().unwrap(),
+            ["start_kill", "wait", "start_kill", "wait"]
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_cold_plug_netdev_add_closes_owned_descriptors() {
+        let (descriptor, peer) = UnixStream::pair().unwrap();
+        let hypervisor = CloudHypervisorInner::default();
+        let network = OwnedNetworkConfig {
+            config: Default::default(),
+            fds: vec![OwnedFd::from(descriptor)],
+        };
+
+        let error = hypervisor
+            .add_network_devices(Some(vec![network]))
+            .await
+            .unwrap_err();
+
+        assert!(is_api_command_not_dispatched(&error));
+        assert_descriptor_peer_closed(peer).await;
+    }
+
+    #[tokio::test]
+    async fn successful_cold_plug_netdev_add_closes_owned_descriptors() {
+        let (client, mut server_socket) = UnixStream::pair().unwrap();
+        let server = thread::spawn(move || {
+            let request = read_request(&mut server_socket);
+            write_response(&mut server_socket, "200", Some("{}"));
+            request
+        });
+        let (descriptor, peer) = UnixStream::pair().unwrap();
+        let hypervisor = CloudHypervisorInner {
+            api_socket: ch_config::ch_api::ApiSocket::new(Some(client)),
+            ..Default::default()
+        };
+        let network = OwnedNetworkConfig {
+            config: Default::default(),
+            fds: vec![OwnedFd::from(descriptor)],
+        };
+
+        hypervisor
+            .add_network_devices(Some(vec![network]))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            server.join().unwrap().request_line,
+            "PUT /api/v1/vm.add-net HTTP/1.1"
+        );
+        assert_descriptor_peer_closed(peer).await;
+    }
+
+    #[tokio::test]
+    async fn panicked_cold_plug_netdev_add_closes_owned_descriptors() {
+        let (descriptor, peer) = UnixStream::pair().unwrap();
+        let hypervisor = CloudHypervisorInner {
+            panic_during_netdev_add: true,
+            ..Default::default()
+        };
+        let network = OwnedNetworkConfig {
+            config: Default::default(),
+            fds: vec![OwnedFd::from(descriptor)],
+        };
+
+        let panic = AssertUnwindSafe(hypervisor.add_network_devices(Some(vec![network])))
+            .catch_unwind()
+            .await;
+
+        assert!(panic.is_err());
+        assert_descriptor_peer_closed(peer).await;
+    }
+
+    #[tokio::test]
+    async fn canceled_cold_plug_netdev_add_closes_all_descriptor_owners() {
+        let (client, mut server_socket) = UnixStream::pair().unwrap();
+        let (request_seen_tx, request_seen_rx) = std::sync::mpsc::channel();
+        let (respond_tx, respond_rx) = std::sync::mpsc::channel();
+        let server = thread::spawn(move || {
+            let request = read_request(&mut server_socket);
+            request_seen_tx.send(()).unwrap();
+            respond_rx.recv().unwrap();
+            write_response(&mut server_socket, "200", Some("{}"));
+            request
+        });
+
+        let (descriptor, peer) = UnixStream::pair().unwrap();
+        let hypervisor = CloudHypervisorInner {
+            api_socket: ch_config::ch_api::ApiSocket::new(Some(client)),
+            ..Default::default()
+        };
+        let network = OwnedNetworkConfig {
+            config: Default::default(),
+            fds: vec![OwnedFd::from(descriptor)],
+        };
+        let add =
+            tokio::spawn(async move { hypervisor.add_network_devices(Some(vec![network])).await });
+        tokio::task::spawn_blocking(move || request_seen_rx.recv().unwrap())
+            .await
+            .unwrap();
+
+        add.abort();
+        assert!(add.await.unwrap_err().is_cancelled());
+        respond_tx.send(()).unwrap();
+        assert_descriptor_peer_closed(peer).await;
+        server.join().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn disconnect_then_stop_terminates_and_reaps_live_child() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let launcher_path = write_test_launcher(temp_dir.path(), "#!/bin/sh\nexec sleep 30\n");
+
+        let (exit_notify, _exit_waiter) = mpsc::channel(1);
+        let mut hypervisor = CloudHypervisorInner::new(Some(exit_notify));
+        hypervisor.id = format!("disconnect-stop-{}", std::process::id());
+        hypervisor.config.path = launcher_path.to_string_lossy().into_owned();
+        hypervisor.cloud_hypervisor_launch(1).await.unwrap();
+        let pid = hypervisor.pid.unwrap();
+
+        hypervisor.disconnect().await;
+        let stop_result = hypervisor.stop_vm().await;
+        let resources_remained = hypervisor.has_active_process_resources();
+        let child_remained = Path::new(&format!("/proc/{pid}")).exists();
+        if resources_remained {
+            hypervisor.terminate_launched_hypervisor().await.unwrap();
+        }
+
+        stop_result.unwrap();
+        assert!(!resources_remained);
+        assert!(!child_remained);
+        assert!(!Path::new(&format!("/proc/{pid}")).exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn logger_join_failure_preserves_child_for_direct_reap() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let launcher_path = write_test_launcher(temp_dir.path(), "#!/bin/sh\nexec sleep 30\n");
+
+        let (exit_notify, _exit_waiter) = mpsc::channel(1);
+        let mut hypervisor = CloudHypervisorInner::new(Some(exit_notify));
+        hypervisor.id = format!("logger-join-failure-{}", std::process::id());
+        hypervisor.config.path = launcher_path.to_string_lossy().into_owned();
+        hypervisor.cloud_hypervisor_launch(1).await.unwrap();
+        let pid = hypervisor.pid.unwrap();
+        let logger_task = hypervisor.logger_task.take().unwrap();
+        logger_task.abort();
+        assert!(logger_task.await.unwrap_err().is_cancelled());
+        hypervisor.logger_task = Some(tokio::spawn(async {
+            panic!("injected logger task panic");
+            #[allow(unreachable_code)]
+            Ok(())
+        }));
+
+        hypervisor.terminate_launched_hypervisor().await.unwrap();
+
+        assert!(!Path::new(&format!("/proc/{pid}")).exists());
+        assert!(!hypervisor.has_active_process_resources());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn natural_process_exit_is_reaped_and_reported() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let launcher_path = write_test_launcher(temp_dir.path(), "#!/bin/sh\nexit 7\n");
+        let (exit_notify, mut exit_waiter) = mpsc::channel(1);
+        let mut hypervisor = CloudHypervisorInner::new(Some(exit_notify));
+        hypervisor.id = format!("natural-exit-{}", std::process::id());
+        hypervisor.config.path = launcher_path.to_string_lossy().into_owned();
+
+        hypervisor.cloud_hypervisor_launch(1).await.unwrap();
+        let pid = hypervisor.pid.unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), exit_waiter.recv())
+                .await
+                .unwrap(),
+            Some(7)
+        );
+        hypervisor.terminate_launched_hypervisor().await.unwrap();
+
+        assert!(!Path::new(&format!("/proc/{pid}")).exists());
+        assert!(!hypervisor.has_active_process_resources());
+    }
+
+    #[tokio::test]
+    async fn not_ready_stop_cleans_stale_epoch_resources() {
+        let (client, peer) = UnixStream::pair().unwrap();
+        let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+        let mut hypervisor = CloudHypervisorInner {
+            api_socket: ch_config::ch_api::ApiSocket::new(Some(client)),
+            shutdown_tx: Some(shutdown_tx),
+            logger_task: Some(tokio::spawn(async move {
+                let _ = shutdown_rx.changed().await;
+                Ok(())
+            })),
+            ..Default::default()
+        };
+        hypervisor
+            .device_ids
+            .insert("runtime-id".to_string(), "vmm-id".to_string());
+
+        hypervisor.stop_vm().await.unwrap();
+
+        assert!(!hypervisor.has_active_epoch_resources().await);
+        assert!(hypervisor.device_ids.is_empty());
+        assert_descriptor_peer_closed(peer).await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn post_spawn_setup_failure_terminates_and_reaps_child() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let pid_path = temp_dir.path().join("child.pid");
+        let launcher_path = temp_dir.path().join("fake-cloud-hypervisor");
+        fs::write(
+            &launcher_path,
+            format!(
+                "#!/bin/sh\necho $$ > '{}'\nexec sleep 30\n",
+                pid_path.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&launcher_path, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let (exit_notify, _exit_waiter) = mpsc::channel(1);
+        let mut hypervisor = CloudHypervisorInner::new(Some(exit_notify));
+        hypervisor.id = format!("post-spawn-failure-{}", std::process::id());
+        hypervisor.config.path = launcher_path.to_string_lossy().into_owned();
+
+        let error = hypervisor.start_vm(1).await.unwrap_err();
+
+        assert!(error.to_string().contains("comms setup failed"));
+        let pid = fs::read_to_string(&pid_path)
+            .unwrap()
+            .trim()
+            .parse::<u32>()
+            .unwrap();
+        assert!(!Path::new(&format!("/proc/{pid}")).exists());
+        assert!(hypervisor.logger_task.is_none());
+        assert!(hypervisor.process.is_none());
+        assert!(hypervisor.pid.is_none());
+        assert_eq!(hypervisor.state, VmmState::NotReady);
+    }
 
     fn set_fake_guest_protection(protection: Option<GuestProtection>) {
         let existing_ref = FAKE_GUEST_PROTECTION.clone();
