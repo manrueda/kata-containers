@@ -726,6 +726,39 @@ impl PCIeTopology {
         Ok(Some(bus_port_id))
     }
 
+    /// Reserves an existing, unallocated PCIe root port for a hot-plugged
+    /// device. Unlike [`Self::reserve_bus_for_device`], this method never
+    /// creates a root port because QEMU can only use ports that were present
+    /// when the VM started.
+    pub fn reserve_existing_root_port_for_device(&mut self, device_id: &str) -> Result<String> {
+        if let Some((bus, _, _)) = self.reserved_bus.get(device_id) {
+            return Ok(bus.clone());
+        }
+
+        let mut ids: Vec<u32> = self.pcie_port_devices.keys().copied().collect();
+        ids.sort_unstable();
+        let id = ids
+            .into_iter()
+            .find(|id| {
+                self.pcie_port_devices
+                    .get(id)
+                    .is_some_and(|port| !port.allocated && port.connected_switch.is_none())
+            })
+            .ok_or_else(|| anyhow!("no free preconfigured PCIe root port"))?;
+
+        let port = self
+            .pcie_port_devices
+            .get_mut(&id)
+            .ok_or_else(|| anyhow!("PCIe root port {id} disappeared during allocation"))?;
+        port.allocated = true;
+        let bus = port.port_id();
+
+        self.reserved_bus
+            .insert(device_id.to_string(), (bus.clone(), id + 9, id + 2));
+
+        Ok(bus)
+    }
+
     pub fn release_bus_for_device(&mut self, device_id: &str) -> Result<()> {
         let bus = match self.reserved_bus.get(device_id) {
             Some(bus) => bus.clone(),

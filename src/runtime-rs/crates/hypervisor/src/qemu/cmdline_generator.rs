@@ -6,6 +6,7 @@
 use crate::device::topology::{TopologyPortDevice, DEFAULT_PCIE_ROOT_BUS};
 use crate::qemu::block_source::{block_fd_opaque, prepare_block_source};
 use crate::qemu::qmp::get_qmp_socket_path;
+use crate::qemu::supports_pcie_root_ports;
 use crate::utils::{
     chown_to_parent, clear_cloexec, create_vhost_net_fds, open_named_tuntap, uses_native_ccw_bus,
     SocketAddress,
@@ -16,7 +17,9 @@ use std::borrow::Cow;
 
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
-use kata_types::config::hypervisor::{VIRTIO_BLK_PCI, VIRTIO_SCSI};
+#[cfg(test)]
+use kata_types::config::hypervisor::VIRTIO_BLK_PCI;
+use kata_types::config::hypervisor::VIRTIO_SCSI;
 use kata_types::rootless::is_rootless;
 use serde::{Deserialize, Serialize};
 use serde_json;
@@ -2961,6 +2964,14 @@ fn should_disable_modern() -> bool {
     }
 }
 
+fn sorted_root_ports(
+    root_ports: HashMap<u32, TopologyPortDevice>,
+) -> Vec<(u32, TopologyPortDevice)> {
+    let mut root_ports: Vec<_> = root_ports.into_iter().collect();
+    root_ports.sort_unstable_by_key(|(index, _)| *index);
+    root_ports
+}
+
 pub struct QemuCmdLine<'a> {
     id: String,
     config: &'a HypervisorConfig,
@@ -3050,10 +3061,9 @@ impl<'a> QemuCmdLine<'a> {
             qemu_cmd_line.add_scsi_controller();
         }
 
-        // Add independent IO threads only when hotplug uses virtio-blk-pci.
-        if config.blockdev_info.block_device_driver == VIRTIO_BLK_PCI {
-            qemu_cmd_line.add_indep_iothreads();
-        }
+        // EmptyDir can select virtio-blk-pci per device even when the runtime
+        // default is virtio-scsi.
+        qemu_cmd_line.add_indep_iothreads();
 
         if config.device_info.reclaim_guest_freed_memory {
             qemu_cmd_line.add_virtio_balloon();
@@ -3809,7 +3819,7 @@ impl<'a> QemuCmdLine<'a> {
 
         self.devices.reserve(root_ports.len());
 
-        for (index, rp) in root_ports {
+        for (index, rp) in sorted_root_ports(root_ports) {
             // VFIO cold-plug (see `add_pcie_vfio_device`) runs before this when resource order
             // is CDI VFIO then port pool; it already emits `pcie-root-port,id=rpN` for reserved
             // slots (`TopologyPortDevice::allocated`). Skip placeholders for those IDs or QEMU
@@ -3857,7 +3867,7 @@ impl<'a> QemuCmdLine<'a> {
         }
 
         let machine_type = &self.config.machine_info.machine_type;
-        if !matches!(machine_type.as_str(), "q35" | "virt") {
+        if !supports_pcie_root_ports(machine_type) {
             info!(
                 sl!(),
                 "PCIe switch ports not supported for machine type: {}", machine_type

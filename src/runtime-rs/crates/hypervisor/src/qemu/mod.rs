@@ -25,6 +25,10 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tokio::sync::{mpsc, Mutex};
 
+pub fn supports_pcie_root_ports(machine_type: &str) -> bool {
+    matches!(machine_type, "q35" | "virt")
+}
+
 #[derive(Debug)]
 pub struct Qemu {
     inner: Arc<RwLock<QemuInner>>,

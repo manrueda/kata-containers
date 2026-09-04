@@ -23,7 +23,7 @@ use crate::utils::{
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use kata_sys_util::netns::NetnsGuard;
-use kata_types::config::hypervisor::{RootlessUser, VIRTIO_BLK_CCW, VIRTIO_BLK_PCI};
+use kata_types::config::hypervisor::{RootlessUser, VIRTIO_BLK_CCW, VIRTIO_BLK_PCI, VIRTIO_SCSI};
 use kata_types::prefix_with_rootless_dir;
 use kata_types::rootless::is_rootless;
 use kata_types::{
@@ -1045,6 +1045,18 @@ impl QemuInner {
     }
 }
 
+fn qemu_block_driver(driver_option: &str, configured_driver: &str) -> Result<String> {
+    match driver_option {
+        KATA_BLK_DEV_TYPE => Ok(VIRTIO_BLK_PCI.to_string()),
+        KATA_CCW_DEV_TYPE => Ok(VIRTIO_BLK_CCW.to_string()),
+        KATA_SCSI_DEV_TYPE => Ok(VIRTIO_SCSI.to_string()),
+        "" => Ok(configured_driver.to_string()),
+        unsupported => Err(anyhow!(
+            "unsupported QEMU block device driver option {unsupported}"
+        )),
+    }
+}
+
 const BPF_JIT_ENABLE_PATH: &str = "/proc/sys/net/core/bpf_jit_enable";
 
 fn check_bpf_enabled(seccomp_sandbox: Option<&str>) {
@@ -1240,13 +1252,14 @@ impl QemuInner {
 
         match device {
             DeviceType::BlockModern(ref block_device) => {
-                let (index, driver) = {
+                let (index, driver_option) = {
                     let cfg = &block_device.lock().await.config;
-                    (
-                        cfg.index,
-                        self.config.blockdev_info.block_device_driver.clone(),
-                    )
+                    (cfg.index, cfg.driver_option.clone())
                 };
+                let driver = qemu_block_driver(
+                    &driver_option,
+                    &self.config.blockdev_info.block_device_driver,
+                )?;
                 qmp.hotunplug_block_device(&driver, index)
                     .context("hotunplug block device")?;
             }
@@ -1332,7 +1345,8 @@ impl QemuInner {
                     no_drop,
                     vmdk,
                     discard_unmap,
-                    driver,
+                    driver_option,
+                    pcie_root_port,
                     logical_sector_size,
                     physical_sector_size,
                 ) = {
@@ -1349,11 +1363,16 @@ impl QemuInner {
                         cfg.no_drop,
                         cfg.vmdk.clone(),
                         cfg.discard_unmap,
-                        self.config.blockdev_info.block_device_driver.clone(),
+                        cfg.driver_option.clone(),
+                        cfg.pcie_root_port.clone(),
                         cfg.logical_sector_size,
                         cfg.physical_sector_size,
                     )
                 };
+                let driver = qemu_block_driver(
+                    &driver_option,
+                    &self.config.blockdev_info.block_device_driver,
+                )?;
 
                 // Determine iothread for hotplugged virtio-blk-pci devices.
                 // Only attach iothread when:
@@ -1386,6 +1405,7 @@ impl QemuInner {
                         physical_sector_size,
                         vmdk.as_ref(),
                         iothread,
+                        pcie_root_port.as_deref(),
                     )
                     .context("hotplug block device")?;
 

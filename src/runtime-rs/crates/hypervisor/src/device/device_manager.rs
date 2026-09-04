@@ -18,13 +18,14 @@ use kata_types::config::hypervisor::{
 use tokio::sync::{Mutex, RwLock};
 
 use crate::{
+    qemu::supports_pcie_root_ports,
     vfio_device::{VfioDeviceModernHandle, VfioDeviceType},
     vhost_user_blk::VhostUserBlkDevice,
     BlockConfigModern, BlockDeviceModernHandle, HybridVsockDevice, Hypervisor, NetworkDevice,
     PCIePortDevice, ProtectionDevice, ShareFsDevice, VfioDevice, VhostUserConfig,
-    VhostUserNetDevice, VsockDevice, KATA_BLK_DEV_TYPE, KATA_CCW_DEV_TYPE, KATA_MMIO_BLK_DEV_TYPE,
-    KATA_NVDIMM_DEV_TYPE, KATA_SCSI_DEV_TYPE, VIRTIO_BLOCK_CCW, VIRTIO_BLOCK_MMIO,
-    VIRTIO_BLOCK_PCI, VIRTIO_PMEM,
+    VhostUserNetDevice, VsockDevice, HYPERVISOR_QEMU, KATA_BLK_DEV_TYPE, KATA_CCW_DEV_TYPE,
+    KATA_MMIO_BLK_DEV_TYPE, KATA_NVDIMM_DEV_TYPE, KATA_SCSI_DEV_TYPE, VIRTIO_BLOCK_CCW,
+    VIRTIO_BLOCK_MMIO, VIRTIO_BLOCK_PCI, VIRTIO_PMEM,
 };
 
 use super::{
@@ -122,11 +123,29 @@ impl DeviceManager {
         topo_config: Option<&TopologyConfigInfo>,
     ) -> Result<Self> {
         let devices = HashMap::<String, ArcMutexDevice>::new();
+        let pcie_topology = match topo_config {
+            Some(config) if config.hypervisor_name == HYPERVISOR_QEMU => {
+                let machine_type = hypervisor
+                    .hypervisor_config()
+                    .await
+                    .machine_info
+                    .machine_type;
+                if supports_pcie_root_ports(&machine_type) {
+                    PCIeTopology::new(Some(config))
+                } else {
+                    let mut config = config.clone();
+                    config.device_info.pcie_root_port = 0;
+                    config.device_info.pcie_switch_port = 0;
+                    PCIeTopology::new(Some(&config))
+                }
+            }
+            _ => PCIeTopology::new(topo_config),
+        };
         Ok(DeviceManager {
             devices,
             hypervisor,
             shared_info: SharedInfo::new().await,
-            pcie_topology: PCIeTopology::new(topo_config),
+            pcie_topology,
         })
     }
 
@@ -140,6 +159,14 @@ impl DeviceManager {
 
     async fn get_shared_fs_info(&self) -> SharedFsInfo {
         self.hypervisor.hypervisor_config().await.shared_fs
+    }
+
+    async fn get_machine_type(&self) -> String {
+        self.hypervisor
+            .hypervisor_config()
+            .await
+            .machine_info
+            .machine_type
     }
 
     async fn try_add_device(&mut self, device_id: &str) -> Result<()> {
@@ -721,6 +748,10 @@ pub async fn get_block_device_info(d: &RwLock<DeviceManager>) -> BlockDeviceInfo
 
 pub async fn get_shared_fs_info(d: &RwLock<DeviceManager>) -> SharedFsInfo {
     d.read().await.get_shared_fs_info().await
+}
+
+pub async fn get_machine_type(d: &RwLock<DeviceManager>) -> String {
+    d.read().await.get_machine_type().await
 }
 
 pub async fn find_device_id(d: &RwLock<DeviceManager>, host_path: &str) -> Option<String> {

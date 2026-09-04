@@ -17,10 +17,15 @@ use base64::{engine::general_purpose::URL_SAFE, Engine as _};
 use hypervisor::device::device_manager::do_handle_device;
 use hypervisor::{
     device::{
-        device_manager::{find_device_id, get_block_device_info, DeviceManager, DeviceRemoval},
-        device_state_in_doubt, DeviceConfig, DeviceType,
+        device_manager::{
+            find_device_id, get_block_device_info, get_machine_type, DeviceManager, DeviceRemoval,
+        },
+        device_state_in_doubt,
+        topology::PCIeTopology,
+        DeviceConfig, DeviceType,
     },
-    BlockConfigModern, BlockDeviceAio,
+    qemu::supports_pcie_root_ports,
+    BlockConfigModern, BlockDeviceAio, HYPERVISOR_QEMU,
 };
 use kata_sys_util::k8s::is_disk_empty_dir;
 use kata_types::config::hypervisor::{VIRTIO_BLK_PCI, VIRTIO_SCSI};
@@ -206,11 +211,15 @@ impl BlockEmptyDirVolume {
         }
 
         let blkdev_info = get_block_device_info(d).await;
-        let block_driver =
-            block_emptydir_block_driver(discard_unmap, &blkdev_info.block_device_driver);
+        let machine_type = get_machine_type(d).await;
+        let topology = d.read().await.get_pcie_topology();
+        let block_driver = block_emptydir_driver(discard_unmap, &blkdev_info.block_device_driver);
+        let use_pcie_root_port =
+            use_qemu_pcie_root_port(block_driver, &machine_type, topology.as_ref());
         let block_config = BlockConfigModern {
             path_on_host: disk_path.display().to_string(),
-            driver_option: block_driver,
+            use_pcie_root_port,
+            driver_option: block_driver.to_string(),
             blkdev_aio: BlockDeviceAio::new(&blkdev_info.block_device_aio),
             num_queues: blkdev_info.num_queues,
             queue_size: blkdev_info.queue_size,
@@ -825,12 +834,24 @@ pub(crate) fn is_block_emptydir_mode(emptydir_mode: &str) -> bool {
 /// host sparse `disk.img` after file deletion or overwrite. QEMU's default
 /// virtio-scsi frontend does not expose discard, so virtio-blk is selected when
 /// discard is required.
-fn block_emptydir_block_driver(discard_unmap: bool, default_driver: &str) -> String {
+fn block_emptydir_driver(discard_unmap: bool, default_driver: &str) -> &str {
     if discard_unmap && default_driver == VIRTIO_SCSI {
-        VIRTIO_BLK_PCI.to_string()
+        VIRTIO_BLK_PCI
     } else {
-        default_driver.to_string()
+        default_driver
     }
+}
+
+fn use_qemu_pcie_root_port(
+    block_driver: &str,
+    machine_type: &str,
+    topology: Option<&PCIeTopology>,
+) -> bool {
+    block_driver == VIRTIO_BLK_PCI
+        && supports_pcie_root_ports(machine_type)
+        && topology.is_some_and(|topology| {
+            topology.hypervisor_name == HYPERVISOR_QEMU && topology.pcie_root_ports > 0
+        })
 }
 
 fn get_filesystem_capacity(path: &Path) -> Result<u64> {
@@ -859,16 +880,16 @@ mod tests {
     #[test]
     fn block_emptydir_uses_virtio_blk_when_discard_requires_it() {
         assert_eq!(
-            block_emptydir_block_driver(true, VIRTIO_SCSI),
+            block_emptydir_driver(true, VIRTIO_SCSI),
             VIRTIO_BLK_PCI
         );
-        assert_eq!(block_emptydir_block_driver(false, VIRTIO_SCSI), VIRTIO_SCSI);
+        assert_eq!(block_emptydir_driver(false, VIRTIO_SCSI), VIRTIO_SCSI);
         assert_eq!(
-            block_emptydir_block_driver(true, VIRTIO_BLK_PCI),
+            block_emptydir_driver(true, VIRTIO_BLK_PCI),
             VIRTIO_BLK_PCI
         );
         assert_eq!(
-            block_emptydir_block_driver(true, VIRTIO_BLK_CCW),
+            block_emptydir_driver(true, VIRTIO_BLK_CCW),
             VIRTIO_BLK_CCW
         );
     }

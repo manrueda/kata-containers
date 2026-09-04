@@ -380,11 +380,10 @@ disable_nesting_checks = false
 # nvdimm is not supported when `confidential_guest = true`.
 disable_image_nvdimm = true
 
-# Before hot plugging a PCIe device, you need to add a pcie_root_port device.
-# Use this parameter when using some large PCI bar devices, such as Nvidia GPU
-# The value means the number of pcie_root_port
-# Default 0
-pcie_root_port = 0
+# Preconfigure PCIe root ports for hot-plugged devices.
+# QEMU uses these ports for as many as eight block-backed emptyDir volumes.
+# Default 8
+pcie_root_port = 8
 
 # If vhost-net backend for virtio-net is not desired, set to true. Default is false, which trades off
 # security (vhost-net runs ring0) for network I/O performance.

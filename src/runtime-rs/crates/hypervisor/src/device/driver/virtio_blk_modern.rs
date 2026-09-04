@@ -14,7 +14,8 @@ use crate::device::Device;
 use crate::device::DeviceType;
 use crate::device::{device_state_in_doubt, DeviceStateInDoubt};
 use crate::Hypervisor as hypervisor;
-use anyhow::{Context, Result};
+use crate::HYPERVISOR_QEMU;
+use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 
 /// VIRTIO_BLOCK_PCI indicates block driver is virtio-pci based
@@ -152,6 +153,12 @@ pub struct BlockConfigModern {
     /// pci path is the slot at which the drive is attached
     pub pci_path: Option<PciPath>,
 
+    /// Preconfigured PCIe root-port bus used for QEMU hot-plug.
+    pub pcie_root_port: Option<String>,
+
+    /// Requires QEMU to hot-plug this device through a PCIe root port.
+    pub use_pcie_root_port: bool,
+
     /// scsi_addr of the block device, in case the device is attached using SCSI driver
     /// scsi_addr is of the format SCSI-Id:LUN
     pub scsi_addr: Option<String>,
@@ -229,11 +236,24 @@ impl BlockDeviceModernHandle {
     }
 }
 
+fn uses_qemu_pcie_root_port(
+    config: &BlockConfigModern,
+    topology: Option<&PCIeTopology>,
+) -> Result<bool> {
+    if !config.use_pcie_root_port {
+        return Ok(false);
+    }
+
+    let topology = topology
+        .ok_or_else(|| anyhow!("required PCIe topology is unavailable for block device"))?;
+    Ok(topology.hypervisor_name == HYPERVISOR_QEMU)
+}
+
 #[async_trait]
 impl Device for BlockDeviceModernHandle {
     async fn attach(
         &mut self,
-        _pcie_topo: &mut Option<&mut PCIeTopology>,
+        pcie_topo: &mut Option<&mut PCIeTopology>,
         h: &dyn hypervisor,
     ) -> Result<()> {
         if !self.attach_pending {
@@ -254,6 +274,33 @@ impl Device for BlockDeviceModernHandle {
         // treating the reference count as proof of attachment.
         if h.block_device_add_is_independently_owned() {
             self.attach_pending = true;
+        }
+
+        let use_pcie_root_port = match {
+            let inner = self.inner.lock().await;
+            uses_qemu_pcie_root_port(&inner.config, pcie_topo.as_deref())
+        } {
+            Ok(use_root_port) => use_root_port,
+            Err(error) => {
+                self.decrease_attach_count().await?;
+                return Err(error);
+            }
+        };
+        if use_pcie_root_port {
+            let device_id = self.device_id().await;
+            let bus = pcie_topo
+                .as_deref_mut()
+                .ok_or_else(|| {
+                    anyhow!("block device {device_id} requires a preconfigured PCIe root port")
+                })?
+                .reserve_existing_root_port_for_device(&device_id);
+            match bus {
+                Ok(bus) => self.inner.lock().await.config.pcie_root_port = Some(bus),
+                Err(error) => {
+                    self.decrease_attach_count().await?;
+                    return Err(error);
+                }
+            }
         }
 
         match h.add_device(DeviceType::BlockModern(self.arc())).await {
@@ -284,6 +331,14 @@ impl Device for BlockDeviceModernHandle {
                 self.attach_pending = false;
                 error!(sl!(), "failed to attach block device: {:?}", error);
                 self.decrease_attach_count().await?;
+                if use_pcie_root_port {
+                    let device_id = self.device_id().await;
+                    if let Some(topology) = pcie_topo.as_deref_mut() {
+                        topology.release_bus_for_device(&device_id)?;
+                    }
+                    self.inner.lock().await.config.pcie_root_port = None;
+                }
+
                 Err(error)
             }
         }
@@ -291,7 +346,7 @@ impl Device for BlockDeviceModernHandle {
 
     async fn detach(
         &mut self,
-        _pcie_topo: &mut Option<&mut PCIeTopology>,
+        pcie_topo: &mut Option<&mut PCIeTopology>,
         h: &dyn hypervisor,
     ) -> Result<Option<u64>> {
         // get the count of device detached, skip detach once it reaches the 0
@@ -305,6 +360,14 @@ impl Device for BlockDeviceModernHandle {
         if let Err(e) = h.remove_device(DeviceType::BlockModern(self.arc())).await {
             self.increase_attach_count().await?;
             return Err(e);
+        }
+        if self.inner.lock().await.config.pcie_root_port.is_some() {
+            let device_id = self.device_id().await;
+            let topology = pcie_topo.as_deref_mut().ok_or_else(|| {
+                anyhow!("missing PCIe topology while detaching block device {device_id}")
+            })?;
+            topology.release_bus_for_device(&device_id)?;
+            self.inner.lock().await.config.pcie_root_port = None;
         }
         Ok(Some(self.snapshot_config().await.index))
     }

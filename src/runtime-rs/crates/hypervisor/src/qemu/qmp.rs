@@ -1245,6 +1245,7 @@ impl Qmp {
         physical_block_size: u32,
         vmdk: Option<&VmdkConfig>,
         iothread: Option<&str>,
+        pcie_root_port: Option<&str>,
     ) -> Result<(Option<PciPath>, Option<String>)> {
         // `blockdev-add`
         let node_name = block_node_name(index);
@@ -1487,21 +1488,22 @@ impl Qmp {
 
             Ok((None, Some(ccw_addr)))
         } else {
-            let (bus, slot) = match self.find_free_slot() {
-                Ok(value) => value,
-                Err(err) => {
-                    if self
-                        .qmp
-                        .execute(&qapi_qmp::blockdev_del {
-                            node_name: node_name.clone(),
-                        })
-                        .is_ok()
-                    {
-                        self.remove_block_fdsets(&node_name);
+            let (bus, slot, track_bridge_slot) =
+                match select_block_pci_target(pcie_root_port, || self.find_free_slot()) {
+                    Ok(value) => value,
+                    Err(err) => {
+                        if self
+                            .qmp
+                            .execute(&qapi_qmp::blockdev_del {
+                                node_name: node_name.clone(),
+                            })
+                            .is_ok()
+                        {
+                            self.remove_block_fdsets(&node_name);
+                        }
+                        return Err(err);
                     }
-                    return Err(err);
-                }
-            };
+                };
             blkdev_add_args.insert("addr".to_owned(), format!("{slot:02}").into());
             if !is_readonly {
                 blkdev_add_args.insert("share-rw".to_string(), true.into());
@@ -1535,7 +1537,9 @@ impl Qmp {
             let pci_path = self
                 .get_device_by_qdev_id(&node_name)
                 .context("get device by qdev_id failed")?;
-            self.record_pci_bridge_slot(&bus, slot, &node_name);
+            if track_bridge_slot {
+                self.record_pci_bridge_slot(&bus, slot, &node_name);
+            }
             info!(
                 sl!(),
                 "hotplug block device return pci path: {:?}", &pci_path
@@ -1763,6 +1767,27 @@ fn is_flat_cpu_topology(driver: &str) -> bool {
 
 const PCI_BRIDGE_MAX_CAPACITY: i64 = 30;
 const PCI_BRIDGE_FIRST_HOTPLUG_SLOT: i64 = 1;
+
+fn select_block_pci_target<FindBridge>(
+    pcie_root_port: Option<&str>,
+    find_bridge: FindBridge,
+) -> Result<(String, i64, bool)>
+where
+    FindBridge: FnOnce() -> Result<(String, i64)>,
+{
+    if let Some(root_port) = pcie_root_port {
+        let valid_root_port = root_port
+            .strip_prefix("rp")
+            .is_some_and(|index| !index.is_empty() && index.parse::<u32>().is_ok());
+        if !valid_root_port {
+            return Err(anyhow!("invalid PCIe root-port bus {root_port}"));
+        }
+        return Ok((root_port.to_string(), 0, false));
+    }
+
+    let (bus, slot) = find_bridge()?;
+    Ok((bus, slot, true))
+}
 
 fn free_slot_on_pci_bridge(pci_dev: &PciDeviceInfo) -> Option<i64> {
     if !pci_dev.qdev_id.starts_with("pci-bridge-") {

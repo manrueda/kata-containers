@@ -380,12 +380,11 @@ disable_image_nvdimm = @DEFDISABLEIMAGENVDIMM_NV@
 # qemu-nvidia-cpu carries no GPU passthrough, so cold-plug stays disabled.
 cold_plug_vfio = "no-port"
 
-# Before hot plugging a PCIe device, you need to add a pcie_root_port device.
-# Use this parameter when using some large PCI bar devices, such as Nvidia GPU
-# The value means the number of pcie_root_port
-# This value is valid when machine_type is "q35"
-# Default 0
-pcie_root_port = 0
+# Preconfigure PCIe root ports for hot-plugged devices.
+# QEMU uses these ports for as many as eight block-backed emptyDir volumes on
+# the q35 and virt machine types.
+# Default 8
+pcie_root_port = 8
 
 # Before hot plugging a PCIe device onto a switch port, you need add a pcie_switch_port device fist.
 # Use this parameter when using some large PCI bar devices, such as Nvidia GPU
