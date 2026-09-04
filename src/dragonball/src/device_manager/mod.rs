@@ -1825,6 +1825,41 @@ mod tests {
         let _ = mgr.io_manager();
     }
 
+    #[test]
+    fn test_transport_rollback_attempts_every_resource_cleanup() {
+        let mut resources = DeviceResources::new();
+        resources.append(Resource::MmioAddressRange {
+            base: 0x1000,
+            size: 0x1000,
+        });
+        resources.append(Resource::MmioAddressRange {
+            base: 0x2000,
+            size: 0x1000,
+        });
+        let mut attempts = Vec::new();
+
+        let failure = cleanup_device_resources_with(&resources, |resource| {
+            attempts.push(resource.clone());
+            if attempts.len() == 1 {
+                Err(
+                    crate::resource_manager::ResourceError::InvalidResourceRange(
+                        "MMIO address".to_string(),
+                    ),
+                )
+            } else {
+                Ok(())
+            }
+        })
+        .unwrap_err();
+
+        assert_eq!(attempts.len(), 2);
+        assert_eq!(failure.remaining.get_all_resources().len(), 1);
+        assert_eq!(
+            failure.remaining.get_all_resources()[0],
+            resources.get_all_resources()[0]
+        );
+    }
+
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn test_create_devices() {

@@ -1230,6 +1230,9 @@ impl Default for BlockDeviceMgr {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
+    use dbs_device::resources::Resource;
     use test_utils::skip_if_kvm_unaccessable;
     use vmm_sys_util::tempfile::TempFile;
 
@@ -1254,6 +1257,228 @@ mod tests {
         assert!(!mgr.is_read_only_root());
         assert_eq!(mgr.get_index_of_drive_id(""), None);
         assert_eq!(mgr.info_list.len(), 0);
+    }
+
+    #[test]
+    fn test_block_hotplug_result_propagates_guest_status() {
+        assert_eq!(
+            block_hotplug_status_result(0, Some(7), "volume-7"),
+            Ok(Some(7))
+        );
+        assert!(matches!(
+            block_hotplug_status_result(-16, None, "volume-3").unwrap_err(),
+            BlockHotplugError::Rejected(message)
+                if message == "guest rejected block device volume-3 operation with result -16"
+        ));
+        assert!(matches!(
+            block_hotplug_result(UpcallClientResponse::UpcallReset, None, "volume-4").unwrap_err(),
+            BlockHotplugError::OutcomeUnknown(message)
+                if message == "guest upcall reset for block device volume-4"
+        ));
+    }
+
+    #[test]
+    fn test_block_hotplug_guest_identity_matches_transport() {
+        assert_eq!(block_hotplug_guest_device_id(Some(true), 7), Some(7));
+        assert_eq!(block_hotplug_guest_device_id(Some(false), 0), None);
+    }
+
+    #[test]
+    fn test_block_manager_tracks_and_detaches_eight_unique_devices() {
+        skip_if_kvm_unaccessable!();
+        let files: Vec<_> = (0..8).map(|_| TempFile::new().unwrap()).collect();
+        let mut vm = crate::vm::tests::create_vm_instance();
+        let mut ids = HashSet::new();
+
+        for (index, file) in files.iter().enumerate() {
+            let id = format!("volume-{index}");
+            assert!(ids.insert(id.clone()));
+            let ctx = DeviceOpContext::create_boot_ctx(&vm, None);
+            let (sender, _receiver) = channel();
+            vm.device_manager_mut()
+                .block_manager
+                .insert_device(
+                    ctx,
+                    BlockDeviceConfigInfo {
+                        drive_id: id,
+                        path_on_host: file.as_path().to_owned(),
+                        is_direct: false,
+                        ..Default::default()
+                    },
+                    sender,
+                )
+                .unwrap();
+            if matches!(index + 1, 1 | 4 | 8) {
+                assert_eq!(vm.device_manager().block_manager.info_list.len(), index + 1);
+            }
+        }
+
+        assert_eq!(vm.device_manager().block_manager.info_list.len(), 8);
+        for index in (0..8).rev() {
+            let ctx = DeviceOpContext::create_boot_ctx(&vm, None);
+            vm.device_manager_mut()
+                .block_manager
+                .remove_device(ctx, &format!("volume-{index}"))
+                .unwrap();
+            if matches!(index, 0 | 4 | 7) {
+                assert_eq!(vm.device_manager().block_manager.info_list.len(), index);
+            }
+        }
+        assert!(vm.device_manager().block_manager.info_list.is_empty());
+    }
+
+    #[test]
+    fn test_backend_open_failure_removes_inserted_configuration_for_retry() {
+        skip_if_kvm_unaccessable!();
+        let mut vm = create_vm_for_test();
+        let backing_file = TempFile::new().unwrap();
+        let path = backing_file.as_path().to_owned();
+        std::fs::remove_file(&path).unwrap();
+        let config = BlockDeviceConfigInfo {
+            drive_id: "backend-retry".to_string(),
+            path_on_host: path.clone(),
+            use_pci_bus: Some(false),
+            ..Default::default()
+        };
+        let ctx = DeviceOpContext::new(
+            Some(vm.epoll_manager().clone()),
+            vm.device_manager(),
+            Some(vm.vm_as().unwrap().clone()),
+            Some(create_address_space()),
+            true,
+            Some(vm.vm_config().clone()),
+            vm.shared_info().clone(),
+        );
+        let (sender, _receiver) = channel();
+        assert!(vm
+            .device_manager_mut()
+            .block_manager
+            .insert_device(ctx, config.clone(), sender)
+            .is_err());
+        assert!(vm.device_manager().block_manager.info_list.is_empty());
+
+        std::fs::File::create(&path).unwrap().set_len(4096).unwrap();
+        let retry_ctx = DeviceOpContext::create_boot_ctx(&vm, None);
+        let (sender, _receiver) = channel();
+        vm.device_manager_mut()
+            .block_manager
+            .insert_device(retry_ctx, config, sender)
+            .unwrap();
+        assert_eq!(vm.device_manager().block_manager.info_list.len(), 1);
+        assert_eq!(
+            vm.device_manager().block_manager.info_list[0]
+                .config
+                .path_on_host,
+            path
+        );
+    }
+
+    #[test]
+    fn test_transport_creation_failure_removes_inserted_configuration_for_retry() {
+        skip_if_kvm_unaccessable!();
+        let file = TempFile::new().unwrap();
+        file.as_file().set_len(4096).unwrap();
+        let mut vm = create_vm_for_test();
+        let config = BlockDeviceConfigInfo {
+            drive_id: "transport-retry".to_string(),
+            path_on_host: file.as_path().to_owned(),
+            use_pci_bus: Some(false),
+            ..Default::default()
+        };
+        let ctx = DeviceOpContext::new(
+            Some(vm.epoll_manager().clone()),
+            vm.device_manager(),
+            Some(vm.vm_as().unwrap().clone()),
+            None,
+            true,
+            Some(vm.vm_config().clone()),
+            vm.shared_info().clone(),
+        );
+        let (sender, _receiver) = channel();
+        assert!(vm
+            .device_manager_mut()
+            .block_manager
+            .insert_device(ctx, config.clone(), sender)
+            .is_err());
+        assert!(vm.device_manager().block_manager.info_list.is_empty());
+
+        let retry_ctx = DeviceOpContext::create_boot_ctx(&vm, None);
+        let (sender, _receiver) = channel();
+        vm.device_manager_mut()
+            .block_manager
+            .insert_device(retry_ctx, config, sender)
+            .unwrap();
+        assert_eq!(vm.device_manager().block_manager.info_list.len(), 1);
+    }
+
+    #[test]
+    fn test_failed_transport_rollback_retains_configuration_until_retry() {
+        let file = TempFile::new().unwrap();
+        let mut manager = BlockDeviceMgr::default();
+        let config = BlockDeviceConfigInfo {
+            drive_id: "rollback-retry".to_string(),
+            path_on_host: file.as_path().to_owned(),
+            ..Default::default()
+        };
+        let index = manager.create(config.clone()).unwrap();
+
+        let error = manager
+            .finish_failed_hotplug_insert(
+                index,
+                BlockDeviceError::InvalidBlockDeviceType,
+                Err(DeviceMgrError::InvalidOperation),
+            )
+            .unwrap_err();
+        assert!(matches!(error, BlockDeviceError::RollbackIncomplete { .. }));
+        assert_eq!(
+            manager.get_config_of_drive_id(&config.drive_id),
+            Some(config)
+        );
+
+        assert!(manager
+            .finish_failed_hotplug_insert(index, BlockDeviceError::InvalidBlockDeviceType, Ok(()))
+            .is_err());
+        assert!(manager.info_list.is_empty());
+    }
+
+    #[test]
+    fn test_transport_construction_rollback_retains_pending_resources() {
+        let file = TempFile::new().unwrap();
+        let mut manager = BlockDeviceMgr::default();
+        let config = BlockDeviceConfigInfo {
+            drive_id: "transport-construction-rollback".to_string(),
+            path_on_host: file.as_path().to_owned(),
+            ..Default::default()
+        };
+        let index = manager.create(config.clone()).unwrap();
+        let mut remaining = DeviceResources::new();
+        remaining.append(Resource::MmioAddressRange {
+            base: 0x1000,
+            size: 0x1000,
+        });
+
+        let error = manager
+            .finish_failed_hotplug_insert(
+                index,
+                BlockDeviceError::DeviceManager(DeviceMgrError::TransportRollbackIncomplete {
+                    operation: Box::new(DeviceMgrError::InvalidOperation),
+                    cleanup: crate::resource_manager::ResourceError::InvalidResourceRange(
+                        "MMIO address".to_string(),
+                    ),
+                    remaining,
+                }),
+                Ok(()),
+            )
+            .unwrap_err();
+
+        assert!(matches!(error, BlockDeviceError::RollbackIncomplete { .. }));
+        assert_eq!(
+            manager.get_config_of_drive_id(&config.drive_id),
+            Some(config)
+        );
+        assert!(manager
+            .pending_transport_cleanup
+            .contains_key("transport-construction-rollback"));
     }
 
     #[test]

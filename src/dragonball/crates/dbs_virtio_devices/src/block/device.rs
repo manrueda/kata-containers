@@ -547,12 +547,15 @@ mod tests {
         let mut file = DummyFile::new();
         file.device_id = Some(device_id.to_string());
         let disk_image: Box<dyn Ufile> = Box::new(file);
-        let disk_id = build_device_id(disk_image.as_ref());
+        let disk_id = build_device_id(disk_image.as_ref(), None);
         assert_eq!(disk_id.len() as u32, VIRTIO_BLK_ID_BYTES);
         let disk_image: Box<dyn Ufile> = Box::new(DummyFile::new());
-        let disk_id2 = build_device_id(disk_image.as_ref());
+        let disk_id2 = build_device_id(disk_image.as_ref(), None);
         assert_eq!(disk_id2.len() as u32, VIRTIO_BLK_ID_BYTES);
         assert_ne!(disk_id, disk_id2);
+
+        let configured_id = build_device_id(disk_image.as_ref(), Some("volume-7"));
+        assert_eq!(&configured_id[..8], b"volume-7");
     }
 
     #[test]
@@ -792,7 +795,7 @@ mod tests {
         let mut file = DummyFile::new();
         file.capacity = 4096;
         let mut disk: Box<dyn Ufile> = Box::new(file);
-        let disk_id = build_device_id(disk.as_ref());
+        let disk_id = build_device_id(disk.as_ref(), None);
 
         {
             // RequestType::In
@@ -968,7 +971,7 @@ mod tests {
         vq.avail.idx().store(1);
 
         let mut disk: Box<dyn Ufile> = Box::new(DummyFile::new());
-        let disk_id = build_device_id(disk.as_ref());
+        let disk_id = build_device_id(disk.as_ref(), None);
         let mut q = vq.create_queue();
         vq.dtable(0).set(0x1000, 0x1000, VIRTQ_DESC_F_NEXT, 1);
         vq.dtable(1)
@@ -1214,6 +1217,7 @@ mod tests {
             .is_ok());
     }
 
+    #[allow(clippy::repeat_vec_with_capacity)]
     fn get_block_epoll_handler_with_file(
         file: DummyFile,
     ) -> InnerBlockEpollHandler<Arc<GuestMemoryMmap>, QueueSync> {
@@ -1221,7 +1225,7 @@ mod tests {
         let queue = VirtioQueueConfig::create(256, 0).unwrap();
         let rate_limiter = RateLimiter::default();
         let disk_image: Box<dyn Ufile> = Box::new(file);
-        let disk_image_id = build_device_id(disk_image.as_ref());
+        let disk_image_id = build_device_id(disk_image.as_ref(), None);
 
         let data_desc_vec = vec![Vec::with_capacity(CONFIG_MAX_SEG as usize); 256];
         let iovecs_vec = vec![Vec::with_capacity(CONFIG_MAX_SEG as usize); 256];

@@ -907,4 +907,298 @@ mod tests {
             "cleanup must release the retained namespace"
         );
     }
+
+    const RESPONDER_TIMEOUT: Duration = Duration::from_secs(2);
+
+    fn send_block_hotplug_response(
+        response_sender: &Sender<VmmResponse>,
+        result: BlockHotplugResult,
+    ) {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        response_sender
+            .send(Box::new(Ok(VmmData::SyncBlockHotplug((
+                sender.clone(),
+                receiver,
+            )))))
+            .unwrap();
+        sender.send(result).unwrap();
+    }
+
+    #[test]
+    fn late_block_add_response_reuses_original_request() {
+        let (instance, request_receiver, response_sender) =
+            VmmInstance::test_channels("late-add-test");
+        let (continue_sender, continue_receiver) = std::sync::mpsc::channel();
+        let (delivered_sender, delivered_receiver) = std::sync::mpsc::channel();
+        let responder = thread::spawn(move || {
+            let request = *request_receiver.recv_timeout(RESPONDER_TIMEOUT).unwrap();
+            assert!(matches!(
+                request,
+                VmmAction::InsertBlockDevice(ref config) if config.drive_id == "volume-0"
+            ));
+            let (sender, receiver) = std::sync::mpsc::channel();
+            response_sender
+                .send(Box::new(Ok(VmmData::SyncBlockHotplug((
+                    sender.clone(),
+                    receiver,
+                )))))
+                .unwrap();
+            continue_receiver.recv_timeout(RESPONDER_TIMEOUT).unwrap();
+            sender.send(Ok(Some(3))).unwrap();
+            delivered_sender.send(()).unwrap();
+        });
+
+        let config = BlockDeviceConfigInfo {
+            drive_id: "volume-0".to_string(),
+            ..Default::default()
+        };
+        let error = instance
+            .insert_block_device(config.clone(), Duration::from_millis(1))
+            .unwrap_err();
+        assert!(error.downcast_ref::<DeviceStateInDoubt>().is_some());
+        continue_sender.send(()).unwrap();
+        delivered_receiver.recv_timeout(RESPONDER_TIMEOUT).unwrap();
+        assert_eq!(
+            instance
+                .insert_block_device(config, Duration::from_millis(10))
+                .unwrap(),
+            Some(3)
+        );
+        responder.join().unwrap();
+    }
+
+    #[test]
+    fn late_block_remove_response_finishes_original_request() {
+        let (instance, request_receiver, response_sender) =
+            VmmInstance::test_channels("late-remove-test");
+        let (continue_sender, continue_receiver) = std::sync::mpsc::channel();
+        let (delivered_sender, delivered_receiver) = std::sync::mpsc::channel();
+        let responder = thread::spawn(move || {
+            let request = *request_receiver.recv_timeout(RESPONDER_TIMEOUT).unwrap();
+            assert!(matches!(
+                request,
+                VmmAction::PrepareRemoveBlockDevice(ref id) if id == "volume-1"
+            ));
+            let (sender, receiver) = std::sync::mpsc::channel();
+            response_sender
+                .send(Box::new(Ok(VmmData::SyncBlockHotplug((
+                    sender.clone(),
+                    receiver,
+                )))))
+                .unwrap();
+            continue_receiver.recv_timeout(RESPONDER_TIMEOUT).unwrap();
+            sender.send(Ok(None)).unwrap();
+            delivered_sender.send(()).unwrap();
+
+            let cleanup = *request_receiver.recv_timeout(RESPONDER_TIMEOUT).unwrap();
+            assert!(matches!(
+                cleanup,
+                VmmAction::RemoveBlockDevice(ref id) if id == "volume-1"
+            ));
+            response_sender.send(Box::new(Ok(VmmData::Empty))).unwrap();
+        });
+
+        let error = instance
+            .remove_block_device("volume-1", Duration::from_millis(1))
+            .unwrap_err();
+        assert!(error.downcast_ref::<DeviceStateInDoubt>().is_some());
+        continue_sender.send(()).unwrap();
+        delivered_receiver.recv_timeout(RESPONDER_TIMEOUT).unwrap();
+        instance
+            .remove_block_device("volume-1", Duration::from_millis(10))
+            .unwrap();
+        responder.join().unwrap();
+    }
+
+    #[test]
+    fn reset_block_add_remains_unresolved_until_vm_stop() {
+        let (mut instance, request_receiver, response_sender) =
+            VmmInstance::test_channels("reset-add-test");
+        let responder = thread::spawn(move || {
+            let request = *request_receiver.recv_timeout(RESPONDER_TIMEOUT).unwrap();
+            assert!(matches!(
+                request,
+                VmmAction::InsertBlockDevice(ref config) if config.drive_id == "volume-reset-add"
+            ));
+            send_block_hotplug_response(
+                &response_sender,
+                Err(BlockHotplugError::OutcomeUnknown(
+                    "guest upcall reset".to_string(),
+                )),
+            );
+        });
+
+        let config = BlockDeviceConfigInfo {
+            drive_id: "volume-reset-add".to_string(),
+            ..Default::default()
+        };
+        let error = instance
+            .insert_block_device(config.clone(), Duration::from_millis(10))
+            .unwrap_err();
+        assert!(error.downcast_ref::<DeviceStateInDoubt>().is_some());
+        assert!(matches!(
+            instance
+                .pending_block_operations
+                .lock()
+                .unwrap()
+                .get("volume-reset-add"),
+            Some(PendingBlockOperation::AddUnknown)
+        ));
+
+        let retry = instance
+            .insert_block_device(config, Duration::from_millis(10))
+            .unwrap_err();
+        assert!(retry.downcast_ref::<DeviceStateInDoubt>().is_some());
+        instance.stop().unwrap();
+        assert!(instance.pending_block_operations.lock().unwrap().is_empty());
+        responder.join().unwrap();
+    }
+
+    #[test]
+    fn reset_block_remove_remains_unresolved_until_vm_stop() {
+        let (mut instance, request_receiver, response_sender) =
+            VmmInstance::test_channels("reset-remove-test");
+        let responder = thread::spawn(move || {
+            let request = *request_receiver.recv_timeout(RESPONDER_TIMEOUT).unwrap();
+            assert!(matches!(
+                request,
+                VmmAction::PrepareRemoveBlockDevice(ref id) if id == "volume-reset-remove"
+            ));
+            send_block_hotplug_response(
+                &response_sender,
+                Err(BlockHotplugError::OutcomeUnknown(
+                    "guest upcall reset".to_string(),
+                )),
+            );
+        });
+
+        let error = instance
+            .remove_block_device("volume-reset-remove", Duration::from_millis(10))
+            .unwrap_err();
+        assert!(error.downcast_ref::<DeviceStateInDoubt>().is_some());
+        assert!(matches!(
+            instance
+                .pending_block_operations
+                .lock()
+                .unwrap()
+                .get("volume-reset-remove"),
+            Some(PendingBlockOperation::RemoveUnknown)
+        ));
+
+        let retry = instance
+            .remove_block_device("volume-reset-remove", Duration::from_millis(10))
+            .unwrap_err();
+        assert!(retry.downcast_ref::<DeviceStateInDoubt>().is_some());
+        instance.stop().unwrap();
+        assert!(instance.pending_block_operations.lock().unwrap().is_empty());
+        responder.join().unwrap();
+    }
+
+    #[test]
+    fn failed_vmm_rollback_remains_retryable() {
+        let (instance, request_receiver, response_sender) =
+            VmmInstance::test_channels("rollback-test");
+        let responder = thread::spawn(move || {
+            let request = *request_receiver.recv_timeout(RESPONDER_TIMEOUT).unwrap();
+            assert!(matches!(request, VmmAction::InsertBlockDevice(_)));
+            send_block_hotplug_response(
+                &response_sender,
+                Err(BlockHotplugError::Rejected(
+                    "injected guest add failure".to_string(),
+                )),
+            );
+
+            let failed_cleanup = *request_receiver.recv_timeout(RESPONDER_TIMEOUT).unwrap();
+            assert!(matches!(
+                failed_cleanup,
+                VmmAction::RemoveBlockDevice(ref id) if id == "volume-2"
+            ));
+            response_sender
+                .send(Box::new(Err(VmmActionError::InvalidVMID)))
+                .unwrap();
+
+            let retry_cleanup = *request_receiver.recv_timeout(RESPONDER_TIMEOUT).unwrap();
+            assert!(matches!(
+                retry_cleanup,
+                VmmAction::RemoveBlockDevice(ref id) if id == "volume-2"
+            ));
+            response_sender.send(Box::new(Ok(VmmData::Empty))).unwrap();
+        });
+
+        let error = instance
+            .insert_block_device(
+                BlockDeviceConfigInfo {
+                    drive_id: "volume-2".to_string(),
+                    ..Default::default()
+                },
+                Duration::from_millis(10),
+            )
+            .unwrap_err();
+        assert!(error.downcast_ref::<DeviceStateInDoubt>().is_some());
+        instance
+            .remove_block_device("volume-2", Duration::from_millis(10))
+            .unwrap();
+        responder.join().unwrap();
+    }
+
+    #[test]
+    fn transport_rollback_failure_maps_to_unresolved_state() {
+        let (instance, request_receiver, response_sender) =
+            VmmInstance::test_channels("transport-rollback-test");
+        let responder = thread::spawn(move || {
+            let request = *request_receiver.recv_timeout(RESPONDER_TIMEOUT).unwrap();
+            assert!(matches!(
+                request,
+                VmmAction::InsertBlockDevice(ref config) if config.drive_id == "volume-6"
+            ));
+            response_sender
+                .send(Box::new(Err(VmmActionError::Block(
+                    BlockDeviceError::RollbackIncomplete {
+                        operation: Box::new(BlockDeviceError::InvalidBlockDeviceType),
+                        cleanup: dragonball::device_manager::DeviceMgrError::InvalidOperation,
+                    },
+                ))))
+                .unwrap();
+
+            let cleanup = *request_receiver.recv_timeout(RESPONDER_TIMEOUT).unwrap();
+            assert!(matches!(
+                cleanup,
+                VmmAction::RemoveBlockDevice(ref id) if id == "volume-6"
+            ));
+            response_sender.send(Box::new(Ok(VmmData::Empty))).unwrap();
+        });
+
+        let error = instance
+            .insert_block_device(
+                BlockDeviceConfigInfo {
+                    drive_id: "volume-6".to_string(),
+                    ..Default::default()
+                },
+                Duration::from_millis(10),
+            )
+            .unwrap_err();
+        assert!(error.downcast_ref::<DeviceStateInDoubt>().is_some());
+        instance
+            .remove_block_device("volume-6", Duration::from_millis(10))
+            .unwrap();
+        responder.join().unwrap();
+    }
+
+    #[test]
+    fn disconnected_operation_is_finalized_after_vm_stop() {
+        let (exit_notify, _exit_waiter) = mpsc::channel(1);
+        let mut instance = VmmInstance::new("disconnected-operation-test", exit_notify);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        drop(sender);
+        instance.store_pending_block_operation("volume-7", PendingBlockOperation::Add(receiver));
+
+        let error = instance
+            .remove_block_device("volume-7", Duration::from_millis(10))
+            .unwrap_err();
+        assert!(error.downcast_ref::<DeviceStateInDoubt>().is_some());
+        assert_eq!(instance.pending_block_operations.lock().unwrap().len(), 1);
+
+        instance.stop().unwrap();
+        assert!(instance.pending_block_operations.lock().unwrap().is_empty());
+    }
 }

@@ -325,10 +325,281 @@ pub(crate) fn build_dragonball_network_config(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::{convert::TryFrom, path::PathBuf, sync::Arc, thread, time::Duration};
+
+    use crossbeam_channel::Sender;
+    use dragonball::api::v1::{BlockHotplugResult, VmmAction, VmmData, VmmResponse};
+    use kata_types::config::hypervisor::Hypervisor as HypervisorConfig;
+    use tokio::sync::RwLock;
+
+    use super::{vmm_instance::VmmInstance, Dragonball};
+    use crate::device::pci_path::PciPath;
+    #[cfg(target_arch = "aarch64")]
+    use crate::VIRTIO_BLOCK_MMIO;
+    #[cfg(target_arch = "x86_64")]
+    use crate::VIRTIO_BLOCK_PCI;
+    use crate::{
+        device::{
+            device_manager::{do_handle_device, DeviceManager, DeviceRemoval},
+            DeviceConfig, DeviceType,
+        },
+        BlockConfigModern, Hypervisor, VmmState,
+    };
+
+    const RESPONDER_TIMEOUT: Duration = Duration::from_secs(2);
+    #[cfg(target_arch = "x86_64")]
+    const CALLBACK_SLOTS: [Option<i32>; 8] = [
+        Some(6),
+        Some(2),
+        Some(8),
+        Some(4),
+        Some(1),
+        Some(7),
+        Some(3),
+        Some(5),
+    ];
+    #[cfg(target_arch = "aarch64")]
+    const CALLBACK_SLOTS: [Option<i32>; 8] = [None; 8];
+    #[cfg(target_arch = "x86_64")]
+    const REPLACEMENT_CALLBACK_SLOT: Option<i32> = Some(6);
+    #[cfg(target_arch = "aarch64")]
+    const REPLACEMENT_CALLBACK_SLOT: Option<i32> = None;
 
     #[test]
     fn test_dragonball_disables_agent_metrics() {
         assert!(!Dragonball::new().is_agent_metrics_supported());
+    }
+
+    fn send_block_hotplug_response(
+        response_sender: &Sender<VmmResponse>,
+        result: BlockHotplugResult,
+    ) {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        response_sender
+            .send(Box::new(Ok(VmmData::SyncBlockHotplug((
+                sender.clone(),
+                receiver,
+            )))))
+            .unwrap();
+        sender.send(result).unwrap();
+    }
+
+    #[tokio::test]
+    async fn block_lifecycle_uses_dragonball_driver_at_one_four_and_eight_devices() {
+        #[cfg(target_arch = "aarch64")]
+        let (driver, use_pci_bus) = (VIRTIO_BLOCK_MMIO, false);
+        #[cfg(target_arch = "x86_64")]
+        let (driver, use_pci_bus) = (VIRTIO_BLOCK_PCI, true);
+
+        let hypervisor = Arc::new(Dragonball::new());
+        let mut config = HypervisorConfig::default();
+        config.blockdev_info.block_device_driver = driver.to_string();
+        hypervisor.set_hypervisor_config(config).await;
+
+        let (instance, request_receiver, response_sender) =
+            VmmInstance::test_channels("block-lifecycle-test");
+        {
+            let mut inner = hypervisor.inner.write().await;
+            inner.state = VmmState::VmRunning;
+            inner.vmm_instance = instance;
+        }
+
+        let responder = thread::spawn(move || {
+            let mut insertions = Vec::new();
+            for (index, callback_slot) in CALLBACK_SLOTS.iter().copied().enumerate() {
+                let request = *request_receiver.recv_timeout(RESPONDER_TIMEOUT).unwrap();
+                let VmmAction::InsertBlockDevice(config) = request else {
+                    panic!("expected block insertion request, got {:?}", request);
+                };
+                assert_eq!(
+                    config.path_on_host,
+                    PathBuf::from(format!("/tmp/dragonball-block-{index}.img"))
+                );
+                assert_eq!(config.use_pci_bus, Some(use_pci_bus));
+                assert!(config.sparse);
+                insertions.push(config.drive_id);
+
+                send_block_hotplug_response(&response_sender, Ok(callback_slot));
+            }
+
+            let mut removals = Vec::new();
+            for _ in 0..8 {
+                let prepare = *request_receiver.recv_timeout(RESPONDER_TIMEOUT).unwrap();
+                let VmmAction::PrepareRemoveBlockDevice(prepare_id) = prepare else {
+                    panic!("expected block removal preparation, got {:?}", prepare);
+                };
+                send_block_hotplug_response(&response_sender, Ok(None));
+
+                let remove = *request_receiver.recv_timeout(RESPONDER_TIMEOUT).unwrap();
+                let VmmAction::RemoveBlockDevice(id) = remove else {
+                    panic!("expected block removal request, got {:?}", remove);
+                };
+                assert_eq!(id, prepare_id);
+                removals.push(id);
+                response_sender.send(Box::new(Ok(VmmData::Empty))).unwrap();
+            }
+
+            let replacement = *request_receiver.recv_timeout(RESPONDER_TIMEOUT).unwrap();
+            let VmmAction::InsertBlockDevice(config) = replacement else {
+                panic!(
+                    "expected replacement block insertion request, got {:?}",
+                    replacement
+                );
+            };
+            assert_eq!(
+                config.path_on_host,
+                PathBuf::from("/tmp/dragonball-block-replacement.img")
+            );
+            assert_eq!(config.use_pci_bus, Some(use_pci_bus));
+            assert!(config.sparse);
+            let replacement_insertion = config.drive_id;
+            send_block_hotplug_response(&response_sender, Ok(REPLACEMENT_CALLBACK_SLOT));
+
+            let prepare = *request_receiver.recv_timeout(RESPONDER_TIMEOUT).unwrap();
+            let VmmAction::PrepareRemoveBlockDevice(replacement_prepare) = prepare else {
+                panic!(
+                    "expected replacement block removal preparation, got {:?}",
+                    prepare
+                );
+            };
+            send_block_hotplug_response(&response_sender, Ok(None));
+
+            let remove = *request_receiver.recv_timeout(RESPONDER_TIMEOUT).unwrap();
+            let VmmAction::RemoveBlockDevice(replacement_removal) = remove else {
+                panic!(
+                    "expected replacement block removal request, got {:?}",
+                    remove
+                );
+            };
+            assert_eq!(replacement_removal, replacement_prepare);
+            response_sender.send(Box::new(Ok(VmmData::Empty))).unwrap();
+            drop(response_sender);
+
+            (
+                insertions,
+                removals,
+                replacement_insertion,
+                replacement_removal,
+            )
+        });
+
+        let manager = RwLock::new(DeviceManager::new(hypervisor.clone(), None).await.unwrap());
+        let mut device_ids = Vec::new();
+        let mut block_devices = Vec::new();
+        for index in 0..8 {
+            let device = do_handle_device(
+                &manager,
+                &DeviceConfig::BlockCfgModern(BlockConfigModern {
+                    path_on_host: format!("/tmp/dragonball-block-{index}.img"),
+                    driver_option: driver.to_string(),
+                    discard_unmap: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+            let DeviceType::BlockModern(block) = device else {
+                panic!("expected BlockModern device");
+            };
+            device_ids.push(block.lock().await.device_id.clone());
+            block_devices.push(block);
+
+            if matches!(index + 1, 1 | 4 | 8) {
+                let manager = manager.read().await;
+                assert_eq!(block_devices.len(), index + 1);
+                for (device_index, block) in block_devices.iter().enumerate() {
+                    let block = block.lock().await;
+                    assert_eq!(block.config.index, device_index as u64);
+                    assert_eq!(
+                        block.config.virt_path,
+                        format!("/dev/vd{}", char::from(b'a' + device_index as u8))
+                    );
+                    let expected_pci_path = CALLBACK_SLOTS[device_index]
+                        .map(|slot| PciPath::try_from(slot as u32).unwrap());
+                    assert_eq!(block.config.pci_path.as_ref(), expected_pci_path.as_ref());
+                    assert!(manager.contains_device(&block.device_id));
+                }
+            }
+        }
+
+        for id in device_ids.iter().rev() {
+            assert_eq!(
+                manager
+                    .write()
+                    .await
+                    .try_remove_device_with_outcome(id)
+                    .await
+                    .unwrap(),
+                DeviceRemoval::Detached
+            );
+            assert!(!manager.read().await.contains_device(id));
+        }
+        {
+            let manager = manager.read().await;
+            assert!(device_ids.iter().all(|id| !manager.contains_device(id)));
+        }
+        assert!(hypervisor
+            .inner
+            .read()
+            .await
+            .cached_block_devices
+            .is_empty());
+
+        let replacement = do_handle_device(
+            &manager,
+            &DeviceConfig::BlockCfgModern(BlockConfigModern {
+                path_on_host: "/tmp/dragonball-block-replacement.img".to_string(),
+                driver_option: driver.to_string(),
+                discard_unmap: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let DeviceType::BlockModern(replacement) = replacement else {
+            panic!("expected replacement BlockModern device");
+        };
+        let replacement_id = {
+            let block = replacement.lock().await;
+            assert_eq!(block.config.index, 0);
+            assert_eq!(block.config.virt_path, "/dev/vda");
+            let expected_pci_path =
+                REPLACEMENT_CALLBACK_SLOT.map(|slot| PciPath::try_from(slot as u32).unwrap());
+            assert_eq!(block.config.pci_path.as_ref(), expected_pci_path.as_ref());
+            assert!(manager.read().await.contains_device(&block.device_id));
+            block.device_id.clone()
+        };
+        assert_eq!(
+            manager
+                .write()
+                .await
+                .try_remove_device_with_outcome(&replacement_id)
+                .await
+                .unwrap(),
+            DeviceRemoval::Detached
+        );
+        {
+            let manager = manager.read().await;
+            assert!(device_ids
+                .iter()
+                .chain(std::iter::once(&replacement_id))
+                .all(|id| !manager.contains_device(id)));
+        }
+        assert!(hypervisor
+            .inner
+            .read()
+            .await
+            .cached_block_devices
+            .is_empty());
+
+        let (insertions, removals, replacement_insertion, replacement_removal) =
+            responder.join().unwrap();
+        assert_eq!(insertions, device_ids);
+        assert_eq!(
+            removals,
+            device_ids.iter().rev().cloned().collect::<Vec<_>>()
+        );
+        assert_eq!(replacement_insertion, replacement_id);
+        assert_eq!(replacement_removal, replacement_id);
     }
 }

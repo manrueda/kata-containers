@@ -599,10 +599,63 @@ impl DragonballInner {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use dragonball::api::v1::FsDeviceConfigInfo;
     use tokio::sync::mpsc;
 
-    use crate::dragonball::DragonballInner;
+    use super::{use_pci_bus, BLOCK_HOTPLUG_TIMEOUT};
+    use crate::{
+        dragonball::DragonballInner, KATA_BLK_DEV_TYPE, KATA_MMIO_BLK_DEV_TYPE, KATA_SCSI_DEV_TYPE,
+    };
+
+    #[test]
+    fn test_block_transport_mapping_and_timeout() {
+        assert!(use_pci_bus(KATA_BLK_DEV_TYPE).unwrap());
+        assert!(!use_pci_bus(KATA_MMIO_BLK_DEV_TYPE).unwrap());
+        assert!(use_pci_bus(KATA_SCSI_DEV_TYPE).is_err());
+        assert_eq!(BLOCK_HOTPLUG_TIMEOUT, Duration::from_secs(10));
+    }
+
+    #[test]
+    fn test_pending_block_host_cleanup_skips_completed_vmm_removal() {
+        let (tx, _) = mpsc::channel(1);
+        let mut dragonball = DragonballInner::new(tx);
+        dragonball
+            .cached_block_devices
+            .insert("volume-host-cleanup".to_string());
+        dragonball
+            .pending_block_host_cleanup
+            .insert("volume-host-cleanup".to_string());
+
+        dragonball
+            .remove_block_drive("volume-host-cleanup")
+            .unwrap();
+
+        assert!(!dragonball
+            .cached_block_devices
+            .contains("volume-host-cleanup"));
+        assert!(!dragonball
+            .pending_block_host_cleanup
+            .contains("volume-host-cleanup"));
+    }
+
+    #[test]
+    fn test_vm_cleanup_finalizes_pending_block_host_cleanup() {
+        let (tx, _) = mpsc::channel(1);
+        let mut dragonball = DragonballInner::new(tx);
+        dragonball
+            .cached_block_devices
+            .insert("volume-vm-stop".to_string());
+        dragonball
+            .pending_block_host_cleanup
+            .insert("volume-vm-stop".to_string());
+
+        dragonball.cleanup_resource().unwrap();
+
+        assert!(dragonball.cached_block_devices.is_empty());
+        assert!(dragonball.pending_block_host_cleanup.is_empty());
+    }
 
     #[test]
     fn test_parse_inline_virtiofs_args() {
