@@ -119,11 +119,13 @@ struct SandboxInner {
     state: SandboxState,
     exit_info: Option<SandboxExitInfo>,
     created_at: Option<SystemTime>,
-    // Whether sandbox resources (cgroup, network, mounts, ...) have already
-    // been released.  Teardown can be driven both by the sandbox container
-    // exiting and by an explicit shutdown RPC, so guard against running the
-    // cleanup twice.
+    // Whether every sandbox cleanup stage has completed. Failed partial
+    // cleanup leaves this false so a later shutdown can retry.
     cleaned: bool,
+    vm_termination_confirmed: bool,
+    vm_wait_started: bool,
+    vm_wait_error: Option<String>,
+    pending_emptydir_detach_error: Option<String>,
 }
 
 impl SandboxInner {
@@ -133,8 +135,132 @@ impl SandboxInner {
             exit_info: None,
             created_at: None,
             cleaned: false,
+            vm_termination_confirmed: false,
+            vm_wait_started: false,
+            vm_wait_error: None,
+            pending_emptydir_detach_error: None,
         }
     }
+
+    fn record_emptydir_detach_error(&mut self, error: Option<anyhow::Error>) {
+        self.pending_emptydir_detach_error = error.map(|error| format!("{error:#}"));
+    }
+
+    fn resolve_emptydir_detach(&mut self, finalize_error: Option<anyhow::Error>) -> Option<String> {
+        match finalize_error {
+            None => {
+                self.pending_emptydir_detach_error = None;
+                None
+            }
+            Some(error) => Some(
+                self.pending_emptydir_detach_error
+                    .as_ref()
+                    .map(|detach_error| {
+                        format!(
+                            "finalize block EmptyDir disks after VM stop: {error:#}; pre-stop detach: {detach_error}"
+                        )
+                    })
+                    .unwrap_or_else(|| {
+                        format!("finalize block EmptyDir disks after VM stop: {error:#}")
+                    }),
+            ),
+        }
+    }
+
+    fn record_confirmed_vm_termination(&mut self, exit_status: u32, exited_at: SystemTime) -> bool {
+        if self.vm_termination_confirmed {
+            return false;
+        }
+        self.state = SandboxState::Stopped;
+        self.vm_termination_confirmed = true;
+        self.vm_wait_error = None;
+        self.exit_info = Some(SandboxExitInfo {
+            exit_status,
+            exited_at: Some(exited_at),
+        });
+        true
+    }
+}
+
+fn register_vm_wait_start(inner: &mut SandboxInner) {
+    inner.vm_wait_started = true;
+}
+
+fn teardown_result(errors: Vec<String>) -> Result<()> {
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(anyhow!(errors.join("; ")))
+    }
+}
+
+async fn stop_and_join_vm<Stop, StopFuture, Join, JoinFuture, T>(
+    stop: Stop,
+    join: Join,
+) -> Result<T>
+where
+    Stop: FnOnce() -> StopFuture,
+    StopFuture: std::future::Future<Output = Result<()>>,
+    Join: FnOnce() -> JoinFuture,
+    JoinFuture: std::future::Future<Output = Result<T>>,
+{
+    stop().await.context("stop VM")?;
+    join().await.context("join VM after stop")
+}
+
+async fn run_shutdown_stages<
+    Stop,
+    StopFuture,
+    Cleanup,
+    CleanupFuture,
+    Monitor,
+    MonitorFuture,
+    AgentStop,
+    AgentFuture,
+    Server,
+    ServerFuture,
+>(
+    stop: Stop,
+    cleanup: Cleanup,
+    stop_monitor: Monitor,
+    stop_agent: AgentStop,
+    stop_server: Server,
+) -> Result<()>
+where
+    Stop: FnOnce() -> StopFuture,
+    StopFuture: std::future::Future<Output = Result<()>>,
+    Cleanup: FnOnce() -> CleanupFuture,
+    CleanupFuture: std::future::Future<Output = Result<()>>,
+    Monitor: FnOnce() -> MonitorFuture,
+    MonitorFuture: std::future::Future<Output = Result<()>>,
+    AgentStop: FnOnce() -> AgentFuture,
+    AgentFuture: std::future::Future<Output = Result<()>>,
+    Server: FnOnce() -> ServerFuture,
+    ServerFuture: std::future::Future<Output = Result<()>>,
+{
+    let mut errors = Vec::new();
+    let stopped = match stop().await {
+        Ok(()) => true,
+        Err(error) => {
+            errors.push(format!("stop: {error:#}"));
+            false
+        }
+    };
+    if stopped {
+        if let Err(error) = cleanup().await {
+            errors.push(format!("clean up: {error:#}"));
+        }
+    }
+    if let Err(error) = stop_monitor().await {
+        errors.push(format!("stop monitor: {error:#}"));
+    }
+    if let Err(error) = stop_agent().await {
+        errors.push(format!("stop agent: {error:#}"));
+    }
+    if let Err(error) = stop_server().await {
+        errors.push(format!("stop server: {error:#}"));
+    }
+    teardown_result(errors)
 }
 
 #[derive(Clone)]
@@ -142,6 +268,7 @@ pub struct VirtSandbox {
     sid: String,
     msg_sender: Arc<Mutex<Sender<Message>>>,
     inner: Arc<RwLock<SandboxInner>>,
+    cleanup_lock: Arc<Mutex<()>>,
     resource_manager: Arc<ResourceManager>,
     agent: Arc<dyn Agent>,
     hypervisor: Arc<dyn Hypervisor>,
@@ -189,6 +316,7 @@ impl VirtSandbox {
             sid: sid.to_string(),
             msg_sender: Arc::new(Mutex::new(msg_sender)),
             inner: Arc::new(RwLock::new(SandboxInner::new())),
+            cleanup_lock: Arc::new(Mutex::new(())),
             agent,
             hypervisor,
             resource_manager,
@@ -234,16 +362,18 @@ impl VirtSandbox {
 
     async fn record_stop(&self, exit_status: u32, exited_at: std::time::SystemTime) {
         let mut inner = self.inner.write().await;
-        if inner.state == SandboxState::Stopped {
+        if inner.record_confirmed_vm_termination(exit_status, exited_at) {
+            self.exit_notify_tx.send_replace(true);
+        }
+    }
+
+    async fn record_vm_wait_error(&self, error: anyhow::Error) {
+        let mut inner = self.inner.write().await;
+        if inner.vm_termination_confirmed {
             return;
         }
-
-        inner.state = SandboxState::Stopped;
-        inner.exit_info = Some(SandboxExitInfo {
-            exit_status,
-            exited_at: Some(exited_at),
-        });
-        let _ = self.exit_notify_tx.send(true);
+        inner.vm_wait_error = Some(format!("{error:#}"));
+        self.exit_notify_tx.send_replace(true);
     }
 
     #[instrument]
@@ -1075,6 +1205,7 @@ impl Sandbox for VirtSandbox {
         info!(sl!(), "start vm");
 
         let sandbox = self.clone();
+        register_vm_wait_start(&mut inner);
         // wait for vm exit in background, and record the exit status and time when vm exited.
         tokio::spawn(async move {
             match sandbox.hypervisor.wait_vm().await {
@@ -1085,7 +1216,7 @@ impl Sandbox for VirtSandbox {
                 }
                 Err(err) => {
                     warn!(sl!(), "failed waiting for sandbox VM exit: {:?}", err);
-                    sandbox.record_stop(255, SystemTime::now()).await;
+                    sandbox.record_vm_wait_error(err).await;
                 }
             }
         });
@@ -1269,7 +1400,7 @@ impl Sandbox for VirtSandbox {
 
         // if sandbox is not in SandboxState::Init then return,
         // otherwise try to create sandbox
-        let inner = self.inner.write().await;
+        let mut inner = self.inner.write().await;
         if inner.state != SandboxState::Init {
             return Ok(());
         }
@@ -1308,6 +1439,7 @@ impl Sandbox for VirtSandbox {
         info!(sl!(), "vm started from template");
 
         let sandbox = self.clone();
+        register_vm_wait_start(&mut inner);
         tokio::spawn(async move {
             match sandbox.hypervisor.wait_vm().await {
                 Ok(exit_code) => {
@@ -1317,7 +1449,7 @@ impl Sandbox for VirtSandbox {
                 }
                 Err(err) => {
                     warn!(sl!(), "failed waiting for sandbox VM exit: {:?}", err);
-                    sandbox.record_stop(255, SystemTime::now()).await;
+                    sandbox.record_vm_wait_error(err).await;
                 }
             }
         });
@@ -1356,16 +1488,29 @@ impl Sandbox for VirtSandbox {
         }
 
         let inner = self.inner.read().await;
-        Ok(inner.exit_info.clone().unwrap_or_default())
+        if inner.vm_termination_confirmed {
+            return Ok(inner.exit_info.clone().unwrap_or_default());
+        }
+        Err(anyhow!(
+            "VM termination is unconfirmed after wait monitor failure: {}",
+            inner
+                .vm_wait_error
+                .as_deref()
+                .unwrap_or("wait monitor ended without an exit status")
+        ))
     }
 
     async fn stop(&self) -> Result<()> {
-        let state = {
+        let (state, vm_termination_confirmed, vm_wait_started) = {
             let sandbox_inner = self.inner.read().await;
-            sandbox_inner.state
+            (
+                sandbox_inner.state,
+                sandbox_inner.vm_termination_confirmed,
+                sandbox_inner.vm_wait_started,
+            )
         };
 
-        if state == SandboxState::Stopped {
+        if vm_termination_confirmed {
             return Ok(());
         }
 
@@ -1373,52 +1518,93 @@ impl Sandbox for VirtSandbox {
         // cleanly instead of hitting ECONNRESET/EOF on a closed channel.
         self.cancel_token.cancel();
 
-        info!(sl!(), "begin stop sandbox");
-        if state == SandboxState::Init {
-            let _ = self.hypervisor.stop_vm().await;
-            self.record_stop(0, SystemTime::now()).await;
-            info!(sl!(), "sandbox stopped during Init");
-            return Ok(());
+        let mut pre_stop_errors = Vec::new();
+        if let Err(error) = self
+            .resource_manager
+            .retry_failed_volume_rollbacks_before_vm_stop()
+            .await
+        {
+            pre_stop_errors.push(format!(
+                "retry failed volume rollbacks before VM stop: {error:#}"
+            ));
         }
+        if let Err(error) = self
+            .resource_manager
+            .detach_ephemeral_disks_before_vm_stop()
+            .await
+        {
+            pre_stop_errors.push(format!(
+                "detach block EmptyDir disks before VM stop: {error:#}"
+            ));
+        }
+        let detach_error = if pre_stop_errors.is_empty() {
+            None
+        } else {
+            Some(anyhow!(pre_stop_errors.join("; ")))
+        };
+        self.inner
+            .write()
+            .await
+            .record_emptydir_detach_error(detach_error);
 
-        self.hypervisor.stop_vm().await.context("stop vm")?;
-        self.wait().await.context("wait for vm exit after stop")?;
-        info!(sl!(), "sandbox stopped");
-
+        info!(sl!(), "begin stop sandbox");
+        if vm_wait_started {
+            stop_and_join_vm(|| self.hypervisor.stop_vm(), || self.wait()).await?;
+        } else {
+            let exit_code =
+                stop_and_join_vm(|| self.hypervisor.stop_vm(), || self.hypervisor.wait_vm())
+                    .await?;
+            self.record_stop(exit_code as u32, SystemTime::now()).await;
+        }
+        info!(sl!(), "sandbox stopped from state {:?}", state);
         Ok(())
     }
 
     async fn shutdown(&self) -> Result<()> {
         info!(sl!(), "shutdown");
 
-        self.stop().await.context("stop")?;
-
-        self.cleanup().await.context("do the clean up")?;
-
-        info!(sl!(), "stop monitor");
-        self.monitor.stop().await;
-
-        info!(sl!(), "stop agent");
-        self.agent.stop().await;
-
-        // stop server
-        info!(sl!(), "send shutdown message");
-        let msg = Message::new(Action::Shutdown);
-        let sender = self.msg_sender.clone();
-        let sender = sender.lock().await;
-        sender.send(msg).await.context("send shutdown msg")?;
-        Ok(())
+        run_shutdown_stages(
+            || async { self.stop().await },
+            || async { self.cleanup().await },
+            || async {
+                info!(sl!(), "stop monitor");
+                self.monitor.stop().await;
+                Ok(())
+            },
+            || async {
+                info!(sl!(), "stop agent");
+                self.agent.stop().await;
+                Ok(())
+            },
+            || async {
+                info!(sl!(), "send shutdown message");
+                let msg = Message::new(Action::Shutdown);
+                let sender = self.msg_sender.lock().await;
+                sender.send(msg).await.context("send shutdown message")
+            },
+        )
+        .await
     }
 
     async fn cleanup(&self) -> Result<()> {
-        // Teardown may be triggered both when the sandbox container exits and
-        // by a later shutdown RPC; only release the resources once.
+        // Teardown may be triggered more than once. Mark it complete only
+        // after every stage succeeds so partial cleanup remains retryable.
+        let _cleanup_guard = self.cleanup_lock.lock().await;
         {
-            let mut inner = self.inner.write().await;
+            let inner = self.inner.read().await;
             if inner.cleaned {
                 return Ok(());
             }
-            inner.cleaned = true;
+            if !inner.vm_termination_confirmed {
+                let pending = inner
+                    .pending_emptydir_detach_error
+                    .as_deref()
+                    .map(|error| format!("; pending pre-stop cleanup: {error}"))
+                    .unwrap_or_default();
+                return Err(anyhow!(
+                    "VM termination is unconfirmed; sandbox resources and block EmptyDir ownership remain reserved{pending}"
+                ));
+            }
         }
 
         let rootless_uid = self
@@ -1429,17 +1615,45 @@ impl Sandbox for VirtSandbox {
             .rootless_user
             .map(|user| user.uid);
 
+        let mut errors = Vec::new();
         info!(sl!(), "delete hypervisor");
-        self.hypervisor
-            .cleanup()
+        if let Err(error) = self.hypervisor.cleanup().await {
+            errors.push(format!("delete hypervisor: {error:#}"));
+        }
+
+        let mut finalize_errors = Vec::new();
+        if let Err(error) = self
+            .resource_manager
+            .finalize_ephemeral_disks_after_vm_stop()
             .await
-            .context("delete hypervisor")?;
+        {
+            finalize_errors.push(format!("finalize block EmptyDir disks: {error:#}"));
+        }
+        if let Err(error) = self
+            .resource_manager
+            .finalize_failed_volume_rollbacks_after_vm_stop()
+            .await
+        {
+            finalize_errors.push(format!("finalize failed volume rollbacks: {error:#}"));
+        }
+        let finalize_error = if finalize_errors.is_empty() {
+            None
+        } else {
+            Some(anyhow!(finalize_errors.join("; ")))
+        };
+        if let Some(error) = self
+            .inner
+            .write()
+            .await
+            .resolve_emptydir_detach(finalize_error)
+        {
+            errors.push(error);
+        }
 
         info!(sl!(), "resource clean up");
-        self.resource_manager
-            .cleanup()
-            .await
-            .context("resource clean up")?;
+        if let Err(error) = self.resource_manager.cleanup().await {
+            errors.push(format!("resource clean up: {error:#}"));
+        }
 
         if let Some(uid) = rootless_uid {
             let path = vmm_user_runtime_dir(uid);
@@ -1450,11 +1664,20 @@ impl Sandbox for VirtSandbox {
                     path.display(),
                     err
                 );
+                errors.push(format!(
+                    "remove rootless runtime directory {}: {err:#}",
+                    path.display()
+                ));
             }
         }
 
         // TODO: cleanup other sandbox resource
-        Ok(())
+        if errors.is_empty() {
+            self.inner.write().await.cleaned = true;
+            Ok(())
+        } else {
+            teardown_result(errors)
+        }
     }
 
     async fn rescan_network(&self) -> Result<()> {
@@ -1711,6 +1934,7 @@ impl Persist for VirtSandbox {
             sid: sid.to_string(),
             msg_sender: Arc::new(Mutex::new(sandbox_args.sender)),
             inner: Arc::new(RwLock::new(SandboxInner::new())),
+            cleanup_lock: Arc::new(Mutex::new(())),
             agent,
             hypervisor,
             resource_manager,
@@ -1765,5 +1989,140 @@ mod tests {
         .unwrap();
 
         assert_eq!(metrics, "agent_metric 1\n");
+    }
+
+    fn record_stage(stages: &Arc<std::sync::Mutex<Vec<&'static str>>>, stage: &'static str) {
+        stages.lock().unwrap().push(stage);
+    }
+
+    #[tokio::test]
+    async fn start_path_registers_vm_wait_without_relocking_inner() {
+        let inner = RwLock::new(SandboxInner::new());
+
+        tokio::time::timeout(std::time::Duration::from_millis(100), async {
+            let mut start_guard = inner.write().await;
+            register_vm_wait_start(&mut start_guard);
+            tokio::task::yield_now().await;
+            assert!(start_guard.vm_wait_started);
+        })
+        .await
+        .expect("start path deadlocked while registering VM wait");
+    }
+
+    #[tokio::test]
+    async fn live_sandbox_stop_failure_does_not_join_or_confirm() {
+        let join_called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let join_observer = join_called.clone();
+
+        let result = stop_and_join_vm(
+            || async { Err(anyhow!("injected stop failure")) },
+            || async move {
+                join_observer.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(0)
+            },
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert!(!join_called.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(!SandboxInner::new().vm_termination_confirmed);
+    }
+
+    #[tokio::test]
+    async fn live_sandbox_successful_stop_and_join_confirms_termination() {
+        let exit_status = stop_and_join_vm(|| async { Ok(()) }, || async { Ok(17) })
+            .await
+            .unwrap();
+        let mut inner = SandboxInner::new();
+
+        assert!(inner.record_confirmed_vm_termination(exit_status, SystemTime::now()));
+        assert!(inner.vm_termination_confirmed);
+        assert_eq!(inner.state, SandboxState::Stopped);
+        assert_eq!(inner.exit_info.unwrap().exit_status, 17);
+    }
+
+    #[test]
+    fn wait_monitor_error_does_not_confirm_termination() {
+        let mut inner = SandboxInner::new();
+        inner.state = SandboxState::Running;
+        inner.vm_wait_error = Some("injected wait failure".to_string());
+
+        assert!(!inner.vm_termination_confirmed);
+        assert_ne!(inner.state, SandboxState::Stopped);
+    }
+
+    #[tokio::test]
+    async fn shutdown_runs_remaining_stages_and_aggregates_errors() {
+        let stages = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let stop_stages = stages.clone();
+        let cleanup_stages = stages.clone();
+        let monitor_stages = stages.clone();
+        let agent_stages = stages.clone();
+        let server_stages = stages.clone();
+
+        let error = run_shutdown_stages(
+            || async move {
+                record_stage(&stop_stages, "stop");
+                Ok(())
+            },
+            || async move {
+                record_stage(&cleanup_stages, "cleanup");
+                Err(anyhow!("injected cleanup failure"))
+            },
+            || async move {
+                record_stage(&monitor_stages, "monitor");
+                Ok(())
+            },
+            || async move {
+                record_stage(&agent_stages, "agent");
+                Ok(())
+            },
+            || async move {
+                record_stage(&server_stages, "server");
+                Err(anyhow!("injected server failure"))
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(
+            *stages.lock().unwrap(),
+            vec!["stop", "cleanup", "monitor", "agent", "server"]
+        );
+        let message = format!("{error:#}");
+        assert!(message.contains("injected cleanup failure"));
+        assert!(message.contains("injected server failure"));
+    }
+
+    #[test]
+    fn successful_finalization_resolves_pre_stop_detach_error() {
+        let mut inner = SandboxInner::new();
+        inner.record_emptydir_detach_error(Some(anyhow!(
+            "Firecracker does not support block device hot-unplug"
+        )));
+
+        assert!(inner.resolve_emptydir_detach(None).is_none());
+        assert!(inner.pending_emptydir_detach_error.is_none());
+        assert!(teardown_result(Vec::new()).is_ok());
+    }
+
+    #[test]
+    fn unrelated_and_unresolved_teardown_errors_remain_failures() {
+        let mut inner = SandboxInner::new();
+        inner.record_emptydir_detach_error(Some(anyhow!(
+            "Firecracker does not support block device hot-unplug"
+        )));
+
+        let unresolved = inner
+            .resolve_emptydir_detach(Some(anyhow!("artifact removal failed")))
+            .unwrap();
+        assert!(unresolved.contains("artifact removal failed"));
+        assert!(unresolved.contains("does not support block device hot-unplug"));
+        assert!(inner.pending_emptydir_detach_error.is_some());
+
+        assert!(teardown_result(vec!["stop VM failed".to_string()]).is_err());
+        assert!(inner.resolve_emptydir_detach(None).is_none());
+        assert!(inner.pending_emptydir_detach_error.is_none());
+        assert!(teardown_result(vec!["server shutdown failed".to_string()]).is_err());
     }
 }

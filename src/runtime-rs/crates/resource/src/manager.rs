@@ -224,6 +224,26 @@ impl ResourceManager {
         inner.cleanup().await
     }
 
+    pub async fn detach_ephemeral_disks_before_vm_stop(&self) -> Result<()> {
+        let inner = self.inner.read().await;
+        inner.detach_ephemeral_disks_before_vm_stop().await
+    }
+
+    pub async fn retry_failed_volume_rollbacks_before_vm_stop(&self) -> Result<()> {
+        let inner = self.inner.read().await;
+        inner.retry_failed_volume_rollbacks_before_vm_stop().await
+    }
+
+    pub async fn finalize_ephemeral_disks_after_vm_stop(&self) -> Result<()> {
+        let inner = self.inner.read().await;
+        inner.finalize_ephemeral_disks_after_vm_stop().await
+    }
+
+    pub async fn finalize_failed_volume_rollbacks_after_vm_stop(&self) -> Result<()> {
+        let inner = self.inner.read().await;
+        inner.finalize_failed_volume_rollbacks_after_vm_stop().await
+    }
+
     pub async fn guest_volume_stats_path(&self, host_volume_path: &str) -> Option<String> {
         let inner = self.inner.read().await;
         inner

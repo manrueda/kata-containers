@@ -956,6 +956,30 @@ impl ResourceManagerInner {
         }
     }
 
+    pub async fn detach_ephemeral_disks_before_vm_stop(&self) -> Result<()> {
+        self.volume_resource
+            .detach_ephemeral_disks(self.device_manager.as_ref())
+            .await
+    }
+
+    pub async fn retry_failed_volume_rollbacks_before_vm_stop(&self) -> Result<()> {
+        self.volume_resource
+            .retry_failed_rollbacks(self.device_manager.as_ref())
+            .await
+    }
+
+    pub async fn finalize_ephemeral_disks_after_vm_stop(&self) -> Result<()> {
+        self.volume_resource
+            .finalize_ephemeral_disks(self.device_manager.as_ref())
+            .await
+    }
+
+    pub async fn finalize_failed_volume_rollbacks_after_vm_stop(&self) -> Result<()> {
+        self.volume_resource
+            .finalize_failed_rollbacks_after_vm_stop(self.device_manager.as_ref())
+            .await
+    }
+
     pub async fn cleanup(&self) -> Result<()> {
         // detach network endpoints (rebinds VFs from vfio-pci back to host driver)
         if let Some(network) = &self.network {
@@ -995,11 +1019,6 @@ impl ResourceManagerInner {
         if let Some(swap) = self.swap_resource.as_ref() {
             swap.clean().await;
         }
-
-        self.volume_resource
-            .cleanup_ephemeral_disks()
-            .await
-            .context("failed to cleanup ephemeral disks")?;
 
         Ok(())
     }

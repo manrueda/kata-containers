@@ -7,6 +7,12 @@
 use anyhow::{anyhow, Context, Error, Result};
 use base64::Engine as _;
 use std::convert::TryFrom;
+#[cfg(feature = "safe-path")]
+use std::fs::{File, OpenOptions};
+#[cfg(feature = "safe-path")]
+use std::io::Write;
+#[cfg(feature = "safe-path")]
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::{collections::HashMap, path::PathBuf};
 
 use crate::handler::HandlerManager;
@@ -30,6 +36,8 @@ pub const KATA_K8S_LOCAL_STORAGE_TYPE: &str = "local";
 
 /// KATA_MOUNT_INFO_FILE_NAME is used for the file that holds direct-volume mount info
 pub const KATA_MOUNT_INFO_FILE_NAME: &str = "mountInfo.json";
+#[cfg(feature = "safe-path")]
+static MOUNT_INFO_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// Specify `fsgid` for a volume or mount, `fsgid=1`.
 pub const KATA_MOUNT_OPTION_FS_GID: &str = "fsgid";
@@ -547,9 +555,79 @@ pub fn add_volume_mount_info(volume_path: &str, mount_info: &DirectVolumeMountIn
     let file_path = dir.join(KATA_MOUNT_INFO_FILE_NAME);
     let data =
         serde_json::to_string(mount_info).context("failed to serialize DirectVolumeMountInfo")?;
-    std::fs::write(&file_path, data)
-        .with_context(|| format!("failed to write mount info to {:?}", file_path))?;
+    atomic_write_file(&file_path, data.as_bytes())
+        .with_context(|| format!("failed to publish mount info to {:?}", file_path))?;
     Ok(())
+}
+
+#[cfg(feature = "safe-path")]
+fn atomic_write_file(file_path: &std::path::Path, data: &[u8]) -> Result<()> {
+    atomic_write_file_with_dir_sync(file_path, data, |parent| {
+        File::open(parent)
+            .with_context(|| format!("open mount info directory {:?}", parent))?
+            .sync_all()
+            .with_context(|| format!("sync mount info directory {:?}", parent))
+    })
+}
+
+#[cfg(feature = "safe-path")]
+fn atomic_write_file_with_dir_sync<F>(
+    file_path: &std::path::Path,
+    data: &[u8],
+    sync_parent: F,
+) -> Result<()>
+where
+    F: FnOnce(&std::path::Path) -> Result<()>,
+{
+    let parent = file_path
+        .parent()
+        .ok_or_else(|| anyhow!("mount info path {:?} has no parent", file_path))?;
+    let (temp_path, mut file) = loop {
+        let sequence = MOUNT_INFO_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let temp_path = parent.join(format!(
+            ".{}.{}.{}.tmp",
+            KATA_MOUNT_INFO_FILE_NAME,
+            std::process::id(),
+            sequence
+        ));
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)
+        {
+            Ok(file) => break (temp_path, file),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("create temporary mount info {:?}", temp_path));
+            }
+        }
+    };
+
+    let publish_result = (|| -> Result<()> {
+        file.write_all(data)
+            .with_context(|| format!("write temporary mount info {:?}", temp_path))?;
+        file.sync_all()
+            .with_context(|| format!("sync temporary mount info {:?}", temp_path))?;
+        std::fs::rename(&temp_path, file_path).with_context(|| {
+            format!(
+                "rename temporary mount info {:?} to {:?}",
+                temp_path, file_path
+            )
+        })?;
+        sync_parent(parent).with_context(|| {
+            format!(
+                "mount info {:?} was published but directory sync failed",
+                file_path
+            )
+        })?;
+        Ok(())
+    })();
+
+    if publish_result.is_err() {
+        let _ = std::fs::remove_file(&temp_path);
+    }
+    publish_result
 }
 
 /// Returns `true` if a `mountInfo.json` exists for the given `volume_path`.
@@ -839,5 +917,35 @@ mod tests {
         let (_prefix, encoded_vol) = option_str.split_once("io.katacontainers.volume=").unwrap();
 
         assert_eq!(encoded_vol, expected_b64_vol);
+    }
+
+    #[cfg(feature = "safe-path")]
+    #[test]
+    fn atomic_mount_info_replaces_complete_file() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let target = temp_dir.path().join(KATA_MOUNT_INFO_FILE_NAME);
+        std::fs::write(&target, br#"{"old":true}"#).unwrap();
+
+        atomic_write_file(&target, br#"{"new":true}"#).unwrap();
+
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), r#"{"new":true}"#);
+    }
+
+    #[cfg(feature = "safe-path")]
+    #[test]
+    fn atomic_mount_info_preserves_file_after_post_rename_sync_failure() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let target = temp_dir.path().join(KATA_MOUNT_INFO_FILE_NAME);
+
+        let error = atomic_write_file_with_dir_sync(&target, br#"{"published":true}"#, |_| {
+            Err(anyhow!("injected directory sync failure"))
+        })
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("was published but directory sync failed"));
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            r#"{"published":true}"#
+        );
     }
 }
