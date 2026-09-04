@@ -39,13 +39,19 @@ use kata_types::rootless::is_rootless;
 use safe_path::scoped_join;
 use std::convert::TryFrom;
 use std::os::fd::AsRawFd;
-use std::os::fd::IntoRawFd;
+use std::os::fd::OwnedFd;
 use std::os::unix::fs::symlink;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
 const VIRTIO_FS: &str = "virtio-fs";
+
+#[derive(Debug)]
+pub(super) struct OwnedNetworkConfig {
+    pub(super) config: NetConfig,
+    pub(super) fds: Vec<OwnedFd>,
+}
 
 impl CloudHypervisorInner {
     pub(crate) async fn add_device(&mut self, device: DeviceType) -> Result<DeviceType> {
@@ -371,13 +377,13 @@ impl CloudHypervisorInner {
         &mut self,
     ) -> Result<(
         Option<Vec<FsConfig>>,
-        Option<Vec<NetConfig>>,
+        Option<Vec<OwnedNetworkConfig>>,
         Option<Vec<DeviceConfig>>,
         Option<ProtectionDevConfig>,
         Option<Vec<DiskConfig>>,
     )> {
         let mut shared_fs_devices = Vec::<FsConfig>::new();
-        let mut network_devices = Vec::<NetConfig>::new();
+        let mut network_devices = Vec::<OwnedNetworkConfig>::new();
         let mut host_devices = Vec::<DeviceConfig>::new();
         let mut protection_device = ProtectionDevConfig::default();
         let mut boot_disks = Vec::<DiskConfig>::new();
@@ -457,10 +463,13 @@ impl CloudHypervisorInner {
                     )
                     .context("open named tuntap")?
                     .into_iter()
-                    .map(|f| f.into_raw_fd())
-                    .collect();
-                    net_config.fds = Some(fds);
-                    network_devices.push(net_config);
+                    .map(OwnedFd::from)
+                    .collect::<Vec<_>>();
+                    net_config.fds = Some(fds.iter().map(AsRawFd::as_raw_fd).collect());
+                    network_devices.push(OwnedNetworkConfig {
+                        config: net_config,
+                        fds,
+                    });
                 }
                 DeviceType::Vfio(vfio_device) => {
                     // A device with multi-funtions, or a IOMMU group with one more

@@ -4,6 +4,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::inner::CloudHypervisorInner;
+use super::inner_device::OwnedNetworkConfig;
 use crate::ch::utils::get_api_socket_path;
 use crate::ch::utils::get_rootless_symlink_sandbox_path;
 use crate::ch::utils::get_vsock_path;
@@ -51,6 +52,7 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, RwLock};
+use std::time::Instant;
 use tokio::io::BufReader;
 use tokio::process::{Child, Command};
 use tokio::sync::watch::Receiver;
@@ -238,29 +240,32 @@ impl CloudHypervisorInner {
             debug!(sl!(), "vm boot response: {:?}", detail);
         }
 
-        if let Some(network_devices) = network_devices {
-            for net in network_devices {
-                let vm_fds = net.fds.clone().unwrap_or_default();
-                let response =
-                    cloud_hypervisor_vm_netdev_add_with_fds(&self.api_socket, net, vm_fds.clone())
-                        .await
-                        .context("failed to add vm netdev with fds")?;
-
-                if let Some(detail) = response {
-                    debug!(sl!(), "vm netdev add response: {:?}", detail);
-                }
-
-                for fd in vm_fds {
-                    // Explicitly close the fd now that it has been sent to CLH.
-                    nix::unistd::close(fd).context("failed to close netdev fd")?;
-                }
-            }
-        }
+        self.add_network_devices(network_devices).await?;
 
         let response = cloud_hypervisor_vm_start(&self.api_socket).await?;
 
         if let Some(detail) = response {
             debug!(sl!(), "vm start response: {:?}", detail);
+        }
+
+        Ok(())
+    }
+
+    async fn add_network_devices(
+        &self,
+        network_devices: Option<Vec<OwnedNetworkConfig>>,
+    ) -> Result<()> {
+        for net in network_devices.unwrap_or_default() {
+            let OwnedNetworkConfig { config, fds } = net;
+            let raw_fds = fds.iter().map(std::os::fd::AsRawFd::as_raw_fd).collect();
+            let response =
+                cloud_hypervisor_vm_netdev_add_with_fds(&self.api_socket, config, raw_fds)
+                    .await
+                    .context("failed to add vm netdev with fds")?;
+
+            if let Some(detail) = response {
+                debug!(sl!(), "vm netdev add response: {:?}", detail);
+            }
         }
 
         Ok(())
@@ -410,26 +415,28 @@ impl CloudHypervisorInner {
 
     async fn cloud_hypervisor_setup_comms(&mut self) -> Result<()> {
         let api_socket_path = get_api_socket_path(&self.id)?;
+        let connect_path = api_socket_path.clone();
+        let timeout = Duration::from_secs(self.timeout_secs as u64);
 
         // The hypervisor has just been spawned, but may not yet have created
         // the API socket, so repeatedly try to connect for up to
         // timeout_secs.
         let join_handle: JoinHandle<Result<UnixStream>> =
             task::spawn_blocking(move || -> Result<UnixStream> {
-                let api_socket: UnixStream;
+                let deadline = Instant::now() + timeout;
 
                 loop {
-                    let result = UnixStream::connect(api_socket_path.clone());
+                    let result = UnixStream::connect(connect_path.clone());
 
                     if let Ok(result) = result {
-                        api_socket = result;
-                        break;
+                        return Ok(result);
+                    }
+                    if Instant::now() >= deadline {
+                        return Err(anyhow!("API socket connect timed out after {timeout:?}"));
                     }
 
                     std::thread::sleep(Duration::from_millis(CH_POLL_TIME_MS));
                 }
-
-                Ok(api_socket)
             });
 
         let timeout_msg = format!(
@@ -437,16 +444,11 @@ impl CloudHypervisorInner {
             self.timeout_secs
         );
 
-        let result =
-            tokio::time::timeout(Duration::from_secs(self.timeout_secs as u64), join_handle)
-                .await
-                .context(timeout_msg)?;
+        let api_socket = join_handle.await.context(timeout_msg)??;
 
-        let result = result?;
-
-        let api_socket = result?;
-
-        *self.api_socket.lock().await = Some(api_socket);
+        self.api_socket
+            .replace(api_socket, Some(PathBuf::from(api_socket_path)))
+            .await;
 
         Ok(())
     }
