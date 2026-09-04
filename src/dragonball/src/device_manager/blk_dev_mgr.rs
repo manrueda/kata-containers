@@ -847,7 +847,7 @@ impl BlockDeviceMgr {
         #[cfg(target_arch = "x86_64")]
         let f_access_platform = ctx.get_confidential_vm_type() == Some(ConfidentialVmType::TDX);
 
-        let device = Block::new(
+        let mut device = Block::new(
             block_files,
             cfg.is_read_only,
             cfg.sparse,
@@ -856,6 +856,7 @@ impl BlockDeviceMgr {
             limiters,
             f_access_platform,
         )?;
+        device.set_device_id(cfg.drive_id.clone());
         Ok(Box::new(device))
     }
 

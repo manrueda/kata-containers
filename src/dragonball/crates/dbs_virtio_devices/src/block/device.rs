@@ -45,14 +45,18 @@ const CONFIG_SPACE_SIZE: usize = 64;
 /// Max segments in a data request.
 const CONFIG_MAX_SEG: u32 = 16;
 
-fn build_device_id(disk_image: &dyn Ufile) -> Vec<u8> {
+fn build_device_id(disk_image: &dyn Ufile, configured_id: Option<&str>) -> Vec<u8> {
     let mut default_disk_image_id = vec![0; VIRTIO_BLK_ID_BYTES as usize];
-    match disk_image.get_device_id() {
+    let disk_id = match configured_id {
+        Some(configured_id) => Ok(configured_id.to_owned()),
+        None => disk_image.get_device_id(),
+    };
+    match disk_id {
         Err(_) => warn!("Could not generate device id. We'll use a default."),
-        Ok(m) => {
+        Ok(disk_id) => {
             // The kernel only knows to read a maximum of VIRTIO_BLK_ID_BYTES.
             // This will also zero out any leftover bytes.
-            let disk_id = m.as_bytes();
+            let disk_id = disk_id.as_bytes();
             let bytes_to_copy = std::cmp::min(disk_id.len(), VIRTIO_BLK_ID_BYTES as usize);
             default_disk_image_id[..bytes_to_copy].clone_from_slice(&disk_id[..bytes_to_copy])
         }
@@ -63,6 +67,7 @@ fn build_device_id(disk_image: &dyn Ufile) -> Vec<u8> {
 /// Virtio device for exposing block level read/write operations on a host file.
 pub struct Block<AS: DbsGuestAddressSpace> {
     pub(crate) device_info: VirtioDeviceInfo,
+    configured_device_id: Option<String>,
     disk_images: Vec<Box<dyn Ufile>>,
     rate_limiters: Vec<RateLimiter>,
     queue_sizes: Arc<Vec<u16>>,
@@ -136,6 +141,7 @@ impl<AS: DbsGuestAddressSpace> Block<AS> {
                 config_space,
                 epoll_mgr,
             ),
+            configured_device_id: None,
             disk_images,
             rate_limiters,
             queue_sizes,
@@ -145,6 +151,11 @@ impl<AS: DbsGuestAddressSpace> Block<AS> {
             kill_evts: Vec::with_capacity(num_queues),
             epoll_threads: Vec::with_capacity(num_queues),
         })
+    }
+
+    /// Configure a stable guest-visible device ID.
+    pub fn set_device_id(&mut self, device_id: String) {
+        self.configured_device_id = Some(device_id);
     }
 
     fn build_config_space(disk_size: u64, max_size: u32, num_queues: u16, sparse: bool) -> Vec<u8> {
@@ -291,7 +302,8 @@ where
         config.queues.reverse();
         while let Some(queue) = config.queues.pop() {
             let disk_image = self.disk_images.pop().unwrap();
-            let disk_image_id = build_device_id(disk_image.as_ref());
+            let disk_image_id =
+                build_device_id(disk_image.as_ref(), self.configured_device_id.as_deref());
 
             let data_desc_vec =
                 vec![Vec::with_capacity(CONFIG_MAX_SEG as usize); self.queue_sizes[0] as usize];

@@ -74,6 +74,9 @@ pub struct DragonballInner {
     /// cached block device
     pub(crate) cached_block_devices: HashSet<String>,
 
+    /// Block devices whose VMM removal completed but host cleanup remains.
+    pub(crate) pending_block_host_cleanup: HashSet<String>,
+
     /// dragonball capabilities
     pub(crate) capabilities: Capabilities,
 
@@ -114,6 +117,7 @@ impl DragonballInner {
             vmm_instance: VmmInstance::new("", exit_notify),
             run_dir: "".to_string(),
             cached_block_devices: Default::default(),
+            pending_block_host_cleanup: Default::default(),
             capabilities,
             guest_memory_block_size_mb: 0,
             mem_hotplug_size_mb: 0,
@@ -208,18 +212,32 @@ impl DragonballInner {
         Ok(())
     }
 
-    pub(crate) fn cleanup_resource(&self) {
+    pub(crate) fn cleanup_resource(&mut self) -> Result<()> {
         if self.jailed {
             self.umount_jail_resource(DRAGONBALL_KERNEL).ok();
             self.umount_jail_resource(DRAGONBALL_ROOT_FS).ok();
-            for id in &self.cached_block_devices {
-                self.umount_jail_resource(id.as_str()).ok();
+        }
+        let cached_block_devices = self.cached_block_devices.clone();
+        let mut cleanup_errors = Vec::new();
+        for id in cached_block_devices {
+            if let Err(error) = self.release_cached_block_resource(&id) {
+                cleanup_errors.push(format!("{id}: {error:#}"));
+            } else {
+                self.pending_block_host_cleanup.remove(&id);
             }
         }
 
         std::fs::remove_dir_all(&self.vm_path)
             .inspect_err(|_| error!(sl!(), "failed to remove dir all for {}", &self.vm_path))
             .ok();
+        if cleanup_errors.is_empty() {
+            Ok(())
+        } else {
+            Err(anyhow!(
+                "failed to clean Dragonball block resources: {}",
+                cleanup_errors.join("; ")
+            ))
+        }
     }
 
     fn set_vm_base_config(&mut self) -> Result<()> {
@@ -584,6 +602,7 @@ impl Persist for DragonballInner {
             run_dir: hypervisor_state.run_dir,
             pending_devices: vec![],
             cached_block_devices: hypervisor_state.cached_block_devices,
+            pending_block_host_cleanup: Default::default(),
             capabilities: Capabilities::new(),
             guest_memory_block_size_mb: 0,
             mem_hotplug_size_mb: 0,

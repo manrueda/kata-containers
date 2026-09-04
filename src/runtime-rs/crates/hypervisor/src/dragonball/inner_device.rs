@@ -10,11 +10,11 @@ use std::time::Duration;
 
 use super::{build_dragonball_network_config, DragonballInner};
 use crate::VhostUserConfig;
-use crate::{device::pci_path::PciPath, KATA_BLK_DEV_TYPE};
+use crate::{device::pci_path::PciPath, KATA_BLK_DEV_TYPE, KATA_MMIO_BLK_DEV_TYPE};
 use crate::{
-    device::DeviceType, HybridVsockConfig, NetworkConfig, ShareFsConfig, ShareFsMountConfig,
-    ShareFsMountOperation, ShareFsMountType, VfioDevice, VmmState, DEFAULT_HOTPLUG_TIMEOUT,
-    JAILER_ROOT,
+    device::{device_state_in_doubt, DeviceStateInDoubt, DeviceType},
+    HybridVsockConfig, NetworkConfig, ShareFsConfig, ShareFsMountConfig, ShareFsMountOperation,
+    ShareFsMountType, VfioDevice, VmmState, JAILER_ROOT,
 };
 use anyhow::{anyhow, Context, Result};
 use dbs_utils::net::MacAddr;
@@ -36,6 +36,17 @@ const DEFAULT_VIRTIO_FS_QUEUE_SIZE: i32 = 1024;
 
 const VIRTIO_FS: &str = "virtio-fs";
 const INLINE_VIRTIO_FS: &str = "inline-virtio-fs";
+const BLOCK_HOTPLUG_TIMEOUT: Duration = Duration::from_secs(10);
+
+fn use_pci_bus(driver: &str) -> Result<bool> {
+    match driver {
+        KATA_BLK_DEV_TYPE => Ok(true),
+        KATA_MMIO_BLK_DEV_TYPE => Ok(false),
+        _ => Err(anyhow!(
+            "Dragonball doesn't support block driver {driver}; expected {KATA_BLK_DEV_TYPE} or {KATA_MMIO_BLK_DEV_TYPE}"
+        )),
+    }
+}
 
 impl DragonballInner {
     pub(crate) async fn add_device(&mut self, device: DeviceType) -> Result<DeviceType> {
@@ -85,11 +96,7 @@ impl DragonballInner {
                     )
                 };
 
-                let use_pci_bus = if driver_option == KATA_BLK_DEV_TYPE {
-                    Some(true)
-                } else {
-                    None
-                };
+                let use_pci_bus = Some(use_pci_bus(&driver_option)?);
 
                 info!(
                     sl!(),
@@ -121,8 +128,23 @@ impl DragonballInner {
 
                 if let Some(slot) = guest_device_id {
                     if slot > 0 {
-                        let mut dev = block_device.lock().await;
-                        dev.config.pci_path = Some(PciPath::try_from(slot as u32)?);
+                        match PciPath::try_from(slot as u32) {
+                            Ok(pci_path) => {
+                                let mut dev = block_device.lock().await;
+                                dev.config.pci_path = Some(pci_path);
+                            }
+                            Err(error) => {
+                                let rollback = self.remove_block_drive(&device_id);
+                                return match rollback {
+                                    Ok(()) => Err(error).context(format!(
+                                        "convert Dragonball guest slot {slot} for block device {device_id}"
+                                    )),
+                                    Err(rollback_error) => Err(rollback_error).context(format!(
+                                        "convert Dragonball guest slot {slot} for block device {device_id}: {error:#}"
+                                    )),
+                                };
+                            }
+                        }
                     }
                 }
 
@@ -269,8 +291,17 @@ impl DragonballInner {
         use_pci_bus: Option<bool>,
         sparse: bool,
     ) -> Result<Option<i32>> {
-        let jailed_drive = self.get_resource(path, id).context("get resource")?;
-        self.cached_block_devices.insert(id.to_string());
+        let jailed_drive = if self.cached_block_devices.contains(id) {
+            if self.jailed {
+                format!("/{id}")
+            } else {
+                path.to_string()
+            }
+        } else {
+            let jailed_drive = self.get_resource(path, id).context("get resource")?;
+            self.cached_block_devices.insert(id.to_string());
+            jailed_drive
+        };
 
         let bandwidth = TokenBucketConfigInfo {
             size: self.config.blockdev_info.disk_rate_limiter_bw_max_rate,
@@ -316,8 +347,8 @@ impl DragonballInner {
         );
         let result = self
             .vmm_instance
-            .insert_block_device(blk_cfg, Duration::from_millis(DEFAULT_HOTPLUG_TIMEOUT))
-            .context("insert block device");
+            .insert_block_device(blk_cfg, BLOCK_HOTPLUG_TIMEOUT)
+            .with_context(|| format!("insert Dragonball block device {id} from {path}"));
         match &result {
             Ok(guest_id) => info!(
                 sl!(),
@@ -325,19 +356,49 @@ impl DragonballInner {
             ),
             Err(e) => error!(sl!(), "add_block_device failed: id={}, error={:?}", id, e),
         }
+        if let Err(attach_error) = result {
+            if device_state_in_doubt(&attach_error).is_some() {
+                return Err(attach_error);
+            }
+            return match self.release_cached_block_resource(id) {
+                Ok(()) => Err(attach_error),
+                Err(cleanup_error) => Err(attach_error).context(format!(
+                    "failed to clean block device {id} after attach failure: {cleanup_error:#}"
+                )),
+            };
+        }
         result
     }
 
     fn remove_block_drive(&mut self, id: &str) -> Result<()> {
-        self.vmm_instance
-            .remove_block_device(id, Duration::from_millis(DEFAULT_HOTPLUG_TIMEOUT))
-            .context("remove block device")?;
-
-        if self.cached_block_devices.contains(id) && self.jailed {
-            self.umount_jail_resource(id)
-                .context("umount jail resource")?;
-            self.cached_block_devices.remove(id);
+        if !self.pending_block_host_cleanup.contains(id) {
+            self.vmm_instance
+                .remove_block_device(id, BLOCK_HOTPLUG_TIMEOUT)
+                .context("remove block device")?;
+            self.pending_block_host_cleanup.insert(id.to_string());
         }
+
+        match self.release_cached_block_resource(id) {
+            Ok(()) => {
+                self.pending_block_host_cleanup.remove(id);
+                Ok(())
+            }
+            Err(error) => Err(anyhow::Error::new(DeviceStateInDoubt::new(
+                id,
+                format!("VMM removal completed but host cleanup remains: {error:#}"),
+            ))),
+        }
+    }
+
+    pub(crate) fn release_cached_block_resource(&mut self, id: &str) -> Result<()> {
+        if !self.cached_block_devices.contains(id) {
+            return Ok(());
+        }
+        if self.jailed {
+            self.umount_jail_resource(id)
+                .with_context(|| format!("unmount jailed block device {id}"))?;
+        }
+        self.cached_block_devices.remove(id);
         Ok(())
     }
 

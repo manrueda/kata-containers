@@ -153,12 +153,11 @@ impl DragonballInner {
         Ok(vcpu_thread_ids)
     }
 
-    pub(crate) async fn cleanup(&self) -> Result<()> {
+    pub(crate) async fn cleanup(&mut self) -> Result<()> {
         // cleanup may run after the VMM waiter has already marked the sandbox
         // stopped, bypassing stop_vm(). Release the namespace handle here too.
         self.vmm_instance.clear_vmm_netns();
-        self.cleanup_resource();
-        Ok(())
+        self.cleanup_resource()
     }
 
     pub(crate) async fn get_pids(&self) -> Result<Vec<u32>> {
