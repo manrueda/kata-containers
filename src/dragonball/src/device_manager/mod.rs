@@ -16,7 +16,7 @@ use dbs_arch::{DeviceType, MMIODeviceInfo};
 #[cfg(feature = "host-device")]
 use dbs_boot::layout::MMIO_LOW_END;
 use dbs_device::device_manager::{Error as IoManagerError, IoManager, IoManagerContext};
-#[cfg(feature = "host-device")]
+#[cfg(feature = "dbs-virtio-devices")]
 use dbs_device::resources::DeviceResources;
 use dbs_device::resources::Resource;
 use dbs_device::DeviceIo;
@@ -185,6 +185,20 @@ pub enum DeviceMgrError {
     #[error("failed to allocate/free device resources: {0}")]
     ResourceError(#[source] crate::resource_manager::ResourceError),
 
+    #[cfg(feature = "dbs-virtio-devices")]
+    /// Transport construction failed, and allocated resources remain owned.
+    #[error(
+        "transport construction failed: {operation}; resource rollback remains incomplete: {cleanup}"
+    )]
+    TransportRollbackIncomplete {
+        /// Original transport construction failure.
+        operation: Box<DeviceMgrError>,
+        /// First cleanup failure.
+        cleanup: crate::resource_manager::ResourceError,
+        /// Resources whose cleanup must be retried.
+        remaining: DeviceResources,
+    },
+
     #[cfg(feature = "host-device")]
     /// Error from Vfio Pci
     #[error("failed to do vfio pci operation: {0:?}")]
@@ -228,6 +242,59 @@ pub type DbsVirtioDevice = Box<
 #[cfg(feature = "dbs-virtio-devices")]
 pub type DbsMmioV2Device =
     MmioV2Device<GuestAddressSpaceImpl, virtio_queue::QueueSync, vm_memory::GuestRegionMmap>;
+
+#[cfg(feature = "dbs-virtio-devices")]
+#[derive(Debug)]
+pub(crate) struct DeviceResourceCleanupFailure {
+    pub(crate) first_error: crate::resource_manager::ResourceError,
+    pub(crate) remaining: DeviceResources,
+}
+
+#[cfg(feature = "dbs-virtio-devices")]
+fn cleanup_device_resources_with<F>(
+    resources: &DeviceResources,
+    mut cleanup: F,
+) -> std::result::Result<(), DeviceResourceCleanupFailure>
+where
+    F: FnMut(&Resource) -> std::result::Result<(), crate::resource_manager::ResourceError>,
+{
+    let mut first_error = None;
+    let mut remaining = DeviceResources::new();
+    for resource in resources.iter() {
+        if let Err(error) = cleanup(resource) {
+            if first_error.is_none() {
+                first_error = Some(error);
+            }
+            remaining.append(resource.clone());
+        }
+    }
+
+    match first_error {
+        Some(first_error) => Err(DeviceResourceCleanupFailure {
+            first_error,
+            remaining,
+        }),
+        None => Ok(()),
+    }
+}
+
+#[cfg(feature = "dbs-virtio-devices")]
+pub(crate) fn cleanup_device_resources(
+    resource_manager: &ResourceManager,
+    resources: &DeviceResources,
+) -> std::result::Result<(), DeviceResourceCleanupFailure> {
+    cleanup_device_resources_with(resources, |resource| match resource {
+        Resource::PioAddressRange { base, size } => resource_manager.free_pio_address(*base, *size),
+        Resource::MmioAddressRange { base, size } => {
+            resource_manager.free_mmio_address(*base, *size)
+        }
+        Resource::MemAddressRange { base, size } => resource_manager.free_mem_address(*base, *size),
+        Resource::LegacyIrq(irq) => resource_manager.free_legacy_irq(*irq),
+        Resource::MsiIrq { base, size, .. } => resource_manager.free_msi_irq(*base, *size),
+        Resource::KvmMemSlot(slot) => resource_manager.free_kvm_mem_slot(*slot),
+        Resource::MacAddress(_) => Ok(()),
+    })
+}
 
 /// Struct to support transactional operations for device management.
 pub struct DeviceManagerTx {
@@ -1199,6 +1266,8 @@ impl DeviceManager {
         };
         let mut requests = vec![MMIO_ADDRESS_DEFAULT];
         device.get_resource_requirements(&mut requests, use_generic_irq);
+        let vm_as = ctx.get_vm_as()?;
+        let address_space = ctx.get_address_space()?;
         let resources = ctx
             .res_manager
             .allocate_device_resources(&requests, use_shared_irq)
@@ -1206,18 +1275,42 @@ impl DeviceManager {
 
         let virtio_dev = match MmioV2Device::new(
             ctx.vm_fd.clone(),
-            ctx.get_vm_as()?,
-            ctx.get_address_space()?,
+            vm_as,
+            address_space,
             ctx.irq_manager.clone(),
             device,
-            resources,
+            resources.clone(),
             features,
         ) {
             Ok(d) => d,
-            Err(e) => return Err(DeviceMgrError::Virtio(e)),
+            Err(e) => {
+                let operation = DeviceMgrError::Virtio(e);
+                return match cleanup_device_resources(&ctx.res_manager, &resources) {
+                    Ok(()) => Err(operation),
+                    Err(failure) => Err(DeviceMgrError::TransportRollbackIncomplete {
+                        operation: Box::new(operation),
+                        cleanup: failure.first_error,
+                        remaining: failure.remaining,
+                    }),
+                };
+            }
         };
 
-        Self::register_mmio_virtio_device(Arc::new(virtio_dev), ctx)
+        let virtio_dev = Arc::new(virtio_dev);
+        match Self::register_mmio_virtio_device(virtio_dev.clone(), ctx) {
+            Ok(device) => Ok(device),
+            Err(error) => {
+                virtio_dev.remove();
+                match cleanup_device_resources(&ctx.res_manager, &resources) {
+                    Ok(()) => Err(error),
+                    Err(failure) => Err(DeviceMgrError::TransportRollbackIncomplete {
+                        operation: Box::new(error),
+                        cleanup: failure.first_error,
+                        remaining: failure.remaining,
+                    }),
+                }
+            }
+        }
     }
 
     fn destroy_mmio_device(
@@ -1296,8 +1389,6 @@ impl DeviceManager {
         ctx: &mut DeviceOpContext,
         use_generic_irq: bool,
     ) -> std::result::Result<Arc<dyn DeviceIo>, DeviceMgrError> {
-        let pci_system_manager = ctx.pci_system_manager.lock().unwrap();
-
         // We always use 64bit bars, we don't support 32bit bar now
         // We aligned to the size of the bar itself, refers to cloud-hypervisor
         // https://github.com/cloud-hypervisor/cloud-hypervisor/commit/bfc65bff2a5bdb9aca7dcd3284a0ced0e5cc7db8
@@ -1332,77 +1423,111 @@ impl DeviceManager {
             }
         }
 
-        // allocate PciMsixIrq and KvmSlot by res_manager
-        let other_resources = ctx
-            .res_manager
-            .allocate_device_resources(&other_requests, false)
-            .map_err(DeviceMgrError::ResourceError)?;
+        let vm_as = ctx.get_vm_as()?;
+        let address_space = ctx.get_address_space()?;
+        let pci_bus = ctx.pci_system_manager.lock().unwrap().pci_root_bus();
+        let mut system_resources = DeviceResources::new();
+        let mut pci_resources = DeviceResources::new();
+        let mut device_id = None;
+        let mut created_device = None;
 
-        let pci_bus = pci_system_manager.pci_root_bus();
-        let dev_id = pci_system_manager
-            .new_device_id(None)
-            .ok_or(DeviceMgrError::VirtioPci)?;
+        let result = (|| {
+            system_resources = ctx
+                .res_manager
+                .allocate_device_resources(&other_requests, false)
+                .map_err(DeviceMgrError::ResourceError)?;
 
-        // Allocate config bar resources by pci_bus
-        let default_config_req = vec![DEFAULE_VIRTIO_PCI_CONFIG_BAR];
-        let default_config_res = pci_bus
-            .allocate_resources(&default_config_req)
-            .map_err(DeviceMgrError::PciError)?;
-        assert!(default_config_res.get_all_resources().len() == 1);
+            let id = ctx
+                .pci_system_manager
+                .lock()
+                .unwrap()
+                .new_device_id(None)
+                .ok_or(DeviceMgrError::VirtioPci)?;
+            device_id = Some(id);
 
-        // Allocate MmioAddress and PioAddress resource by pci bus, other resourece type will skip
-        let mut device_resource = pci_bus
-            .allocate_resources(&device_requests)
-            .map_err(DeviceMgrError::PciError)?;
+            let default_config_res = pci_bus
+                .allocate_resources(&[DEFAULE_VIRTIO_PCI_CONFIG_BAR])
+                .map_err(DeviceMgrError::PciError)?;
+            assert!(default_config_res.get_all_resources().len() == 1);
+            default_config_res
+                .get_all_resources()
+                .iter()
+                .for_each(|resource| pci_resources.append(resource.clone()));
 
-        // Extend PciMsixIrq and KvmSlot resources to device_resource
-        other_resources.get_all_resources().iter().for_each(|res| {
-            device_resource.append(res.clone());
-        });
+            let device_resources = pci_bus
+                .allocate_resources(&device_requests)
+                .map_err(DeviceMgrError::PciError)?;
+            device_resources
+                .get_all_resources()
+                .iter()
+                .for_each(|resource| pci_resources.append(resource.clone()));
 
-        // Do map for virtio share memory region by set_resource, this will use KvmSlot + MmioAddress resources, which should be allocated before
-        let _virito_shared_mem_list = device
-            .as_mut()
-            .set_resource(ctx.vm_fd.clone(), device_resource.clone())
-            .map_err(DeviceMgrError::Virtio)?;
+            let mut assigned_resources = pci_resources.clone();
+            system_resources
+                .get_all_resources()
+                .iter()
+                .for_each(|resource| assigned_resources.append(resource.clone()));
+            device
+                .as_mut()
+                .set_resource(ctx.vm_fd.clone(), assigned_resources.clone())
+                .map_err(DeviceMgrError::Virtio)?;
 
-        // Extend config bar resources to device_resource
-        // Now device_resource contains all resources
-        default_config_res
-            .get_all_resources()
-            .iter()
-            .for_each(|res| {
-                device_resource.append(res.clone());
-            });
-
-        drop(pci_system_manager);
-
-        // new a virtio pci device
-        let mut virtio_dev = VirtioPciDevice::new(
-            ctx.vm_fd.clone(),
-            ctx.get_vm_as()?,
-            ctx.get_address_space()?,
-            ctx.irq_manager.clone(),
-            device_resource,
-            dev_id,
-            device,
-            true,
-            Arc::downgrade(&pci_bus),
-            default_config_res.get_all_resources()[0].clone(),
-        )
-        .map_err(DeviceMgrError::VirtioPciError)?;
-
-        virtio_dev
-            .alloc_bars()
+            let mut virtio_dev = VirtioPciDevice::new(
+                ctx.vm_fd.clone(),
+                vm_as,
+                address_space,
+                ctx.irq_manager.clone(),
+                assigned_resources,
+                id,
+                device,
+                true,
+                Arc::downgrade(&pci_bus),
+                default_config_res.get_all_resources()[0].clone(),
+            )
             .map_err(DeviceMgrError::VirtioPciError)?;
+            virtio_dev
+                .alloc_bars()
+                .map_err(DeviceMgrError::VirtioPciError)?;
 
-        let arc_dev = Arc::new(virtio_dev);
+            let arc_dev = Arc::new(virtio_dev);
+            created_device = Some(arc_dev.clone());
+            pci_bus
+                .register_device(arc_dev.clone())
+                .map_err(DeviceMgrError::PciError)?;
+            Self::register_virtio_pci_device(arc_dev, ctx)
+        })();
 
-        pci_bus
-            .register_device(arc_dev.clone())
-            .map_err(DeviceMgrError::PciError)?;
+        let Err(operation) = result else {
+            return result;
+        };
 
-        Self::register_virtio_pci_device(arc_dev, ctx)
+        if let Some(device) = created_device {
+            device.remove();
+        }
+        let resource_cleanup = if system_resources.get_all_resources().is_empty() {
+            Ok(())
+        } else {
+            cleanup_device_resources(&ctx.res_manager, &system_resources)
+        };
+        if !pci_resources.get_all_resources().is_empty() {
+            pci_bus.free_resources(pci_resources);
+        }
+        if let Some(id) = device_id {
+            let _ = ctx
+                .pci_system_manager
+                .lock()
+                .unwrap()
+                .free_device_id(id as u32);
+        }
+
+        match resource_cleanup {
+            Ok(()) => Err(operation),
+            Err(failure) => Err(DeviceMgrError::TransportRollbackIncomplete {
+                operation: Box::new(operation),
+                cleanup: failure.first_error,
+                remaining: failure.remaining,
+            }),
+        }
     }
 
     /// Create an Virtio PCI transport layer device for the virtio backend device.

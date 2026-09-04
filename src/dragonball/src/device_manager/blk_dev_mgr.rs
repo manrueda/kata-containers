@@ -15,11 +15,11 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
 use std::{
-    collections::{vec_deque, VecDeque},
+    collections::{vec_deque, HashMap, VecDeque},
     sync::mpsc,
 };
 
-use dbs_device::DeviceIo;
+use dbs_device::{resources::DeviceResources, DeviceIo};
 use dbs_pci::VirtioPciDevice;
 use dbs_upcall::{DevMgrResponse, UpcallClientResponse};
 use dbs_virtio_devices as virtio;
@@ -33,9 +33,12 @@ use vm_memory::GuestRegionMmap;
 use crate::address_space_manager::GuestAddressSpaceImpl;
 #[cfg(target_arch = "x86_64")]
 use crate::api::v1::ConfidentialVmType;
+use crate::api::v1::{BlockHotplugError, BlockHotplugResult};
 use crate::config_manager::{ConfigItem, DeviceConfigInfo, RateLimiterConfigInfo};
 use crate::device_manager::blk_dev_mgr::BlockDeviceError::InvalidDeviceId;
-use crate::device_manager::{DeviceManager, DeviceMgrError, DeviceOpContext};
+use crate::device_manager::{
+    cleanup_device_resources, DeviceManager, DeviceMgrError, DeviceOpContext,
+};
 use crate::get_bucket_update;
 use crate::vm::KernelConfigInfo;
 
@@ -128,6 +131,17 @@ pub enum BlockDeviceError {
     /// Cannot initialize a MMIO Block Device or add a device to the MMIO Bus.
     #[error("failure while registering block device: {0}")]
     RegisterBlockDevice(#[source] DeviceMgrError),
+
+    /// The add operation failed, and its allocated transport could not be removed.
+    #[error(
+        "block device add failed: {operation}; transport rollback remains incomplete: {cleanup}"
+    )]
+    RollbackIncomplete {
+        /// Original add failure.
+        operation: Box<BlockDeviceError>,
+        /// Transport cleanup failure.
+        cleanup: DeviceMgrError,
+    },
 }
 
 /// Type of low level storage device/protocol for virtio-blk devices.
@@ -320,6 +334,45 @@ impl std::fmt::Debug for BlockDeviceInfo {
 /// Block Device Info
 pub type BlockDeviceInfo = DeviceConfigInfo<BlockDeviceConfigInfo>;
 
+fn block_hotplug_result(
+    response: UpcallClientResponse,
+    guest_device_id: Option<i32>,
+    drive_id: &str,
+) -> BlockHotplugResult {
+    match response {
+        UpcallClientResponse::DevMgr(DevMgrResponse::AddMmioDev(response))
+        | UpcallClientResponse::DevMgr(DevMgrResponse::Other(response)) => {
+            block_hotplug_status_result(response.result, guest_device_id, drive_id)
+        }
+        UpcallClientResponse::UpcallReset => Err(BlockHotplugError::OutcomeUnknown(format!(
+            "guest upcall reset for block device {drive_id}"
+        ))),
+        UpcallClientResponse::DevMgr(DevMgrResponse::CpuDev(_)) => {
+            Err(BlockHotplugError::OutcomeUnknown(format!(
+                "guest returned an unexpected CPU response for block device {drive_id}"
+            )))
+        }
+    }
+}
+
+fn block_hotplug_status_result(
+    status: i32,
+    guest_device_id: Option<i32>,
+    drive_id: &str,
+) -> BlockHotplugResult {
+    if status == 0 {
+        Ok(guest_device_id)
+    } else {
+        Err(BlockHotplugError::Rejected(format!(
+            "guest rejected block device {drive_id} operation with result {status}"
+        )))
+    }
+}
+
+fn block_hotplug_guest_device_id(use_pci_bus: Option<bool>, slot: u8) -> Option<i32> {
+    use_pci_bus.unwrap_or(false).then_some(slot as i32)
+}
+
 /// Wrapper for the collection that holds all the Block Devices Configs
 #[derive(Clone)]
 pub struct BlockDeviceMgr {
@@ -330,6 +383,7 @@ pub struct BlockDeviceMgr {
     read_only_root: bool,
     part_uuid: Option<String>,
     use_shared_irq: bool,
+    pending_transport_cleanup: HashMap<String, DeviceResources>,
 }
 
 impl BlockDeviceMgr {
@@ -379,7 +433,7 @@ impl BlockDeviceMgr {
         &mut self,
         mut ctx: DeviceOpContext,
         config: BlockDeviceConfigInfo,
-        sender: mpsc::Sender<Option<i32>>,
+        sender: mpsc::Sender<BlockHotplugResult>,
     ) -> std::result::Result<(), BlockDeviceError> {
         if !cfg!(feature = "hotplug") && ctx.is_hotplug {
             return Err(BlockDeviceError::UpdateNotAllowedPostBoot);
@@ -411,101 +465,132 @@ impl BlockDeviceMgr {
                     return Ok(());
                 }
 
-                let mut slot = 0;
-
-                let use_generic_irq = config.use_generic_irq.unwrap_or(USE_GENERIC_IRQ);
-
-                match config.device_type {
-                    BlockDeviceType::RawBlock => {
-                        let device = Self::create_blk_device(&config, &mut ctx)
-                            .map_err(BlockDeviceError::Virtio)?;
-
-                        let dev = if let Some(true) = config.use_pci_bus {
-                            let pci_dev = DeviceManager::create_virtio_pci_device(
-                                device,
-                                &mut ctx,
-                                use_generic_irq,
-                            )
-                            .map_err(BlockDeviceError::DeviceManager)?;
-
-                            let (_, devfn) = DeviceManager::get_pci_device_info(&pci_dev)?;
-                            slot = devfn >> 3;
-
-                            pci_dev
-                        } else {
-                            DeviceManager::create_mmio_virtio_device(
-                                device,
-                                &mut ctx,
-                                config.use_shared_irq.unwrap_or(self.use_shared_irq),
-                                use_generic_irq,
-                            )
-                            .map_err(BlockDeviceError::DeviceManager)?
-                        };
-
-                        let callback: Option<Box<dyn Fn(UpcallClientResponse) + Send>> =
-                            Some(Box::new(move |_| {
-                                // send the pci device slot to caller.
-                                let _ = sender.send(Some(slot as i32));
-                            }));
-
-                        self.update_device_by_index(index, dev.clone())?;
-                        // live-upgrade need save/restore device from info.device.
-                        self.info_list[index].set_device(dev.clone());
-
-                        let mut cleanup = |e, ctx: DeviceOpContext| -> BlockDeviceError {
-                            let logger = ctx.logger().new(slog::o!());
-                            self.remove_device(ctx, &config.drive_id).unwrap();
-                            error!(
-                                logger,
-                                "failed to hot-add pci virtio block device {}, {:?}",
-                                &config.drive_id,
-                                e
-                            );
-                            BlockDeviceError::DeviceManager(e)
-                        };
-
-                        if let Some(true) = config.use_pci_bus {
-                            let _ = ctx
-                                .insert_hotplug_pci_device(&dev, callback)
-                                .map_err(|e| cleanup(e, ctx))?;
-                            Ok(())
-                        } else {
-                            ctx.insert_hotplug_mmio_device(&dev, callback)
-                                .map_err(|e| cleanup(e, ctx))
-                        }
-                    }
-                    #[cfg(feature = "vhost-user-blk")]
-                    BlockDeviceType::Spool | BlockDeviceType::Spdk => {
-                        let device = Self::create_vhost_user_device(&config, &mut ctx)
-                            .map_err(BlockDeviceError::Virtio)?;
-                        let dev = DeviceManager::create_mmio_virtio_device(
-                            device,
-                            &mut ctx,
-                            config.use_shared_irq.unwrap_or(self.use_shared_irq),
-                            config.use_generic_irq.unwrap_or(USE_GENERIC_IRQ),
-                        )
-                        .map_err(BlockDeviceError::DeviceManager)?;
-                        let callback: Option<Box<dyn Fn(UpcallClientResponse) + Send>> =
-                            Some(Box::new(move |_| {
-                                let _ = sender.send(None);
-                            }));
-
-                        self.update_device_by_index(index, Arc::clone(&dev))?;
-                        ctx.insert_hotplug_mmio_device(&dev, callback).map_err(|e| {
-                            let logger = ctx.logger().new(slog::o!());
-                            self.remove_device(ctx, &config.drive_id).unwrap();
-                            error!(
-                                logger,
-                                "failed to hot-add virtio block device {}, {:?}",
-                                &config.drive_id,
-                                e
-                            );
-                            BlockDeviceError::DeviceManager(e)
-                        })
-                    }
-                    _ => Err(BlockDeviceError::InvalidBlockDeviceType),
+                let result = self.insert_hotplug_device(index, &mut ctx, &config, sender);
+                if let Err(error) = result {
+                    return self.rollback_failed_hotplug_insert(index, &mut ctx, error);
                 }
+                Ok(())
             }
+        }
+    }
+
+    fn insert_hotplug_device(
+        &mut self,
+        index: usize,
+        ctx: &mut DeviceOpContext,
+        config: &BlockDeviceConfigInfo,
+        sender: mpsc::Sender<BlockHotplugResult>,
+    ) -> std::result::Result<(), BlockDeviceError> {
+        match config.device_type {
+            BlockDeviceType::RawBlock => {
+                let device =
+                    Self::create_blk_device(config, ctx).map_err(BlockDeviceError::Virtio)?;
+                let use_generic_irq = config.use_generic_irq.unwrap_or(USE_GENERIC_IRQ);
+                let mut slot = 0;
+                let dev = if let Some(true) = config.use_pci_bus {
+                    let pci_dev =
+                        DeviceManager::create_virtio_pci_device(device, ctx, use_generic_irq)
+                            .map_err(BlockDeviceError::DeviceManager)?;
+                    let (_, devfn) = DeviceManager::get_pci_device_info(&pci_dev)?;
+                    slot = devfn >> 3;
+                    pci_dev
+                } else {
+                    DeviceManager::create_mmio_virtio_device(
+                        device,
+                        ctx,
+                        config.use_shared_irq.unwrap_or(self.use_shared_irq),
+                        use_generic_irq,
+                    )
+                    .map_err(BlockDeviceError::DeviceManager)?
+                };
+
+                self.update_device_by_index(index, dev.clone())?;
+                let guest_device_id = block_hotplug_guest_device_id(config.use_pci_bus, slot);
+                let drive_id = config.drive_id.clone();
+                let callback: Option<Box<dyn Fn(UpcallClientResponse) + Send>> =
+                    Some(Box::new(move |response| {
+                        let result = block_hotplug_result(response, guest_device_id, &drive_id);
+                        let _ = sender.send(result);
+                    }));
+                if let Some(true) = config.use_pci_bus {
+                    ctx.insert_hotplug_pci_device(&dev, callback)?;
+                } else {
+                    ctx.insert_hotplug_mmio_device(&dev, callback)?;
+                }
+                Ok(())
+            }
+            #[cfg(feature = "vhost-user-blk")]
+            BlockDeviceType::Spool | BlockDeviceType::Spdk => {
+                let device = Self::create_vhost_user_device(config, ctx)
+                    .map_err(BlockDeviceError::Virtio)?;
+                let dev = DeviceManager::create_mmio_virtio_device(
+                    device,
+                    ctx,
+                    config.use_shared_irq.unwrap_or(self.use_shared_irq),
+                    config.use_generic_irq.unwrap_or(USE_GENERIC_IRQ),
+                )
+                .map_err(BlockDeviceError::DeviceManager)?;
+                self.update_device_by_index(index, Arc::clone(&dev))?;
+                let drive_id = config.drive_id.clone();
+                let callback: Option<Box<dyn Fn(UpcallClientResponse) + Send>> =
+                    Some(Box::new(move |response| {
+                        let result = block_hotplug_result(response, None, &drive_id);
+                        let _ = sender.send(result);
+                    }));
+                ctx.insert_hotplug_mmio_device(&dev, callback)?;
+                Ok(())
+            }
+            _ => Err(BlockDeviceError::InvalidBlockDeviceType),
+        }
+    }
+
+    fn rollback_failed_hotplug_insert(
+        &mut self,
+        index: usize,
+        ctx: &mut DeviceOpContext,
+        operation_error: BlockDeviceError,
+    ) -> std::result::Result<(), BlockDeviceError> {
+        let device = self
+            .info_list
+            .get(index)
+            .and_then(|info| info.device.as_ref())
+            .cloned();
+        let cleanup_result = match device {
+            Some(device) => DeviceManager::destroy_virtio_device(device, ctx),
+            None => Ok(()),
+        };
+        self.finish_failed_hotplug_insert(index, operation_error, cleanup_result)
+    }
+
+    fn finish_failed_hotplug_insert(
+        &mut self,
+        index: usize,
+        operation_error: BlockDeviceError,
+        cleanup_result: Result<(), DeviceMgrError>,
+    ) -> std::result::Result<(), BlockDeviceError> {
+        if let BlockDeviceError::DeviceManager(DeviceMgrError::TransportRollbackIncomplete {
+            operation,
+            cleanup,
+            remaining,
+        }) = operation_error
+        {
+            let drive_id = self.info_list[index].config.drive_id.clone();
+            self.pending_transport_cleanup.insert(drive_id, remaining);
+            return Err(BlockDeviceError::RollbackIncomplete {
+                operation: Box::new(BlockDeviceError::DeviceManager(*operation)),
+                cleanup: DeviceMgrError::ResourceError(cleanup),
+            });
+        }
+
+        match cleanup_result {
+            Ok(()) => {
+                self.info_list.remove(index);
+                Err(operation_error)
+            }
+            Err(cleanup) => Err(BlockDeviceError::RollbackIncomplete {
+                operation: Box::new(operation_error),
+                cleanup,
+            }),
         }
     }
 
@@ -576,6 +661,24 @@ impl BlockDeviceMgr {
 
     /// Removes all virtio-blk devices
     pub fn remove_devices(&mut self, ctx: &mut DeviceOpContext) -> Result<(), DeviceMgrError> {
+        let pending_cleanup = std::mem::take(&mut self.pending_transport_cleanup);
+        let mut cleanup_error = None;
+        for (drive_id, resources) in pending_cleanup {
+            if let Err(failure) = cleanup_device_resources(&ctx.res_manager, &resources) {
+                self.pending_transport_cleanup
+                    .insert(drive_id, failure.remaining.clone());
+                if cleanup_error.is_none() {
+                    cleanup_error = Some(DeviceMgrError::TransportRollbackIncomplete {
+                        operation: Box::new(DeviceMgrError::InvalidOperation),
+                        cleanup: failure.first_error,
+                        remaining: failure.remaining,
+                    });
+                }
+            }
+        }
+        if let Some(error) = cleanup_error {
+            return Err(error);
+        }
         while let Some(mut info) = self.info_list.pop_back() {
             info!(ctx.logger(), "remove drive {}", info.config.drive_id);
             if let Some(device) = info.device.take() {
@@ -586,19 +689,12 @@ impl BlockDeviceMgr {
         Ok(())
     }
 
-    fn remove(&mut self, drive_id: &str) -> Option<BlockDeviceInfo> {
-        match self.get_index_of_drive_id(drive_id) {
-            Some(index) => self.info_list.remove(index),
-            None => None,
-        }
-    }
-
     /// prepare to remove device
     pub fn prepare_remove_device(
         &self,
         ctx: &DeviceOpContext,
         blockdev_id: &str,
-        result_sender: Sender<Option<i32>>,
+        result_sender: Sender<BlockHotplugResult>,
     ) -> Result<(), BlockDeviceError> {
         if !cfg!(feature = "hotplug") {
             return Err(BlockDeviceError::UpdateNotAllowedPostBoot);
@@ -606,23 +702,12 @@ impl BlockDeviceMgr {
 
         info!(ctx.logger(), "prepare remove block device");
 
+        let callback_drive_id = blockdev_id.to_string();
         let callback: Option<Box<dyn Fn(UpcallClientResponse) + Send>> =
-            Some(Box::new(move |result| match result {
-                UpcallClientResponse::DevMgr(response) => {
-                    if let DevMgrResponse::Other(resp) = response {
-                        if let Err(e) = result_sender.send(Some(resp.result)) {
-                            log::error!("send upcall result failed, due to {e:?}!");
-                        }
-                    }
-                }
-                UpcallClientResponse::UpcallReset => {
-                    if let Err(e) = result_sender.send(None) {
-                        log::error!("send upcall result failed, due to {e:?}!");
-                    }
-                }
-                #[allow(unreachable_patterns)]
-                _ => {
-                    log::debug!("this arm should only be triggered under test");
+            Some(Box::new(move |response| {
+                let result = block_hotplug_result(response, None, &callback_drive_id);
+                if let Err(e) = result_sender.send(result) {
+                    log::error!("send block hot-unplug result failed: {e:?}");
                 }
             }));
 
@@ -659,16 +744,29 @@ impl BlockDeviceMgr {
             return Err(BlockDeviceError::UpdateNotAllowedPostBoot);
         }
 
-        match self.remove(drive_id) {
-            Some(mut info) => {
-                info!(ctx.logger(), "remove drive {}", info.config.drive_id);
-                if let Some(device) = info.device.take() {
-                    DeviceManager::destroy_virtio_device(device, &mut ctx)
-                        .map_err(BlockDeviceError::DeviceManager)?;
-                }
+        let index = self
+            .get_index_of_drive_id(drive_id)
+            .ok_or_else(|| BlockDeviceError::InvalidDeviceId(drive_id.to_owned()))?;
+        if let Some(resources) = self.pending_transport_cleanup.remove(drive_id) {
+            if let Err(failure) = cleanup_device_resources(&ctx.res_manager, &resources) {
+                self.pending_transport_cleanup
+                    .insert(drive_id.to_string(), failure.remaining.clone());
+                return Err(BlockDeviceError::DeviceManager(
+                    DeviceMgrError::TransportRollbackIncomplete {
+                        operation: Box::new(DeviceMgrError::InvalidOperation),
+                        cleanup: failure.first_error,
+                        remaining: failure.remaining,
+                    },
+                ));
             }
-            None => return Err(BlockDeviceError::InvalidDeviceId(drive_id.to_owned())),
         }
+        let info = &self.info_list[index];
+        info!(ctx.logger(), "remove drive {}", info.config.drive_id);
+        if let Some(device) = info.device.as_ref() {
+            DeviceManager::destroy_virtio_device(device.clone(), &mut ctx)
+                .map_err(BlockDeviceError::DeviceManager)?;
+        }
+        self.info_list.remove(index);
 
         Ok(())
     }
@@ -749,7 +847,7 @@ impl BlockDeviceMgr {
         #[cfg(target_arch = "x86_64")]
         let f_access_platform = ctx.get_confidential_vm_type() == Some(ConfidentialVmType::TDX);
 
-        Ok(Box::new(Block::new(
+        let device = Block::new(
             block_files,
             cfg.is_read_only,
             cfg.sparse,
@@ -757,7 +855,8 @@ impl BlockDeviceMgr {
             epoll_mgr,
             limiters,
             f_access_platform,
-        )?))
+        )?;
+        Ok(Box::new(device))
     }
 
     #[cfg(feature = "vhost-user-blk")]
@@ -1123,6 +1222,7 @@ impl Default for BlockDeviceMgr {
             read_only_root: false,
             part_uuid: None,
             use_shared_irq: USE_SHARED_IRQ,
+            pending_transport_cleanup: HashMap::new(),
         }
     }
 }

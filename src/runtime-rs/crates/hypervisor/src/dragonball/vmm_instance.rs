@@ -17,13 +17,14 @@ use anyhow::{anyhow, Context, Result};
 use crossbeam_channel::{unbounded, Receiver, Sender};
 use dragonball::{
     api::v1::{
-        BlockDeviceConfigInfo, BootSourceConfig, FsDeviceConfigInfo, FsMountConfigInfo,
-        InstanceInfo, InstanceState, NetworkInterfaceConfig, VcpuResizeInfo, VmmAction,
-        VmmActionError, VmmData, VmmRequest, VmmResponse, VmmService, VsockDeviceConfigInfo,
+        BlockDeviceConfigInfo, BlockHotplugError, BlockHotplugResult, BootSourceConfig,
+        FsDeviceConfigInfo, FsMountConfigInfo, InstanceInfo, InstanceState, NetworkInterfaceConfig,
+        VcpuResizeInfo, VmmAction, VmmActionError, VmmData, VmmRequest, VmmResponse, VmmService,
+        VsockDeviceConfigInfo,
     },
     device_manager::{
-        balloon_dev_mgr::BalloonDeviceConfigInfo, mem_dev_mgr::MemDeviceConfigInfo,
-        vfio_dev_mgr::HostDeviceConfig,
+        balloon_dev_mgr::BalloonDeviceConfigInfo, blk_dev_mgr::BlockDeviceError,
+        mem_dev_mgr::MemDeviceConfigInfo, vfio_dev_mgr::HostDeviceConfig,
     },
     vm::VmConfigInfo,
     Vmm,
@@ -33,7 +34,7 @@ use seccompiler::BpfProgram;
 use tokio::sync::mpsc;
 use vmm_sys_util::eventfd::EventFd;
 
-use crate::ShareFsMountOperation;
+use crate::{device::DeviceStateInDoubt, ShareFsMountOperation};
 
 pub enum Request {
     Sync(VmmAction),
@@ -42,6 +43,15 @@ pub enum Request {
 const DRAGONBALL_VERSION: &str = env!("CARGO_PKG_VERSION");
 const REQUEST_RETRY: u32 = 500;
 const KVM_DEVICE: &str = "/dev/kvm";
+
+#[derive(Debug)]
+enum PendingBlockOperation {
+    Add(std::sync::mpsc::Receiver<BlockHotplugResult>),
+    Remove(std::sync::mpsc::Receiver<BlockHotplugResult>),
+    AddUnknown,
+    RemoveUnknown,
+    Cleanup,
+}
 
 #[derive(Debug)]
 pub struct VmmInstance {
@@ -56,6 +66,7 @@ pub struct VmmInstance {
     seccomps: HashMap<String, BpfProgram>,
     vmm_thread: Option<thread::JoinHandle<Result<i32>>>,
     exit_notify: Option<mpsc::Sender<i32>>,
+    pending_block_operations: Mutex<HashMap<String, PendingBlockOperation>>,
 }
 
 impl VmmInstance {
@@ -78,7 +89,19 @@ impl VmmInstance {
             seccomps: HashMap::new(),
             vmm_thread: None,
             exit_notify: Some(exit_notify),
+            pending_block_operations: Mutex::new(HashMap::new()),
         }
+    }
+
+    #[cfg(test)]
+    pub(super) fn test_channels(id: &str) -> (Self, Receiver<VmmRequest>, Sender<VmmResponse>) {
+        let (exit_notify, _exit_waiter) = mpsc::channel(1);
+        let mut instance = Self::new(id, exit_notify);
+        let (request_sender, request_receiver) = unbounded();
+        let (response_sender, response_receiver) = unbounded();
+        instance.to_vmm = Some(request_sender);
+        instance.from_vmm = Some(response_receiver);
+        (instance, request_receiver, response_sender)
     }
 
     pub fn get_shared_info(&self) -> Arc<RwLock<InstanceInfo>> {
@@ -313,21 +336,151 @@ impl VmmInstance {
         device_cfg: BlockDeviceConfigInfo,
         timeout: Duration,
     ) -> Result<Option<i32>> {
+        if let Some(guest_device_id) = self.resolve_pending_block_add(&device_cfg.drive_id)? {
+            return Ok(guest_device_id);
+        }
+
         let vmmdata = self
             .handle_request_with_retry(Request::Sync(VmmAction::InsertBlockDevice(
                 device_cfg.clone(),
             )))
+            .map_err(|error| self.map_block_insert_error(&device_cfg.drive_id, error))
             .with_context(|| format!("Failed to insert block device {device_cfg:?}"))?;
 
-        if let VmmData::SyncHotplug((_, receiver)) = vmmdata {
-            let guest_dev_id = receiver.recv_timeout(timeout)?;
-            return Ok(guest_dev_id);
+        if let VmmData::SyncBlockHotplug((_, receiver)) = vmmdata {
+            match receiver.recv_timeout(timeout) {
+                Ok(Ok(guest_dev_id)) => return Ok(guest_dev_id),
+                Ok(Err(BlockHotplugError::Rejected(error))) => {
+                    return Err(
+                        self.rollback_inserted_block_device(&device_cfg.drive_id, anyhow!(error))
+                    );
+                }
+                Ok(Err(BlockHotplugError::OutcomeUnknown(reason))) => {
+                    self.store_pending_block_operation(
+                        &device_cfg.drive_id,
+                        PendingBlockOperation::AddUnknown,
+                    );
+                    return Err(self.block_state_in_doubt(&device_cfg.drive_id, reason));
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    self.store_pending_block_operation(
+                        &device_cfg.drive_id,
+                        PendingBlockOperation::Add(receiver),
+                    );
+                    return Err(self.block_state_in_doubt(
+                        &device_cfg.drive_id,
+                        format!(
+                            "guest add response did not arrive within {} ms; Dragonball cannot cancel the request",
+                            timeout.as_millis()
+                        ),
+                    ));
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    self.store_pending_block_operation(
+                        &device_cfg.drive_id,
+                        PendingBlockOperation::Add(receiver),
+                    );
+                    return Err(self.block_state_in_doubt(
+                        &device_cfg.drive_id,
+                        "guest add response channel disconnected before the operation resolved",
+                    ));
+                }
+            }
         }
         Ok(None)
     }
 
+    fn resolve_pending_block_add(&self, id: &str) -> Result<Option<Option<i32>>> {
+        let Some(operation) = self.take_pending_block_operation(id) else {
+            return Ok(None);
+        };
+
+        match operation {
+            PendingBlockOperation::Add(receiver) => match receiver.try_recv() {
+                Ok(Ok(guest_device_id)) => Ok(Some(guest_device_id)),
+                Ok(Err(BlockHotplugError::Rejected(error))) => {
+                    Err(self.rollback_inserted_block_device(id, anyhow!(error)))
+                }
+                Ok(Err(BlockHotplugError::OutcomeUnknown(reason))) => {
+                    self.store_pending_block_operation(id, PendingBlockOperation::AddUnknown);
+                    Err(self.block_state_in_doubt(id, reason))
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    self.store_pending_block_operation(id, PendingBlockOperation::Add(receiver));
+                    Err(self.block_state_in_doubt(
+                        id,
+                        "guest add response remains pending; retry after the guest responds",
+                    ))
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.store_pending_block_operation(id, PendingBlockOperation::Add(receiver));
+                    Err(self.block_state_in_doubt(
+                        id,
+                        "guest add response channel disconnected before the operation resolved",
+                    ))
+                }
+            },
+            PendingBlockOperation::Cleanup => match self.remove_vmm_block_device(id) {
+                Ok(()) => Err(anyhow!(
+                    "previous block device {id} attach failed; VMM cleanup completed, retry the attach"
+                )),
+                Err(error) => {
+                    self.store_pending_block_operation(id, PendingBlockOperation::Cleanup);
+                    Err(self.block_state_in_doubt(
+                        id,
+                        format!("VMM cleanup remains incomplete: {error:#}"),
+                    ))
+                }
+            },
+            operation @ PendingBlockOperation::Remove(_) => {
+                self.store_pending_block_operation(id, operation);
+                Err(self.block_state_in_doubt(
+                    id,
+                    "a guest remove response is pending for this device",
+                ))
+            }
+            PendingBlockOperation::AddUnknown => {
+                self.store_pending_block_operation(id, PendingBlockOperation::AddUnknown);
+                Err(self.block_state_in_doubt(
+                    id,
+                    "guest add outcome remains unknown until the VM stops",
+                ))
+            }
+            PendingBlockOperation::RemoveUnknown => {
+                self.store_pending_block_operation(id, PendingBlockOperation::RemoveUnknown);
+                Err(self.block_state_in_doubt(
+                    id,
+                    "guest remove outcome remains unknown until the VM stops",
+                ))
+            }
+        }
+    }
+
+    fn rollback_inserted_block_device(
+        &self,
+        id: &str,
+        attach_error: anyhow::Error,
+    ) -> anyhow::Error {
+        match self.remove_vmm_block_device(id) {
+            Ok(_) => attach_error,
+            Err(rollback_error) => {
+                self.store_pending_block_operation(id, PendingBlockOperation::Cleanup);
+                self.block_state_in_doubt(
+                    id,
+                    format!(
+                        "attach failed: {attach_error:#}; VMM cleanup failed: {rollback_error:#}"
+                    ),
+                )
+            }
+        }
+    }
+
     pub fn remove_block_device(&self, id: &str, timeout: Duration) -> Result<()> {
         info!(sl!(), "remove block device {}", id);
+
+        if self.resolve_pending_block_remove(id)? {
+            return Ok(());
+        }
 
         let vmmdata = self
             .handle_request(Request::Sync(VmmAction::PrepareRemoveBlockDevice(
@@ -335,10 +488,130 @@ impl VmmInstance {
             )))
             .with_context(|| format!("Failed to prepare remove block device {id:?}"))?;
 
-        if let VmmData::SyncHotplug((_, receiver)) = vmmdata {
-            let _ = receiver.recv_timeout(timeout)?;
+        if let VmmData::SyncBlockHotplug((_, receiver)) = vmmdata {
+            match receiver.recv_timeout(timeout) {
+                Ok(Ok(_)) => {}
+                Ok(Err(BlockHotplugError::Rejected(error))) => {
+                    return Err(anyhow!(error));
+                }
+                Ok(Err(BlockHotplugError::OutcomeUnknown(reason))) => {
+                    self.store_pending_block_operation(id, PendingBlockOperation::RemoveUnknown);
+                    return Err(self.block_state_in_doubt(id, reason));
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    self.store_pending_block_operation(id, PendingBlockOperation::Remove(receiver));
+                    return Err(self.block_state_in_doubt(
+                        id,
+                        format!(
+                            "guest remove response did not arrive within {} ms; Dragonball cannot cancel the request",
+                            timeout.as_millis()
+                        ),
+                    ));
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    self.store_pending_block_operation(id, PendingBlockOperation::Remove(receiver));
+                    return Err(self.block_state_in_doubt(
+                        id,
+                        "guest remove response channel disconnected before the operation resolved",
+                    ));
+                }
+            }
         }
 
+        self.finish_vmm_block_cleanup(id)
+    }
+
+    fn resolve_pending_block_remove(&self, id: &str) -> Result<bool> {
+        let Some(operation) = self.take_pending_block_operation(id) else {
+            return Ok(false);
+        };
+
+        match operation {
+            PendingBlockOperation::Add(receiver) => match receiver.try_recv() {
+                Ok(Ok(_)) => Ok(false),
+                Ok(Err(BlockHotplugError::Rejected(_))) => {
+                    self.finish_vmm_block_cleanup(id)?;
+                    Ok(true)
+                }
+                Ok(Err(BlockHotplugError::OutcomeUnknown(reason))) => {
+                    self.store_pending_block_operation(id, PendingBlockOperation::AddUnknown);
+                    Err(self.block_state_in_doubt(id, reason))
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    self.store_pending_block_operation(id, PendingBlockOperation::Add(receiver));
+                    Err(self.block_state_in_doubt(
+                        id,
+                        "guest add response remains pending; retry after the guest responds",
+                    ))
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.store_pending_block_operation(id, PendingBlockOperation::Add(receiver));
+                    Err(self.block_state_in_doubt(
+                        id,
+                        "guest add response channel disconnected before the operation resolved",
+                    ))
+                }
+            },
+            PendingBlockOperation::Remove(receiver) => match receiver.try_recv() {
+                Ok(Ok(_)) => {
+                    self.finish_vmm_block_cleanup(id)?;
+                    Ok(true)
+                }
+                Ok(Err(BlockHotplugError::Rejected(error))) => Err(anyhow!(error)),
+                Ok(Err(BlockHotplugError::OutcomeUnknown(reason))) => {
+                    self.store_pending_block_operation(id, PendingBlockOperation::RemoveUnknown);
+                    Err(self.block_state_in_doubt(id, reason))
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    self.store_pending_block_operation(id, PendingBlockOperation::Remove(receiver));
+                    Err(self.block_state_in_doubt(
+                        id,
+                        "guest remove response remains pending; retry after the guest responds",
+                    ))
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.store_pending_block_operation(id, PendingBlockOperation::Remove(receiver));
+                    Err(self.block_state_in_doubt(
+                        id,
+                        "guest remove response channel disconnected before the operation resolved",
+                    ))
+                }
+            },
+            PendingBlockOperation::Cleanup => {
+                self.finish_vmm_block_cleanup(id)?;
+                Ok(true)
+            }
+            PendingBlockOperation::AddUnknown => {
+                self.store_pending_block_operation(id, PendingBlockOperation::AddUnknown);
+                Err(self.block_state_in_doubt(
+                    id,
+                    "guest add outcome remains unknown until the VM stops",
+                ))
+            }
+            PendingBlockOperation::RemoveUnknown => {
+                self.store_pending_block_operation(id, PendingBlockOperation::RemoveUnknown);
+                Err(self.block_state_in_doubt(
+                    id,
+                    "guest remove outcome remains unknown until the VM stops",
+                ))
+            }
+        }
+    }
+
+    fn finish_vmm_block_cleanup(&self, id: &str) -> Result<()> {
+        match self.remove_vmm_block_device(id) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                self.store_pending_block_operation(id, PendingBlockOperation::Cleanup);
+                Err(self.block_state_in_doubt(
+                    id,
+                    format!("VMM block cleanup remains incomplete: {error:#}"),
+                ))
+            }
+        }
+    }
+
+    fn remove_vmm_block_device(&self, id: &str) -> Result<()> {
         self.handle_request(Request::Sync(VmmAction::RemoveBlockDevice(id.to_string())))
             .with_context(|| format!("Failed to remove block device {id:?}"))?;
         Ok(())
@@ -459,6 +732,7 @@ impl VmmInstance {
         // vmm is not running, join thread will be hang.
         if self.is_uninitialized() || self.vmm_thread.is_none() {
             debug!(sl!(), "vmm-master thread is uninitialized or has exited.");
+            self.finish_pending_block_operations_after_stop();
             self.clear_vmm_netns();
             return Ok(());
         }
@@ -467,9 +741,61 @@ impl VmmInstance {
         // vmm_thread must be exited, otherwise there will be other sync issues.
         // unwrap is safe, if vmm_thread is None, impossible run to here.
         self.vmm_thread.take().unwrap().join().ok();
+        self.finish_pending_block_operations_after_stop();
         self.clear_vmm_netns();
         info!(sl!(), "vmm-master thread join succeed.");
         Ok(())
+    }
+
+    fn finish_pending_block_operations_after_stop(&self) {
+        let pending = self
+            .pending_block_operations
+            .lock()
+            .expect("pending block operation mutex poisoned")
+            .drain()
+            .map(|(id, _)| id)
+            .collect::<Vec<_>>();
+        if !pending.is_empty() {
+            info!(
+                sl!(),
+                "finalized pending block operations after VM stop: {:?}", pending
+            );
+        }
+    }
+
+    fn take_pending_block_operation(&self, id: &str) -> Option<PendingBlockOperation> {
+        self.pending_block_operations
+            .lock()
+            .expect("pending block operation mutex poisoned")
+            .remove(id)
+    }
+
+    fn store_pending_block_operation(&self, id: &str, operation: PendingBlockOperation) {
+        self.pending_block_operations
+            .lock()
+            .expect("pending block operation mutex poisoned")
+            .insert(id.to_string(), operation);
+    }
+
+    fn block_state_in_doubt(&self, id: &str, reason: impl Into<String>) -> anyhow::Error {
+        anyhow::Error::new(DeviceStateInDoubt::new(id, reason))
+    }
+
+    fn map_block_insert_error(&self, id: &str, error: anyhow::Error) -> anyhow::Error {
+        let rollback_incomplete = error.chain().any(|cause| {
+            matches!(
+                cause.downcast_ref::<VmmActionError>(),
+                Some(VmmActionError::Block(
+                    BlockDeviceError::RollbackIncomplete { .. }
+                ))
+            )
+        });
+        if rollback_incomplete {
+            self.store_pending_block_operation(id, PendingBlockOperation::Cleanup);
+            self.block_state_in_doubt(id, format!("{error:#}"))
+        } else {
+            error
+        }
     }
 
     fn send_request(&self, vmm_action: VmmAction) -> Result<VmmResponse> {

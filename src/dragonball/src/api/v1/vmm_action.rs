@@ -309,6 +309,24 @@ pub enum VmmAction {
     RemoveHostDevice(String),
 }
 
+/// Failure returned by a synchronous block-device hot-plug operation.
+#[derive(Debug, Eq, PartialEq)]
+pub enum BlockHotplugError {
+    /// The guest returned a definitive rejection.
+    Rejected(String),
+    /// The transport failed before the guest outcome became known.
+    OutcomeUnknown(String),
+}
+
+/// Result returned by a synchronous block-device hot-plug operation.
+pub type BlockHotplugResult = std::result::Result<Option<i32>, BlockHotplugError>;
+
+/// Channel pair used to wait for a block-device hot-plug result.
+pub type SyncBlockHotplug = (
+    mpsc::Sender<BlockHotplugResult>,
+    mpsc::Receiver<BlockHotplugResult>,
+);
+
 /// The enum represents the response sent by the VMM in case of success. The response is either
 /// empty, when no data needs to be sent, or an internal VMM structure.
 #[derive(Debug)]
@@ -323,6 +341,9 @@ pub enum VmmData {
     VfioDeviceData(Option<u8>),
     /// Sync Hotplug
     SyncHotplug((mpsc::Sender<Option<i32>>, mpsc::Receiver<Option<i32>>)),
+    /// Synchronous block-device hot-plug result. The inner value is the guest
+    /// device identity when the operation returns one.
+    SyncBlockHotplug(SyncBlockHotplug),
 }
 
 /// Request data type used to communicate between the API and the VMM.
@@ -780,7 +801,7 @@ impl VmmService {
 
         let (sender, receiver) = mpsc::channel();
         let vmm_data = if ctx.is_hotplug() {
-            VmmData::SyncHotplug((sender.clone(), receiver))
+            VmmData::SyncBlockHotplug((sender.clone(), receiver))
         } else {
             VmmData::Empty
         };
@@ -837,7 +858,7 @@ impl VmmService {
         vm.device_manager_mut()
             .block_manager
             .prepare_remove_device(&ctx, blockdev_id, sender.clone())
-            .map(|_| VmmData::SyncHotplug((sender, receiver)))
+            .map(|_| VmmData::SyncBlockHotplug((sender, receiver)))
             .map_err(VmmActionError::Block)
     }
 
