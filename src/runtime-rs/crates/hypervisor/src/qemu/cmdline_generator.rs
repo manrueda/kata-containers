@@ -444,7 +444,7 @@ pub struct CcwSubChannel {
 }
 
 impl CcwSubChannel {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self {
             devices: HashMap::new(),
             addr: 0,

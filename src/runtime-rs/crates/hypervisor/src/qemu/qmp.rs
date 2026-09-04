@@ -9,6 +9,7 @@ use crate::qemu::cmdline_generator::{CcwSubChannel, DeviceVirtioNet, Netdev, QMP
 use crate::utils::get_jailer_root;
 use crate::VcpuThreadIds;
 use crate::VmdkConfig;
+use crate::{BlockCleanupState, BlockDeviceCleanupPending};
 
 use anyhow::{anyhow, Context, Result};
 use kata_types::config::hypervisor::{VIRTIO_BLK_CCW, VIRTIO_SCSI};
@@ -25,14 +26,38 @@ use std::collections::HashMap;
 use std::convert::TryFrom;
 use std::fmt::{Debug, Error, Formatter};
 use std::io::BufReader;
+use std::net::Shutdown;
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::str::FromStr;
 use std::time::Duration;
 
-use qapi_spec::Dictionary;
+use qapi_spec::{Dictionary, ErrorClass};
 use std::thread;
 use std::time::Instant;
+
+type QmpConnection = qapi::Qmp<qapi::Stream<BufReader<UnixStream>, UnixStream>>;
+
+#[derive(serde::Serialize)]
+struct QueryNamedBlockNodes {
+    flat: bool,
+}
+
+impl qapi_spec::Command for QueryNamedBlockNodes {
+    const NAME: &'static str = "query-named-block-nodes";
+    const ALLOW_OOB: bool = false;
+    type Ok = Vec<serde_json::Value>;
+}
+
+enum QmpResidue {
+    Frontend,
+    Backend,
+}
+
+enum ReconciledAdd {
+    Applied,
+    Absent(anyhow::Error),
+}
 
 /// default qmp connection read timeout
 const DEFAULT_QMP_READ_TIMEOUT: u64 = 250;
@@ -41,6 +66,39 @@ const DEFAULT_QMP_CONNECT_DEADLINE_MS: u64 = 50000;
 const DEFAULT_QMP_RETRY_SLEEP_MS: u64 = 50;
 
 const DEVICE_DELETED_TIMEOUT: Duration = Duration::from_secs(10);
+
+fn incomplete_block_cleanup(
+    node_name: &str,
+    primary_error: impl std::fmt::Display,
+    cleanup_error: impl std::fmt::Display,
+    state: BlockCleanupState,
+) -> anyhow::Error {
+    BlockDeviceCleanupPending::with_state(
+        node_name,
+        format!("{primary_error}; rollback failed: {cleanup_error}"),
+        state,
+    )
+    .into()
+}
+
+fn cleanup_state_error(
+    node_name: &str,
+    error: impl std::fmt::Display,
+    state: BlockCleanupState,
+) -> anyhow::Error {
+    BlockDeviceCleanupPending::with_state(node_name, error.to_string(), state).into()
+}
+
+fn find_fd_by_opaque(fdsets: &[qmp::FdsetInfo], opaque: &str) -> Option<qmp::AddfdInfo> {
+    fdsets.iter().find_map(|fdset| {
+        fdset.fds.iter().find_map(|fd| {
+            (fd.opaque.as_deref() == Some(opaque)).then_some(qmp::AddfdInfo {
+                fd: fd.fd,
+                fdset_id: fdset.fdset_id,
+            })
+        })
+    })
+}
 
 fn collect_block_fdsets(fdsets: Vec<qmp::FdsetInfo>) -> HashMap<String, Vec<i64>> {
     let mut block_fdsets: HashMap<String, Vec<i64>> = HashMap::new();
@@ -59,7 +117,8 @@ fn collect_block_fdsets(fdsets: Vec<qmp::FdsetInfo>) -> HashMap<String, Vec<i64>
 }
 
 pub struct Qmp {
-    qmp: qapi::Qmp<qapi::Stream<BufReader<UnixStream>, UnixStream>>,
+    qmp: QmpConnection,
+    qmp_sock_path: Option<String>,
 
     // This is basically the output of
     // `cat /sys/devices/system/memory/block_size_bytes`
@@ -100,25 +159,14 @@ impl Debug for Qmp {
 impl Qmp {
     pub fn new(qmp_sock_path: &str) -> Result<Self> {
         let try_new_once_fn = || -> Result<Qmp> {
-            let stream = UnixStream::connect(qmp_sock_path)?;
-
-            stream
-                .set_read_timeout(Some(Duration::from_millis(DEFAULT_QMP_INIT_READ_TIMEOUT)))
-                .context("set qmp read timeout")?;
-
             let mut qmp = Qmp {
-                qmp: qapi::Qmp::new(qapi::Stream::new(
-                    BufReader::new(stream.try_clone()?),
-                    stream,
-                )),
+                qmp: Self::connect(qmp_sock_path)?,
+                qmp_sock_path: Some(qmp_sock_path.to_string()),
                 guest_memory_block_size: 0,
                 ccw_subchannel: None,
                 pci_bridge_devices: HashMap::new(),
                 block_fdsets: HashMap::new(),
             };
-
-            let info = qmp.qmp.handshake().context("qmp handshake failed")?;
-            info!(sl!(), "QMP initialized: {:#?}", info);
             qmp.refresh_block_fdsets()?;
 
             Ok(qmp)
@@ -142,6 +190,34 @@ impl Qmp {
             .with_context(|| format!("timed out waiting for QMP ready: {}", qmp_sock_path))
     }
 
+    fn connect(qmp_sock_path: &str) -> Result<QmpConnection> {
+        let stream = UnixStream::connect(qmp_sock_path)?;
+        stream
+            .set_read_timeout(Some(Duration::from_millis(DEFAULT_QMP_INIT_READ_TIMEOUT)))
+            .context("set qmp read timeout")?;
+        let mut qmp = qapi::Qmp::new(qapi::Stream::new(
+            BufReader::new(stream.try_clone()?),
+            stream,
+        ));
+        let info = qmp.handshake().context("qmp handshake failed")?;
+        info!(sl!(), "QMP initialized: {:#?}", info);
+        Ok(qmp)
+    }
+
+    fn reconnect(&mut self) -> Result<()> {
+        let qmp_sock_path = self
+            .qmp_sock_path
+            .clone()
+            .ok_or_else(|| anyhow!("QMP socket path is unavailable for reconnection"))?;
+        let _ = self
+            .qmp
+            .inner_mut()
+            .get_mut_write()
+            .shutdown(Shutdown::Both);
+        self.qmp = Self::connect(&qmp_sock_path)?;
+        self.refresh_block_fdsets()
+    }
+
     fn refresh_block_fdsets(&mut self) -> Result<()> {
         let fdsets = self
             .qmp
@@ -149,6 +225,19 @@ impl Qmp {
             .context("query QEMU fdsets")?;
         self.block_fdsets = collect_block_fdsets(fdsets);
         Ok(())
+    }
+
+    fn refresh_block_fdsets_recovering(&mut self) -> Result<()> {
+        match self.qmp.execute(&qmp::query_fdsets {}) {
+            Ok(fdsets) => {
+                self.block_fdsets = collect_block_fdsets(fdsets);
+                Ok(())
+            }
+            Err(qapi::ExecuteError::Qapi(error)) => {
+                Err(anyhow!("QEMU rejected query-fdsets: {error}"))
+            }
+            Err(qapi::ExecuteError::Io(_)) => self.reconnect(),
+        }
     }
 
     pub fn verify_block_fdsets(&self, mut expected: HashMap<String, Vec<i64>>) -> Result<()> {
@@ -892,11 +981,12 @@ impl Qmp {
     }
 
     fn pass_block_fd(&mut self, fd: RawFd, opaque: &str) -> Result<qmp::AddfdInfo> {
-        let command = serde_json::json!({
+        let mut command = serde_json::json!({
             "execute": "add-fd",
             "arguments": { "opaque": opaque },
         })
         .to_string();
+        command.push('\n');
         let bufs = &mut [std::io::IoSlice::new(command.as_bytes())][..];
         let fds = [fd];
         let cmsg = [ControlMessage::ScmRights(&fds)];
@@ -910,36 +1000,341 @@ impl Qmp {
         )
         .with_context(|| format!("send QEMU block fd for {opaque}"))?;
 
-        self.qmp
-            .read_response::<&qmp::add_fd>()
-            .with_context(|| format!("add QEMU block fd for {opaque}"))
+        match self.qmp.read_response::<&qmp::add_fd>() {
+            Ok(info) => Ok(info),
+            Err(qapi::ExecuteError::Qapi(error)) => {
+                Err(anyhow!("QEMU rejected add-fd for {opaque}: {error}"))
+            }
+            Err(qapi::ExecuteError::Io(error)) => {
+                let node_name = block_fd_node_name(opaque).unwrap_or("unknown-block-device");
+                let state = BlockCleanupState {
+                    frontend: false,
+                    backend: false,
+                    fdsets: true,
+                };
+                self.reconnect().map_err(|reconnect_error| {
+                    cleanup_state_error(
+                        node_name,
+                        format!(
+                            "add-fd response was lost: {error}; QMP reconnection failed: {reconnect_error}"
+                        ),
+                        state,
+                    )
+                })?;
+                let fdsets = self.qmp.execute(&qmp::query_fdsets {}).map_err(|query_error| {
+                    cleanup_state_error(
+                        node_name,
+                        format!(
+                            "add-fd response was lost: {error}; fdset discovery failed: {query_error}"
+                        ),
+                        state,
+                    )
+                })?;
+                self.block_fdsets = collect_block_fdsets(fdsets.clone());
+                find_fd_by_opaque(&fdsets, opaque).ok_or_else(|| {
+                    anyhow!(
+                        "add-fd response was lost for {opaque}, and QEMU confirms the fd is absent"
+                    )
+                })
+            }
+        }
     }
 
-    fn remove_block_fdsets(&mut self, node_name: &str) {
+    fn remove_block_fdsets(&mut self, node_name: &str) -> Result<()> {
         let Some(fdset_ids) = self.block_fdsets.remove(node_name) else {
-            return;
+            return Ok(());
         };
 
-        self.remove_fdset_ids(node_name, fdset_ids);
+        self.remove_fdset_ids(node_name, fdset_ids)
     }
 
-    fn remove_fdset_ids(&mut self, node_name: &str, fdset_ids: Vec<i64>) {
+    fn remove_fdset_ids(&mut self, node_name: &str, fdset_ids: Vec<i64>) -> Result<()> {
         let mut failed = Vec::new();
         for fdset_id in fdset_ids {
-            if let Err(err) = self.qmp.execute(&qmp::remove_fd { fd: None, fdset_id }) {
+            let result = self.qmp.execute(&qmp::remove_fd { fd: None, fdset_id });
+            if matches!(&result, Err(qapi::ExecuteError::Io(_))) && self.reconnect().is_err() {
+                failed.push(fdset_id);
+                continue;
+            }
+            let fdsets = match self.qmp.execute(&qmp::query_fdsets {}) {
+                Ok(fdsets) => fdsets,
+                Err(error) => {
+                    warn!(
+                        sl!(),
+                        "failed to verify QEMU fdset {} removal for {}: {:?}",
+                        fdset_id,
+                        node_name,
+                        error
+                    );
+                    failed.push(fdset_id);
+                    continue;
+                }
+            };
+            let remains = fdsets.iter().any(|fdset| fdset.fdset_id == fdset_id);
+            self.block_fdsets = collect_block_fdsets(fdsets);
+            if remains {
                 warn!(
                     sl!(),
-                    "failed to remove QEMU block fdset {} for {}: {:?}", fdset_id, node_name, err
+                    "QEMU block fdset {} for {} remains after remove-fd: {:?}",
+                    fdset_id,
+                    node_name,
+                    result
                 );
                 failed.push(fdset_id);
             }
         }
         if !failed.is_empty() {
-            self.block_fdsets
-                .entry(node_name.to_string())
-                .or_default()
-                .extend(failed);
+            let ids = self.block_fdsets.entry(node_name.to_string()).or_default();
+            ids.extend(failed.iter().copied());
+            ids.sort_unstable();
+            ids.dedup();
+            return Err(anyhow!(
+                "failed to remove QEMU fdsets {:?} for {}",
+                failed,
+                node_name
+            ));
         }
+
+        Ok(())
+    }
+
+    fn cleanup_block_backend(&mut self, node_name: &str) -> Result<()> {
+        self.cleanup_pending_block_device(
+            node_name,
+            BlockCleanupState {
+                frontend: false,
+                backend: true,
+                fdsets: self.block_fdsets.contains_key(node_name),
+            },
+        )
+    }
+
+    fn frontend_exists(&mut self, node_name: &str) -> Result<bool> {
+        let devices = self.qmp.execute(&qapi_qmp::qom_list {
+            path: "/machine/peripheral".to_string(),
+        })?;
+        Ok(devices.iter().any(|device| device.name == node_name))
+    }
+
+    fn block_backend_exists(&mut self, node_name: &str) -> Result<bool> {
+        let nodes = self.qmp.execute(&QueryNamedBlockNodes { flat: true })?;
+        Ok(nodes
+            .iter()
+            .any(|node| node.get("node-name").and_then(|name| name.as_str()) == Some(node_name)))
+    }
+
+    fn reconcile_ambiguous_add(
+        &mut self,
+        node_name: &str,
+        operation: &str,
+        error: std::io::Error,
+        state: BlockCleanupState,
+        residue: QmpResidue,
+    ) -> Result<bool> {
+        self.reconnect().map_err(|reconnect_error| {
+            cleanup_state_error(
+                node_name,
+                format!(
+                    "{operation} response was lost: {error}; QMP reconnection failed: {reconnect_error}"
+                ),
+                state,
+            )
+        })?;
+        let discovered = match residue {
+            QmpResidue::Frontend => self.frontend_exists(node_name),
+            QmpResidue::Backend => self.block_backend_exists(node_name),
+        };
+        discovered.map_err(|query_error| {
+            cleanup_state_error(
+                node_name,
+                format!(
+                    "{operation} response was lost: {error}; state discovery failed: {query_error}"
+                ),
+                state,
+            )
+        })
+    }
+
+    fn reconcile_add_result(
+        &mut self,
+        node_name: &str,
+        operation: &str,
+        result: std::result::Result<qapi_spec::Empty, qapi::ExecuteError>,
+        state: BlockCleanupState,
+        residue: QmpResidue,
+    ) -> Result<ReconciledAdd> {
+        match result {
+            Ok(_) => Ok(ReconciledAdd::Applied),
+            Err(qapi::ExecuteError::Qapi(error)) => Ok(ReconciledAdd::Absent(anyhow!(
+                "QEMU rejected {operation} for {node_name}: {error}"
+            ))),
+            Err(qapi::ExecuteError::Io(error)) => {
+                if self.reconcile_ambiguous_add(node_name, operation, error, state, residue)? {
+                    Ok(ReconciledAdd::Applied)
+                } else {
+                    Ok(ReconciledAdd::Absent(anyhow!(
+                        "{operation} response was lost for {node_name}, and QEMU confirms the resource is absent"
+                    )))
+                }
+            }
+        }
+    }
+
+    fn cleanup_pending_block_device(
+        &mut self,
+        node_name: &str,
+        state: BlockCleanupState,
+    ) -> Result<()> {
+        self.cleanup_pending_block_device_with_timeout(node_name, state, DEVICE_DELETED_TIMEOUT)
+    }
+
+    fn cleanup_pending_block_device_with_timeout(
+        &mut self,
+        node_name: &str,
+        mut state: BlockCleanupState,
+        device_deleted_timeout: Duration,
+    ) -> Result<()> {
+        state.fdsets |= self.block_fdsets.contains_key(node_name);
+
+        if state.frontend {
+            match self.qmp.execute(&qmp::device_del {
+                id: node_name.to_string(),
+            }) {
+                Ok(_) => {
+                    if let Err(wait_err) =
+                        self.wait_for_device_deleted(node_name, device_deleted_timeout)
+                    {
+                        if let Err(reconnect_error) = self.reconnect() {
+                            return Err(cleanup_state_error(
+                                node_name,
+                                format!(
+                                    "{wait_err}; QMP reconnection before frontend discovery failed: {reconnect_error}"
+                                ),
+                                state,
+                            ));
+                        }
+                        match self.frontend_exists(node_name) {
+                            Ok(false) => state.frontend = false,
+                            Ok(true) => {
+                                return Err(cleanup_state_error(node_name, wait_err, state));
+                            }
+                            Err(query_err) => {
+                                return Err(cleanup_state_error(
+                                    node_name,
+                                    format!(
+                                    "{wait_err}; failed to verify frontend removal: {query_err}"
+                                ),
+                                    state,
+                                ));
+                            }
+                        }
+                    } else {
+                        state.frontend = false;
+                    }
+                }
+                Err(device_del_err) => {
+                    if matches!(
+                        &device_del_err,
+                        qapi::ExecuteError::Qapi(qapi_error)
+                            if qapi_error.class == ErrorClass::DeviceNotFound
+                    ) {
+                        state.frontend = false;
+                    } else {
+                        if matches!(&device_del_err, qapi::ExecuteError::Io(_)) {
+                            self.reconnect().map_err(|reconnect_error| {
+                                cleanup_state_error(
+                                    node_name,
+                                    format!(
+                                        "{device_del_err}; QMP reconnection before frontend discovery failed: {reconnect_error}"
+                                    ),
+                                    state,
+                                )
+                            })?;
+                        }
+                        match self.frontend_exists(node_name) {
+                            Ok(false) => state.frontend = false,
+                            Ok(true) => {
+                                return Err(cleanup_state_error(node_name, device_del_err, state));
+                            }
+                            Err(query_err) => {
+                                return Err(cleanup_state_error(
+                                    node_name,
+                                    format!(
+                                        "{device_del_err}; failed to verify frontend state: {query_err}"
+                                    ),
+                                    state,
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if state.backend {
+            if let Err(blockdev_del_err) = self.qmp.execute(&qapi_qmp::blockdev_del {
+                node_name: node_name.to_string(),
+            }) {
+                if matches!(
+                    &blockdev_del_err,
+                    qapi::ExecuteError::Qapi(qapi_error)
+                        if qapi_error.class == ErrorClass::DeviceNotFound
+                ) {
+                    state.backend = false;
+                } else {
+                    if matches!(&blockdev_del_err, qapi::ExecuteError::Io(_)) {
+                        self.reconnect().map_err(|reconnect_error| {
+                            cleanup_state_error(
+                                node_name,
+                                format!(
+                                    "{blockdev_del_err}; QMP reconnection before backend discovery failed: {reconnect_error}"
+                                ),
+                                state,
+                            )
+                        })?;
+                    }
+                    match self.block_backend_exists(node_name) {
+                        Ok(false) => {}
+                        Ok(true) => {
+                            return Err(cleanup_state_error(node_name, blockdev_del_err, state));
+                        }
+                        Err(query_err) => {
+                            return Err(cleanup_state_error(
+                                node_name,
+                                format!(
+                                    "{blockdev_del_err}; failed to verify backend state: {query_err}"
+                                ),
+                                state,
+                            ));
+                        }
+                    }
+                }
+            }
+            state.backend = false;
+        }
+
+        if state.fdsets {
+            self.refresh_block_fdsets_recovering()
+                .map_err(|error| cleanup_state_error(node_name, error, state))?;
+            if !self.block_fdsets.contains_key(node_name) {
+                state.fdsets = false;
+            }
+            if let Err(err) = self.remove_block_fdsets(node_name) {
+                state.fdsets = self.block_fdsets.contains_key(node_name);
+                return Err(cleanup_state_error(node_name, err, state));
+            }
+            state.fdsets = false;
+        }
+
+        if !state.is_complete() {
+            return Err(cleanup_state_error(
+                node_name,
+                "cleanup state remains incomplete",
+                state,
+            ));
+        }
+
+        Ok(())
     }
 
     pub fn hotplug_network_device(
@@ -1108,6 +1503,49 @@ impl Qmp {
         Err(anyhow!("no target device found"))
     }
 
+    fn get_root_port_device_path(&mut self, qdev_id: &str, root_port: &str) -> Result<PciPath> {
+        let device_path = format!("/machine/peripheral/{qdev_id}");
+        let parent_bus = self
+            .qmp
+            .execute(&qapi_qmp::qom_get {
+                path: device_path.clone(),
+                property: "parent_bus".to_string(),
+            })?
+            .as_str()
+            .map(str::to_string)
+            .ok_or_else(|| anyhow!("QEMU returned a non-string parent bus for {qdev_id}"))?;
+        let expected_parent = format!("/machine/peripheral/{root_port}/{root_port}");
+        if parent_bus != expected_parent {
+            return Err(anyhow!(
+                "QEMU attached {qdev_id} to {parent_bus}, expected {expected_parent}"
+            ));
+        }
+
+        let device_addr = self
+            .qmp
+            .execute(&qapi_qmp::qom_get {
+                path: device_path,
+                property: "addr".to_string(),
+            })?
+            .as_i64()
+            .ok_or_else(|| anyhow!("QEMU returned a non-integer PCI address for {qdev_id}"))?;
+        let root_addr = self
+            .qmp
+            .execute(&qapi_qmp::qom_get {
+                path: format!("/machine/peripheral/{root_port}"),
+                property: "addr".to_string(),
+            })?
+            .as_i64()
+            .ok_or_else(|| anyhow!("QEMU returned a non-integer PCI address for {root_port}"))?;
+        if device_addr < 0 || root_addr < 0 {
+            return Err(anyhow!(
+                "QEMU returned a negative PCI address for {qdev_id} or {root_port}"
+            ));
+        }
+
+        PciPath::try_from(format!("{:02x}/{:02x}", root_addr >> 3, device_addr >> 3).as_str())
+    }
+
     /// Execute device_add for a block device. On failure, automatically
     /// rolls back the blockdev node added earlier to avoid orphaned resources.
     fn device_add_with_rollback(
@@ -1117,41 +1555,87 @@ impl Qmp {
         driver: &str,
         arguments: Dictionary,
     ) -> Result<()> {
-        if let Err(e) = self.qmp.execute(&qmp::device_add {
+        let result = self.qmp.execute(&qmp::device_add {
             bus,
             id: Some(node_name.to_owned()),
             driver: driver.to_owned(),
             arguments,
-        }) {
-            if let Err(blockdev_err) = self.qmp.execute(&qapi_qmp::blockdev_del {
-                node_name: node_name.to_owned(),
-            }) {
-                warn!(
-                    sl!(),
-                    "device_add_with_rollback(): blockdev_del failed for {}: {:?}",
-                    node_name,
-                    blockdev_err
-                );
-            } else {
-                self.remove_block_fdsets(node_name);
-            }
-            return Err(anyhow!("device_add {:?}", e));
+        });
+        let state = BlockCleanupState::attached(self.block_fdsets.contains_key(node_name));
+        let error = match self.reconcile_add_result(
+            node_name,
+            "device_add",
+            result,
+            state,
+            QmpResidue::Frontend,
+        )? {
+            ReconciledAdd::Applied => return Ok(()),
+            ReconciledAdd::Absent(error) => error,
+        };
+        if let Err(cleanup_error) = self.cleanup_block_backend(node_name) {
+            return Err(cleanup_error.context(error.to_string()));
         }
-        Ok(())
+        Err(error)
     }
 
     fn wait_for_device_deleted(&mut self, device_id: &str, timeout: Duration) -> Result<()> {
         const POLL_INTERVAL: Duration = Duration::from_millis(100);
         let deadline = Instant::now() + timeout;
 
-        self.qmp
-            .inner_mut()
-            .get_mut_write()
-            .set_read_timeout(Some(timeout))?;
-
         let result = loop {
-            if let Err(e) = self.qmp.nop() {
-                warn!(sl!(), "The QMP nop() failed for {}: {:?}", device_id, e);
+            let now = Instant::now();
+            if now >= deadline {
+                break Err(anyhow!(
+                    "timed out ({:?}) waiting for DEVICE_DELETED event for {}",
+                    timeout,
+                    device_id
+                ));
+            }
+            if let Err(error) = self
+                .qmp
+                .inner_mut()
+                .get_mut_write()
+                .set_read_timeout(Some(POLL_INTERVAL.min(deadline - now)))
+            {
+                break Err(error.into());
+            }
+
+            if let Err(poll_error) = self.qmp.nop() {
+                warn!(
+                    sl!(),
+                    "The QMP nop() failed for {}: {:?}", device_id, poll_error
+                );
+                if let Err(reconnect_error) = self.reconnect() {
+                    break Err(anyhow!(
+                        "QMP deletion poll failed for {device_id}: {poll_error}; QMP reconnection failed: {reconnect_error}"
+                    ));
+                }
+
+                let now = Instant::now();
+                if now >= deadline {
+                    break Err(anyhow!(
+                        "timed out ({:?}) waiting for DEVICE_DELETED event for {}",
+                        timeout,
+                        device_id
+                    ));
+                }
+                if let Err(error) = self
+                    .qmp
+                    .inner_mut()
+                    .get_mut_write()
+                    .set_read_timeout(Some(deadline - now))
+                {
+                    break Err(error.into());
+                }
+                match self.frontend_exists(device_id) {
+                    Ok(false) => break Ok(()),
+                    Ok(true) => continue,
+                    Err(query_error) => {
+                        break Err(anyhow!(
+                            "QMP deletion poll failed for {device_id}: {poll_error}; failed to verify frontend state after reconnection: {query_error}"
+                        ));
+                    }
+                }
             }
 
             let found = self.qmp.events().any(|event| {
@@ -1286,7 +1770,21 @@ impl Qmp {
         ) {
             Ok(source) => source,
             Err(err) => {
-                self.remove_fdset_ids(&node_name, fdset_ids);
+                if err.downcast_ref::<BlockDeviceCleanupPending>().is_some() {
+                    return Err(err);
+                }
+                if let Err(cleanup_err) = self.remove_fdset_ids(&node_name, fdset_ids) {
+                    return Err(incomplete_block_cleanup(
+                        &node_name,
+                        err,
+                        cleanup_err,
+                        BlockCleanupState {
+                            frontend: false,
+                            backend: false,
+                            fdsets: true,
+                        },
+                    ));
+                }
                 return Err(err);
             }
         };
@@ -1367,8 +1865,35 @@ impl Qmp {
             self.block_fdsets.insert(node_name.clone(), fdset_ids);
         }
 
-        if let Err(err) = self.qmp.execute(&qapi_qmp::blockdev_add(blockdev_options)) {
-            self.remove_block_fdsets(&node_name);
+        let blockdev_result = self.qmp.execute(&qapi_qmp::blockdev_add(blockdev_options));
+        let state = BlockCleanupState {
+            frontend: false,
+            backend: true,
+            fdsets: self.block_fdsets.contains_key(&node_name),
+        };
+        let blockdev_error = match self.reconcile_add_result(
+            &node_name,
+            "blockdev-add",
+            blockdev_result,
+            state,
+            QmpResidue::Backend,
+        )? {
+            ReconciledAdd::Applied => None,
+            ReconciledAdd::Absent(error) => Some(error),
+        };
+        if let Some(err) = blockdev_error {
+            if let Err(cleanup_err) = self.remove_block_fdsets(&node_name) {
+                return Err(incomplete_block_cleanup(
+                    &node_name,
+                    err,
+                    cleanup_err,
+                    BlockCleanupState {
+                        frontend: false,
+                        backend: false,
+                        fdsets: true,
+                    },
+                ));
+            }
             return Err(anyhow!("blockdev-add backend {:?}", err));
         }
 
@@ -1433,26 +1958,22 @@ impl Qmp {
             let subchannel = match self.ccw_subchannel.as_mut() {
                 Some(sub) => sub,
                 None => {
-                    self.qmp.execute(&qapi_qmp::blockdev_del {
-                        node_name: node_name.to_owned(),
-                    })?;
-                    self.remove_block_fdsets(&node_name);
-
-                    return Err(anyhow!(
-                        "CCW subchannel not available for virtio-blk-ccw hotplug"
-                    ));
+                    let error = anyhow!("CCW subchannel not available for virtio-blk-ccw hotplug");
+                    if let Err(cleanup_err) = self.cleanup_block_backend(&node_name) {
+                        return Err(cleanup_err.context(error.to_string()));
+                    }
+                    return Err(error);
                 }
             };
 
             let slot = match subchannel.add_device(&node_name) {
                 Ok(s) => s,
                 Err(e) => {
-                    self.qmp.execute(&qapi_qmp::blockdev_del {
-                        node_name: node_name.to_owned(),
-                    })?;
-                    self.remove_block_fdsets(&node_name);
-
-                    return Err(anyhow!("CCW subchannel add_device failed: {:?}", e));
+                    let error = anyhow!("CCW subchannel add_device failed: {:?}", e);
+                    if let Err(cleanup_err) = self.cleanup_block_backend(&node_name) {
+                        return Err(cleanup_err.context(error.to_string()));
+                    }
+                    return Err(error);
                 }
             };
             let devno = subchannel.address_format_ccw(slot);
@@ -1492,14 +2013,8 @@ impl Qmp {
                 match select_block_pci_target(pcie_root_port, || self.find_free_slot()) {
                     Ok(value) => value,
                     Err(err) => {
-                        if self
-                            .qmp
-                            .execute(&qapi_qmp::blockdev_del {
-                                node_name: node_name.clone(),
-                            })
-                            .is_ok()
-                        {
-                            self.remove_block_fdsets(&node_name);
+                        if let Err(cleanup_err) = self.cleanup_block_backend(&node_name) {
+                            return Err(cleanup_err.context(err.to_string()));
                         }
                         return Err(err);
                     }
@@ -1534,9 +2049,17 @@ impl Qmp {
                 blkdev_add_args,
             )?;
 
-            let pci_path = self
-                .get_device_by_qdev_id(&node_name)
-                .context("get device by qdev_id failed")?;
+            let pci_path = if let Some(root_port) = pcie_root_port {
+                self.get_root_port_device_path(&node_name, root_port)
+            } else {
+                self.get_device_by_qdev_id(&node_name)
+            }
+            .context("get device by qdev_id failed");
+            let cleanup_state =
+                BlockCleanupState::attached(self.block_fdsets.contains_key(&node_name));
+            let pci_path = complete_pci_path_lookup(&node_name, pci_path, cleanup_state, || {
+                self.hotunplug_block_device(block_driver, index, Some(cleanup_state))
+            })?;
             if track_bridge_slot {
                 self.record_pci_bridge_slot(&bus, slot, &node_name);
             }
@@ -1550,51 +2073,23 @@ impl Qmp {
     }
 
     /// Hotunplug block device.
-    pub fn hotunplug_block_device(&mut self, block_driver: &str, index: u64) -> Result<()> {
+    pub fn hotunplug_block_device(
+        &mut self,
+        block_driver: &str,
+        index: u64,
+        cleanup_state: Option<BlockCleanupState>,
+    ) -> Result<()> {
         let node_name = block_node_name(index);
 
-        let result = (|| -> Result<()> {
-            // Remove the frontend device (virtio-blk-pci / scsi-hd / virtio-blk-ccw).
-            self.qmp
-                .execute(&qmp::device_del {
-                    id: node_name.clone(),
-                })
-                .map_err(|e| anyhow!("device_del for block device {}: {:?}", node_name, e))?;
-
-            // device_del is asynchronous — wait for the guest to acknowledge removal
-            // before tearing down the backend, otherwise blockdev_del may fail with
-            // "Node is still in use".
-            self.wait_for_device_deleted(&node_name, DEVICE_DELETED_TIMEOUT)
-                .context("hotunplug_block_device(): waiting for DEVICE_DELETED")?;
-
-            // Remove the blockdev backend node.
-            self.qmp
-                .execute(&qapi_qmp::blockdev_del {
-                    node_name: node_name.clone(),
-                })
-                .map_err(|e| anyhow!("blockdev_del for block device {}: {:?}", node_name, e))?;
-
-            self.remove_block_fdsets(&node_name);
-
-            Ok(())
-        })();
-
-        if let Err(ref e) = result {
-            warn!(
-                sl!(),
-                "hotunplug_block_device(): failed for {}, cleaning up CCW state: {:?}",
-                node_name,
-                e
-            );
-        }
-
-        // Clean up CCW subchannel state (s390x) on all paths.
-        if block_driver == VIRTIO_BLK_CCW {
+        let state = cleanup_state.unwrap_or_else(|| {
+            BlockCleanupState::attached(self.block_fdsets.contains_key(&node_name))
+        });
+        let result = self.cleanup_pending_block_device(&node_name, state);
+        if result.is_ok() && block_driver == VIRTIO_BLK_CCW {
             if let Some(ref mut subchannel) = self.ccw_subchannel {
                 let _ = subchannel.remove_device(&node_name);
             }
         }
-
         result?;
 
         info!(
@@ -1767,6 +2262,38 @@ fn is_flat_cpu_topology(driver: &str) -> bool {
 
 const PCI_BRIDGE_MAX_CAPACITY: i64 = 30;
 const PCI_BRIDGE_FIRST_HOTPLUG_SLOT: i64 = 1;
+
+fn complete_pci_path_lookup<Cleanup>(
+    node_name: &str,
+    lookup: Result<PciPath>,
+    cleanup_state: BlockCleanupState,
+    cleanup: Cleanup,
+) -> Result<PciPath>
+where
+    Cleanup: FnOnce() -> Result<()>,
+{
+    match lookup {
+        Ok(path) => Ok(path),
+        Err(lookup_err) => match cleanup() {
+            Ok(()) => Err(lookup_err),
+            Err(cleanup_err) => {
+                if cleanup_err
+                    .downcast_ref::<BlockDeviceCleanupPending>()
+                    .is_some()
+                {
+                    Err(cleanup_err.context(lookup_err.to_string()))
+                } else {
+                    Err(incomplete_block_cleanup(
+                        node_name,
+                        lookup_err,
+                        cleanup_err,
+                        cleanup_state,
+                    ))
+                }
+            }
+        },
+    }
+}
 
 fn select_block_pci_target<FindBridge>(
     pcie_root_port: Option<&str>,

@@ -1252,15 +1252,15 @@ impl QemuInner {
 
         match device {
             DeviceType::BlockModern(ref block_device) => {
-                let (index, driver_option) = {
+                let (index, driver_option, cleanup_state) = {
                     let cfg = &block_device.lock().await.config;
-                    (cfg.index, cfg.driver_option.clone())
+                    (cfg.index, cfg.driver_option.clone(), cfg.cleanup_state)
                 };
                 let driver = qemu_block_driver(
                     &driver_option,
                     &self.config.blockdev_info.block_device_driver,
                 )?;
-                qmp.hotunplug_block_device(&driver, index)
+                qmp.hotunplug_block_device(&driver, index, cleanup_state)
                     .context("hotunplug block device")?;
             }
             DeviceType::Network(_)

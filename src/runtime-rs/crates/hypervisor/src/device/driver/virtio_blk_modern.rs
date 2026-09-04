@@ -25,6 +25,53 @@ pub const VIRTIO_BLOCK_CCW: &str = "virtio-blk-ccw";
 pub const VIRTIO_PMEM: &str = "virtio-pmem";
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BlockCleanupState {
+    pub frontend: bool,
+    pub backend: bool,
+    pub fdsets: bool,
+}
+
+impl BlockCleanupState {
+    pub fn attached(fdsets: bool) -> Self {
+        Self {
+            frontend: true,
+            backend: true,
+            fdsets,
+        }
+    }
+
+    pub fn is_complete(self) -> bool {
+        !self.frontend && !self.backend && !self.fdsets
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("QEMU block device {node_name} cleanup remains incomplete: {details}")]
+pub struct BlockDeviceCleanupPending {
+    node_name: String,
+    details: String,
+    state: BlockCleanupState,
+}
+
+impl BlockDeviceCleanupPending {
+    pub fn with_state(
+        node_name: impl Into<String>,
+        details: impl Into<String>,
+        state: BlockCleanupState,
+    ) -> Self {
+        Self {
+            node_name: node_name.into(),
+            details: details.into(),
+            state,
+        }
+    }
+
+    pub fn state(&self) -> BlockCleanupState {
+        self.state
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum BlockDeviceAio {
     // IoUring is the Linux io_uring I/O implementation.
     #[default]
@@ -159,6 +206,9 @@ pub struct BlockConfigModern {
     /// Requires QEMU to hot-plug this device through a PCIe root port.
     pub use_pcie_root_port: bool,
 
+    /// Tracks exact QEMU residue after an incomplete attach rollback.
+    pub cleanup_state: Option<BlockCleanupState>,
+
     /// scsi_addr of the block device, in case the device is attached using SCSI driver
     /// scsi_addr is of the format SCSI-Id:LUN
     pub scsi_addr: Option<String>,
@@ -249,6 +299,18 @@ fn uses_qemu_pcie_root_port(
     Ok(topology.hypervisor_name == HYPERVISOR_QEMU)
 }
 
+fn pending_cleanup_state(error: &anyhow::Error) -> Option<BlockCleanupState> {
+    error.chain().find_map(|cause| {
+        cause
+            .downcast_ref::<BlockDeviceCleanupPending>()
+            .map(BlockDeviceCleanupPending::state)
+    })
+}
+
+fn cleanup_state_in_doubt(device_id: impl Into<String>, error: anyhow::Error) -> anyhow::Error {
+    anyhow::Error::new(DeviceStateInDoubt::new(device_id, error.to_string()))
+}
+
 #[async_trait]
 impl Device for BlockDeviceModernHandle {
     async fn attach(
@@ -256,6 +318,14 @@ impl Device for BlockDeviceModernHandle {
         pcie_topo: &mut Option<&mut PCIeTopology>,
         h: &dyn hypervisor,
     ) -> Result<()> {
+        if let Some(state) = self.inner.lock().await.config.cleanup_state {
+            let device_id = self.device_id().await;
+            return Err(anyhow::Error::new(DeviceStateInDoubt::new(
+                device_id,
+                format!("QEMU cleanup remains pending: {state:?}"),
+            )));
+        }
+
         if !self.attach_pending {
             // Increase the attach count and skip the hypervisor operation if
             // another owner already attached this device.
@@ -276,10 +346,11 @@ impl Device for BlockDeviceModernHandle {
             self.attach_pending = true;
         }
 
-        let use_pcie_root_port = match {
+        let root_port_result = {
             let inner = self.inner.lock().await;
             uses_qemu_pcie_root_port(&inner.config, pcie_topo.as_deref())
-        } {
+        };
+        let use_pcie_root_port = match root_port_result {
             Ok(use_root_port) => use_root_port,
             Err(error) => {
                 self.decrease_attach_count().await?;
@@ -307,6 +378,13 @@ impl Device for BlockDeviceModernHandle {
             Ok(_) => {
                 self.attach_pending = false;
                 Ok(())
+            }
+            Err(error) if pending_cleanup_state(&error).is_some() => {
+                let state = pending_cleanup_state(&error).expect("checked pending cleanup state");
+                let device_id = self.device_id().await;
+                self.inner.lock().await.config.cleanup_state = Some(state);
+                self.attach_pending = true;
+                Err(cleanup_state_in_doubt(device_id, error))
             }
             Err(error) if device_state_in_doubt(&error).is_some() => {
                 self.attach_pending = true;
@@ -357,10 +435,16 @@ impl Device for BlockDeviceModernHandle {
         {
             return Ok(None);
         }
-        if let Err(e) = h.remove_device(DeviceType::BlockModern(self.arc())).await {
+        if let Err(error) = h.remove_device(DeviceType::BlockModern(self.arc())).await {
             self.increase_attach_count().await?;
-            return Err(e);
+            if let Some(state) = pending_cleanup_state(&error) {
+                let device_id = self.device_id().await;
+                self.inner.lock().await.config.cleanup_state = Some(state);
+                return Err(cleanup_state_in_doubt(device_id, error));
+            }
+            return Err(error);
         }
+        self.inner.lock().await.config.cleanup_state = None;
         if self.inner.lock().await.config.pcie_root_port.is_some() {
             let device_id = self.device_id().await;
             let topology = pcie_topo.as_deref_mut().ok_or_else(|| {
