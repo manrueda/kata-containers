@@ -4,16 +4,20 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::HypervisorState;
-use crate::device::DeviceType;
-use crate::{Hypervisor, MemoryConfig, VcpuThreadIds};
+use crate::device::{device_state_in_doubt, DeviceStateInDoubt, DeviceType};
+use crate::{BlockDeviceModern, Hypervisor, MemoryConfig, VcpuThreadIds};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
+use futures::FutureExt;
 use kata_types::capabilities::{Capabilities, CapabilityBits};
 use kata_types::config::hypervisor::Hypervisor as HypervisorConfig;
 use persist::sandbox_persist::Persist;
 use std::collections::HashMap;
+use std::error::Error as StdError;
+use std::fmt;
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
-use tokio::sync::{mpsc, Mutex, RwLock};
+use tokio::sync::{mpsc, Mutex, Notify, RwLock};
 
 // Convenience macro to obtain the scope logger
 #[macro_export]
@@ -30,9 +34,92 @@ mod utils;
 
 use inner::CloudHypervisorInner;
 
+#[derive(Clone, Debug)]
+enum BlockAddOutcome {
+    Success(Box<DeviceType>),
+    Failure(Arc<anyhow::Error>),
+}
+
+impl BlockAddOutcome {
+    fn from_result(result: Result<DeviceType>) -> Self {
+        match result {
+            Ok(device) => Self::Success(Box::new(device)),
+            Err(error) => Self::Failure(Arc::new(error)),
+        }
+    }
+
+    fn is_in_doubt(&self) -> bool {
+        match self {
+            Self::Success(_) => false,
+            Self::Failure(error) => device_state_in_doubt(error).is_some(),
+        }
+    }
+
+    fn into_result(self) -> Result<DeviceType> {
+        match self {
+            Self::Success(device) => Ok(*device),
+            Self::Failure(error) => Err(anyhow::Error::new(SharedBlockAddError(error))),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct SharedBlockAddError(Arc<anyhow::Error>);
+
+impl fmt::Display for SharedBlockAddError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}", self.0)
+    }
+}
+
+impl StdError for SharedBlockAddError {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        Some(self.0.as_ref().as_ref())
+    }
+}
+
+#[derive(Debug, Default)]
+struct BlockAddOperation {
+    outcome: Mutex<Option<BlockAddOutcome>>,
+    completed: Notify,
+}
+
+impl BlockAddOperation {
+    async fn complete(&self, result: Result<DeviceType>) {
+        *self.outcome.lock().await = Some(BlockAddOutcome::from_result(result));
+        self.completed.notify_waiters();
+    }
+
+    async fn wait(&self) -> BlockAddOutcome {
+        loop {
+            let completed = self.completed.notified();
+            if let Some(outcome) = self.outcome.lock().await.as_ref().cloned() {
+                return outcome;
+            }
+            completed.await;
+        }
+    }
+}
+
+#[derive(Debug)]
+struct BlockAddState {
+    admission_open: bool,
+    operations: HashMap<String, Arc<BlockAddOperation>>,
+}
+
+impl Default for BlockAddState {
+    fn default() -> Self {
+        Self {
+            admission_open: true,
+            operations: HashMap::new(),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct CloudHypervisor {
     inner: Arc<RwLock<CloudHypervisorInner>>,
+    block_adds: Mutex<BlockAddState>,
     exit_waiter: Mutex<(mpsc::Receiver<i32>, i32)>,
 }
 
@@ -42,7 +129,79 @@ impl CloudHypervisor {
 
         Self {
             inner: Arc::new(RwLock::new(CloudHypervisorInner::new(Some(exit_notify)))),
+            block_adds: Mutex::new(BlockAddState::default()),
             exit_waiter: Mutex::new((exit_waiter, 0)),
+        }
+    }
+
+    async fn add_block_device(&self, device: Arc<Mutex<BlockDeviceModern>>) -> Result<DeviceType> {
+        let device_id = device.lock().await.device_id.clone();
+        let (operation, start) = {
+            let mut state = self.block_adds.lock().await;
+            if !state.admission_open {
+                return Err(anyhow::anyhow!(
+                    "Cloud Hypervisor block add for device {device_id} was not admitted because VM stop has begun"
+                ));
+            }
+            match state.operations.get(&device_id) {
+                Some(operation) => (operation.clone(), false),
+                None => {
+                    let operation = Arc::new(BlockAddOperation::default());
+                    state
+                        .operations
+                        .insert(device_id.clone(), operation.clone());
+                    (operation, true)
+                }
+            }
+        };
+
+        if start {
+            let inner = self.inner.clone();
+            let worker_operation = operation.clone();
+            let worker_device_id = device_id.clone();
+            tokio::spawn(async move {
+                let result = AssertUnwindSafe(async move {
+                    inner
+                        .write()
+                        .await
+                        .add_device(DeviceType::BlockModern(device))
+                        .await
+                })
+                .catch_unwind()
+                .await
+                .unwrap_or_else(|_| {
+                    Err(anyhow::Error::new(DeviceStateInDoubt::new(
+                        worker_device_id,
+                        "Cloud Hypervisor block attach worker panicked; cleanup remains pending",
+                    )))
+                });
+                worker_operation.complete(result).await;
+            });
+        }
+
+        let outcome = operation.wait().await;
+        if !outcome.is_in_doubt() {
+            let mut state = self.block_adds.lock().await;
+            if state
+                .operations
+                .get(&device_id)
+                .is_some_and(|active| Arc::ptr_eq(active, &operation))
+            {
+                state.operations.remove(&device_id);
+            }
+        }
+        outcome.into_result()
+    }
+
+    async fn close_block_add_admission_and_drain(&self) {
+        let operations = {
+            let mut state = self.block_adds.lock().await;
+            state.admission_open = false;
+            state.operations.values().cloned().collect::<Vec<_>>()
+        };
+
+        for operation in operations {
+            operation.wait().await;
         }
     }
 
@@ -77,6 +236,7 @@ impl Hypervisor for CloudHypervisor {
     }
 
     async fn stop_vm(&self) -> Result<()> {
+        self.close_block_add_admission_and_drain().await;
         let mut inner = self.inner.write().await;
         inner.stop_vm().await
     }
@@ -107,18 +267,38 @@ impl Hypervisor for CloudHypervisor {
     }
 
     async fn add_device(&self, device: DeviceType) -> Result<DeviceType> {
-        let mut inner = self.inner.write().await;
-        inner.add_device(device).await
+        match device {
+            DeviceType::BlockModern(device) => self.add_block_device(device).await,
+            device => {
+                let mut inner = self.inner.write().await;
+                inner.add_device(device).await
+            }
+        }
     }
 
     async fn remove_device(&self, device: DeviceType) -> Result<()> {
+        let block_device_id = match &device {
+            DeviceType::BlockModern(device) => Some(device.lock().await.device_id.clone()),
+            _ => None,
+        };
         let mut inner = self.inner.write().await;
-        inner.remove_device(device).await
+        let result = inner.remove_device(device).await;
+        drop(inner);
+        if result.is_ok() {
+            if let Some(device_id) = block_device_id {
+                self.block_adds.lock().await.operations.remove(&device_id);
+            }
+        }
+        result
     }
 
     async fn update_device(&self, device: DeviceType) -> Result<()> {
         let mut inner = self.inner.write().await;
         inner.update_device(device).await
+    }
+
+    fn block_device_add_is_independently_owned(&self) -> bool {
+        true
     }
 
     async fn get_agent_socket(&self) -> Result<String> {
@@ -234,6 +414,7 @@ impl Persist for CloudHypervisor {
         let inner = CloudHypervisorInner::restore(exit_notify, hypervisor_state).await?;
         Ok(Self {
             inner: Arc::new(RwLock::new(inner)),
+            block_adds: Mutex::new(BlockAddState::default()),
             exit_waiter: Mutex::new((exit_waiter, 0)),
         })
     }

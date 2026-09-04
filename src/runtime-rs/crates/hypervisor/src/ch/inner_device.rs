@@ -7,7 +7,7 @@
 use super::inner::CloudHypervisorInner;
 use crate::ch::utils::get_rootless_symlink_sandbox_jailer_root;
 use crate::device::pci_path::PciPath;
-use crate::device::DeviceType;
+use crate::device::{DeviceStateInDoubt, DeviceType};
 use crate::utils::create_dir_all_with_inherit_owner;
 use crate::utils::open_named_tuntap;
 use crate::HybridVsockDevice;
@@ -24,7 +24,8 @@ use ch_config::ch_api::cloud_hypervisor_vm_device_add;
 use ch_config::ch_api::{
     cloud_hypervisor_vm_blockdev_add, cloud_hypervisor_vm_device_remove,
     cloud_hypervisor_vm_fs_add, cloud_hypervisor_vm_netdev_add_with_fds,
-    cloud_hypervisor_vm_vsock_add, PciDeviceInfo, VmRemoveDeviceData,
+    cloud_hypervisor_vm_vsock_add, is_api_command_not_dispatched, is_definite_server_response,
+    PciDeviceInfo, VmRemoveDeviceData,
 };
 use ch_config::convert::DEFAULT_NUM_PCI_SEGMENTS;
 use ch_config::DiskConfig;
@@ -129,10 +130,16 @@ impl CloudHypervisorInner {
 
     pub(crate) async fn remove_device(&mut self, device: DeviceType) -> Result<()> {
         match device {
-            DeviceType::Vfio(vfiodev) => self.inner_remove_device(vfiodev.device_id.as_str()).await,
+            DeviceType::Vfio(vfiodev) => {
+                self.inner_remove_device(vfiodev.device_id.as_str(), None)
+                    .await
+            }
             DeviceType::BlockModern(blockdev) => {
                 let device_id = blockdev.lock().await.device_id.clone();
-                self.inner_remove_device(device_id.as_str()).await
+                self.inner_remove_device(device_id.as_str(), Some(device_id.as_str()))
+                    .await?;
+                blockdev.lock().await.config.pci_path = None;
+                Ok(())
             }
             _ => Ok(()),
         }
@@ -222,25 +229,38 @@ impl CloudHypervisorInner {
         Ok(DeviceType::Vfio(vfio_device))
     }
 
-    async fn inner_remove_device(&mut self, device_id: &str) -> Result<()> {
-        let clh_device_id = self.device_ids.get(device_id);
-
-        if clh_device_id.is_none() {
-            return Err(anyhow!(
-                "Device id for cloud-hypervisor not found while removing device"
-            ));
-        }
-
-        let clh_device_id = clh_device_id.unwrap();
+    async fn inner_remove_device(
+        &mut self,
+        device_id: &str,
+        stable_vmm_id: Option<&str>,
+    ) -> Result<()> {
+        let clh_device_id = self
+            .device_ids
+            .get(device_id)
+            .cloned()
+            .or_else(|| stable_vmm_id.map(str::to_string))
+            .ok_or_else(|| {
+                anyhow!(
+                    "cannot detach runtime device {device_id}: Cloud Hypervisor device identity is missing"
+                )
+            })?;
         let rm_data = VmRemoveDeviceData {
             id: clh_device_id.clone(),
         };
 
-        let response = cloud_hypervisor_vm_device_remove(&self.api_socket, rm_data).await?;
+        let response = cloud_hypervisor_vm_device_remove(&self.api_socket, rm_data)
+            .await
+            .with_context(|| {
+                format!(
+                    "Cloud Hypervisor failed to detach runtime device {device_id} (VMM device {clh_device_id})"
+                )
+            })?;
 
         if let Some(detail) = response {
             debug!(sl!(), "device remove response: {:?}", detail);
         }
+
+        self.device_ids.remove(device_id);
 
         Ok(())
     }
@@ -324,24 +344,121 @@ impl CloudHypervisorInner {
             (dev.device_id.clone(), dev.config.clone())
         };
 
-        let disk_config = self.make_disk_config(&config)?;
+        let mut disk_config = self.make_disk_config(&config)?;
+        disk_config.id = Some(device_id.clone());
 
-        let response = cloud_hypervisor_vm_blockdev_add(&self.api_socket, disk_config).await?;
+        // Claim the stable VMM identity before dispatch. A canceled caller or
+        // uncertain response leaves enough state for deterministic cleanup.
+        self.device_ids.insert(device_id.clone(), device_id.clone());
 
-        if let Some(detail) = response {
-            debug!(sl!(), "blockdev add response: {:?}", detail);
+        let response = match cloud_hypervisor_vm_blockdev_add(&self.api_socket, disk_config).await {
+            Ok(response) => response,
+            Err(error)
+                if is_api_command_not_dispatched(&error) || is_definite_server_response(&error) =>
+            {
+                self.device_ids.remove(&device_id);
+                return Err(error.context(format!(
+                    "Cloud Hypervisor failed to attach block device {device_id} from {}",
+                    config.path_on_host
+                )));
+            }
+            Err(error) => {
+                let reason = format!(
+                    "Cloud Hypervisor may have attached block device {device_id} from {}; cleanup remains pending",
+                    config.path_on_host
+                );
+                return Err(
+                    anyhow::Error::new(DeviceStateInDoubt::new(device_id, reason)).context(error),
+                );
+            }
+        };
 
-            let dev_info: PciDeviceInfo =
-                serde_json::from_str(detail.as_str()).map_err(|e| anyhow!(e))?;
-            self.device_ids.insert(device_id.clone(), dev_info.id);
+        let detail = match response {
+            Some(detail) => detail,
+            None => {
+                let error = anyhow!(
+                    "Cloud Hypervisor attached block device {device_id} from {} without returning guest device identity",
+                    config.path_on_host
+                );
+                return Err(self
+                    .rollback_added_block_device(&device_id, &device_id, error)
+                    .await);
+            }
+        };
+        debug!(sl!(), "blockdev add response: {:?}", detail);
 
-            // Persist the cloud-hypervisor assigned PCI path back into the device
-            // so it can be used later for removal / hot-unplug.
-            let mut block_dev = device.lock().await;
-            block_dev.config.pci_path = Some(Self::clh_pci_info_to_path(dev_info.bdf.as_str())?);
+        let dev_info: PciDeviceInfo = match serde_json::from_str(detail.as_str()) {
+            Ok(info) => info,
+            Err(error) => {
+                let error = anyhow!(error).context(format!(
+                    "Cloud Hypervisor returned invalid identity for block device {device_id}: {detail}"
+                ));
+                return Err(self
+                    .rollback_added_block_device(&device_id, &device_id, error)
+                    .await);
+            }
+        };
+
+        if dev_info.id != device_id {
+            let error = anyhow!(
+                "Cloud Hypervisor returned device identity {} for block device {device_id}",
+                dev_info.id
+            );
+            return Err(self
+                .rollback_added_block_device(&device_id, &dev_info.id, error)
+                .await);
         }
 
+        let pci_path = match Self::clh_pci_info_to_path(dev_info.bdf.as_str()) {
+            Ok(path) => path,
+            Err(error) => {
+                let error = error.context(format!(
+                    "Cloud Hypervisor returned invalid PCI identity for block device {device_id}"
+                ));
+                return Err(self
+                    .rollback_added_block_device(&device_id, &dev_info.id, error)
+                    .await);
+            }
+        };
+
+        device.lock().await.config.pci_path = Some(pci_path);
         Ok(DeviceType::BlockModern(device))
+    }
+
+    async fn rollback_added_block_device(
+        &mut self,
+        runtime_device_id: &str,
+        vmm_device_id: &str,
+        attach_error: anyhow::Error,
+    ) -> anyhow::Error {
+        // A valid add response is authoritative for VMM identity, even when
+        // it disagrees with the requested runtime identity. Preserve that
+        // mapping before rollback so cancellation cannot lose cleanup state.
+        self.device_ids
+            .insert(runtime_device_id.to_string(), vmm_device_id.to_string());
+        let rollback = cloud_hypervisor_vm_device_remove(
+            &self.api_socket,
+            VmRemoveDeviceData {
+                id: vmm_device_id.to_string(),
+            },
+        )
+        .await;
+
+        match rollback {
+            Ok(_) => {
+                self.device_ids.remove(runtime_device_id);
+                attach_error.context(format!(
+                    "rolled back partially attached runtime block device {runtime_device_id} (VMM device {vmm_device_id})"
+                ))
+            }
+            Err(rollback_error) => {
+                let reason = format!(
+                    "runtime block device {runtime_device_id} (VMM device {vmm_device_id}) remains potentially attached and pending cleanup: {rollback_error:#}"
+                );
+                anyhow::Error::new(DeviceStateInDoubt::new(runtime_device_id, reason))
+                    .context(attach_error)
+            }
+        }
     }
 
     async fn handle_network_device(&mut self, device: NetworkDevice) -> Result<DeviceType> {
