@@ -475,3 +475,45 @@ impl Device for BlockDeviceModernHandle {
         do_decrease_count(&mut guard.attach_count)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn root_port_requirement_is_qemu_specific() {
+        let config = BlockConfigModern {
+            use_pcie_root_port: true,
+            ..Default::default()
+        };
+        let qemu_topology = PCIeTopology {
+            hypervisor_name: HYPERVISOR_QEMU.to_string(),
+            ..Default::default()
+        };
+        let cloud_hypervisor_topology = PCIeTopology {
+            hypervisor_name: "cloud-hypervisor".to_string(),
+            ..Default::default()
+        };
+
+        assert!(uses_qemu_pcie_root_port(&config, Some(&qemu_topology)).unwrap());
+        assert!(!uses_qemu_pcie_root_port(&config, Some(&cloud_hypervisor_topology)).unwrap());
+        assert!(uses_qemu_pcie_root_port(&config, None).is_err());
+
+        let unrelated_config = BlockConfigModern::default();
+        assert!(!uses_qemu_pcie_root_port(&unrelated_config, None).unwrap());
+    }
+
+    #[test]
+    fn incomplete_cleanup_uses_foundation_in_doubt_marker() {
+        let state = BlockCleanupState {
+            frontend: false,
+            backend: true,
+            fdsets: true,
+        };
+        let cleanup_error =
+            BlockDeviceCleanupPending::with_state("drive-3", "injected incomplete cleanup", state);
+        let error = cleanup_state_in_doubt("drive-3", cleanup_error.into());
+
+        assert!(device_state_in_doubt(&error).is_some());
+    }
+}

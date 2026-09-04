@@ -2394,6 +2394,921 @@ fn block_node_name(index: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
+    use std::io::{BufRead, Write};
+    use std::os::unix::net::UnixListener;
+    use std::path::Path;
+
+    const QMP_GREETING: &str = r#"{"QMP":{"version":{"qemu":{"major":8,"minor":2,"micro":0},"package":""},"capabilities":[]}}"#;
+    const TEST_BLOCK_FDSETS: &str =
+        r#"{"return":[{"fdset-id":7,"fds":[{"fd":9,"opaque":"kata-block:drive-0:source"}]}]}"#;
+
+    struct TestQemuProcess {
+        child: std::process::Child,
+    }
+
+    impl TestQemuProcess {
+        fn start(socket_path: &Path) -> Self {
+            let kernel_path = socket_path.parent().unwrap().join("Image");
+            let kernel = std::fs::File::create(&kernel_path).unwrap();
+            let status = std::process::Command::new("sudo")
+                .args(["-n", "gzip", "-dc", "/boot/vmlinuz"])
+                .stdout(std::process::Stdio::from(kernel))
+                .status()
+                .unwrap();
+            assert!(status.success(), "extract the Lima kernel");
+
+            let mut command = std::process::Command::new("qemu-system-aarch64");
+            command
+                .args([
+                    "-machine",
+                    "virt",
+                    "-accel",
+                    "tcg",
+                    "-cpu",
+                    "max",
+                    "-S",
+                    "-display",
+                    "none",
+                    "-nodefaults",
+                    "-m",
+                    "512M",
+                    "-kernel",
+                ])
+                .arg(&kernel_path)
+                .args([
+                    "-initrd",
+                    "/boot/initrd.img",
+                    "-append",
+                    "console=ttyAMA0 root=/dev/doesnotexist panic=-1",
+                    "-serial",
+                    "null",
+                ])
+                .arg("-qmp")
+                .arg(format!("unix:{},server=on,wait=off", socket_path.display()));
+            for index in 0..8 {
+                command.arg("-device").arg(format!(
+                    "pcie-root-port,id=rp{index},bus=pcie.0,chassis=0,slot={index}"
+                ));
+            }
+            command
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::inherit());
+            let child = command.spawn().expect("launch qemu-system-aarch64");
+            let mut process = Self { child };
+            for _ in 0..100 {
+                if socket_path.exists() {
+                    return process;
+                }
+                if let Some(status) = process.child.try_wait().unwrap() {
+                    panic!("QEMU exited before creating its QMP socket: {}", status);
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            panic!("QEMU did not create its QMP socket");
+        }
+    }
+
+    impl Drop for TestQemuProcess {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+
+    #[derive(serde::Serialize)]
+    struct TestBlockdevAdd {}
+
+    impl qapi_spec::Command for TestBlockdevAdd {
+        const NAME: &'static str = "blockdev-add";
+        const ALLOW_OOB: bool = false;
+        type Ok = qapi_spec::Empty;
+    }
+
+    fn write_qmp_response(writer: &mut UnixStream, response: &str) {
+        writer.write_all(response.as_bytes()).unwrap();
+        writer.write_all(b"\n").unwrap();
+        writer.flush().unwrap();
+    }
+
+    fn read_qmp_command(reader: &mut BufReader<UnixStream>) -> serde_json::Value {
+        let mut request = String::new();
+        reader.read_line(&mut request).unwrap();
+        serde_json::from_str(&request).unwrap()
+    }
+
+    fn accept_initialized_qmp(
+        listener: &UnixListener,
+        fdsets: &str,
+        commands: &mut Vec<serde_json::Value>,
+    ) -> (BufReader<UnixStream>, UnixStream) {
+        let (stream, _) = listener.accept().unwrap();
+        let mut writer = stream.try_clone().unwrap();
+        let mut reader = BufReader::new(stream);
+        write_qmp_response(&mut writer, QMP_GREETING);
+        commands.push(read_qmp_command(&mut reader));
+        write_qmp_response(&mut writer, r#"{"return":{}}"#);
+        commands.push(read_qmp_command(&mut reader));
+        write_qmp_response(&mut writer, fdsets);
+        (reader, writer)
+    }
+
+    fn qmp_with_responses(
+        responses: Vec<&'static str>,
+    ) -> (Qmp, std::thread::JoinHandle<Vec<serde_json::Value>>) {
+        let (client, server) = UnixStream::pair().unwrap();
+        let qmp = Qmp {
+            qmp: qapi::Qmp::new(qapi::Stream::new(
+                BufReader::new(client.try_clone().unwrap()),
+                client,
+            )),
+            qmp_sock_path: None,
+            guest_memory_block_size: 0,
+            ccw_subchannel: None,
+            pci_bridge_devices: HashMap::new(),
+            block_fdsets: HashMap::new(),
+        };
+        let server_thread = std::thread::spawn(move || {
+            let mut reader = BufReader::new(server.try_clone().unwrap());
+            let mut writer = server;
+            let mut commands = Vec::new();
+            for response in responses {
+                let mut request = String::new();
+                reader.read_line(&mut request).unwrap();
+                commands.push(serde_json::from_str(&request).unwrap());
+                writer.write_all(response.as_bytes()).unwrap();
+                writer.write_all(b"\n").unwrap();
+                writer.flush().unwrap();
+            }
+            commands
+        });
+        (qmp, server_thread)
+    }
+
+    #[test]
+    #[ignore = "requires KATA_TEST_QEMU_TCG=1 and qemu-system-aarch64"]
+    fn real_qemu_tcg_block_lifecycle() {
+        if std::env::var("KATA_TEST_QEMU_TCG").as_deref() != Ok("1") {
+            return;
+        }
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let socket_path = temp_dir.path().join("qmp.sock");
+        let _process = TestQemuProcess::start(&socket_path);
+        let disk_path = temp_dir.path().join("disk.img");
+        let disk = std::fs::File::create(&disk_path).unwrap();
+        disk.set_len(64 * 1024 * 1024).unwrap();
+        drop(disk);
+
+        let mut qmp = Qmp::new(socket_path.to_str().unwrap()).unwrap();
+        qmp.qmp_cont().unwrap();
+        let aio = crate::device::driver::BlockDeviceAio::Threads.to_string();
+        let opaque = block_fd_opaque("drive-0", "block-source");
+        let (pci_path, address) = qmp
+            .hotplug_block_device(
+                "virtio-blk-pci",
+                0,
+                disk_path.to_str().unwrap(),
+                &aio,
+                Some(false),
+                false,
+                false,
+                true,
+                0,
+                0,
+                None,
+                None,
+                Some("rp3"),
+            )
+            .unwrap();
+
+        assert_eq!(pci_path.unwrap().to_string(), "04/00");
+        assert!(address.is_none());
+        assert!(qmp.frontend_exists("drive-0").unwrap());
+        assert!(qmp.block_backend_exists("drive-0").unwrap());
+        let fdsets = qmp.qmp.execute(&qmp::query_fdsets {}).unwrap();
+        assert!(find_fd_by_opaque(&fdsets, &opaque).is_some());
+
+        if let Err(mut last_error) = qmp.hotunplug_block_device("virtio-blk-pci", 0, None) {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                let pending = last_error
+                    .downcast_ref::<BlockDeviceCleanupPending>()
+                    .unwrap_or_else(|| {
+                        panic!("unexpected QEMU hot-unplug error: {:#}", last_error)
+                    });
+                let state = pending.state();
+                assert_eq!(
+                    state,
+                    BlockCleanupState {
+                        frontend: false,
+                        backend: false,
+                        fdsets: true,
+                    },
+                    "QEMU hot-unplug reported inaccurate cleanup state: {last_error:#}"
+                );
+                eprintln!("QEMU block cleanup pending with state {state:?}: {last_error:#}");
+
+                if Instant::now() >= deadline {
+                    panic!(
+                        "QEMU block cleanup retry deadline expired: {:#}",
+                        last_error
+                    );
+                }
+                std::thread::sleep(Duration::from_millis(10));
+                match qmp.hotunplug_block_device("virtio-blk-pci", 0, Some(state)) {
+                    Ok(()) => break,
+                    Err(error) => last_error = error,
+                }
+            }
+        }
+
+        assert!(!qmp.frontend_exists("drive-0").unwrap());
+        assert!(!qmp.block_backend_exists("drive-0").unwrap());
+        let fdsets = qmp.qmp.execute(&qmp::query_fdsets {}).unwrap();
+        assert!(find_fd_by_opaque(&fdsets, &opaque).is_none());
+    }
+
+    #[test]
+    fn add_fd_lost_response_discovers_accepted_fd() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let socket_path = temp_dir.path().join("qmp.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let opaque = block_fd_opaque("drive-0", "source");
+        let expected_opaque = opaque.clone();
+        let server = std::thread::spawn(move || {
+            let mut commands = Vec::new();
+            let (mut reader, writer) =
+                accept_initialized_qmp(&listener, r#"{"return":[]}"#, &mut commands);
+            commands.push(read_qmp_command(&mut reader));
+            drop(reader);
+            drop(writer);
+
+            let fdsets = serde_json::json!({
+                "return": [{
+                    "fdset-id": 7,
+                    "fds": [{"fd": 9, "opaque": expected_opaque}]
+                }]
+            })
+            .to_string();
+            let (mut reader, mut writer) =
+                accept_initialized_qmp(&listener, &fdsets, &mut commands);
+            commands.push(read_qmp_command(&mut reader));
+            write_qmp_response(&mut writer, &fdsets);
+            commands
+        });
+
+        let mut qmp = Qmp::new(socket_path.to_str().unwrap()).unwrap();
+        let file = tempfile::tempfile().unwrap();
+        let info = qmp.pass_block_fd(file.as_raw_fd(), &opaque).unwrap();
+
+        assert_eq!(info.fdset_id, 7);
+        assert_eq!(qmp.block_fdsets.get("drive-0"), Some(&vec![7]));
+        let commands = server.join().unwrap();
+        assert_eq!(commands[2]["execute"], "add-fd");
+        assert_eq!(commands[5]["execute"], "query-fdsets");
+    }
+
+    #[test]
+    fn blockdev_add_lost_response_discovers_accepted_backend() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let socket_path = temp_dir.path().join("qmp.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let server = std::thread::spawn(move || {
+            let mut commands = Vec::new();
+            let (mut reader, writer) =
+                accept_initialized_qmp(&listener, r#"{"return":[]}"#, &mut commands);
+            commands.push(read_qmp_command(&mut reader));
+            drop(reader);
+            drop(writer);
+
+            let (mut reader, mut writer) =
+                accept_initialized_qmp(&listener, r#"{"return":[]}"#, &mut commands);
+            commands.push(read_qmp_command(&mut reader));
+            write_qmp_response(&mut writer, r#"{"return":[{"node-name":"drive-0"}]}"#);
+            commands
+        });
+
+        let mut qmp = Qmp::new(socket_path.to_str().unwrap()).unwrap();
+        let result = qmp.qmp.execute(&TestBlockdevAdd {});
+        let outcome = qmp
+            .reconcile_add_result(
+                "drive-0",
+                "blockdev-add",
+                result,
+                BlockCleanupState {
+                    frontend: false,
+                    backend: true,
+                    fdsets: false,
+                },
+                QmpResidue::Backend,
+            )
+            .unwrap();
+
+        assert!(matches!(outcome, ReconciledAdd::Applied));
+        let commands = server.join().unwrap();
+        assert_eq!(commands[2]["execute"], "blockdev-add");
+        assert_eq!(commands[5]["execute"], "query-named-block-nodes");
+    }
+
+    #[test]
+    fn device_add_lost_response_discovers_accepted_frontend() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let socket_path = temp_dir.path().join("qmp.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let server = std::thread::spawn(move || {
+            let mut commands = Vec::new();
+            let (mut reader, writer) =
+                accept_initialized_qmp(&listener, r#"{"return":[]}"#, &mut commands);
+            commands.push(read_qmp_command(&mut reader));
+            drop(reader);
+            drop(writer);
+
+            let (mut reader, mut writer) =
+                accept_initialized_qmp(&listener, r#"{"return":[]}"#, &mut commands);
+            commands.push(read_qmp_command(&mut reader));
+            write_qmp_response(
+                &mut writer,
+                r#"{"return":[{"name":"drive-0","type":"child<virtio-blk-pci>"}]}"#,
+            );
+            commands
+        });
+
+        let mut qmp = Qmp::new(socket_path.to_str().unwrap()).unwrap();
+        qmp.device_add_with_rollback(
+            "drive-0",
+            Some("rp0".to_string()),
+            "virtio-blk-pci",
+            Dictionary::new(),
+        )
+        .unwrap();
+        let commands = server.join().unwrap();
+        assert_eq!(commands[2]["execute"], "device_add");
+        assert_eq!(commands[5]["execute"], "qom-list");
+    }
+
+    #[test]
+    fn remove_fd_lost_response_discovers_absent_fdset() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let socket_path = temp_dir.path().join("qmp.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let opaque = block_fd_opaque("drive-0", "source");
+        let server = std::thread::spawn(move || {
+            let mut commands = Vec::new();
+            let fdsets = serde_json::json!({
+                "return": [{
+                    "fdset-id": 7,
+                    "fds": [{"fd": 9, "opaque": opaque}]
+                }]
+            })
+            .to_string();
+            let (mut reader, writer) = accept_initialized_qmp(&listener, &fdsets, &mut commands);
+            commands.push(read_qmp_command(&mut reader));
+            drop(reader);
+            drop(writer);
+
+            let (mut reader, mut writer) =
+                accept_initialized_qmp(&listener, r#"{"return":[]}"#, &mut commands);
+            commands.push(read_qmp_command(&mut reader));
+            write_qmp_response(&mut writer, r#"{"return":[]}"#);
+            commands
+        });
+
+        let mut qmp = Qmp::new(socket_path.to_str().unwrap()).unwrap();
+        qmp.remove_fdset_ids("drive-0", vec![7]).unwrap();
+
+        assert!(!qmp.block_fdsets.contains_key("drive-0"));
+        let commands = server.join().unwrap();
+        assert_eq!(commands[2]["execute"], "remove-fd");
+        assert_eq!(commands[4]["execute"], "query-fdsets");
+    }
+
+    fn assert_block_removal_reconciles_lost_response(block_driver: &str) {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let socket_path = temp_dir.path().join("qmp.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let server = std::thread::spawn(move || {
+            let mut commands = Vec::new();
+            let (mut reader, writer) =
+                accept_initialized_qmp(&listener, r#"{"return":[]}"#, &mut commands);
+            commands.push(read_qmp_command(&mut reader));
+            drop(reader);
+            drop(writer);
+
+            let (mut reader, mut writer) =
+                accept_initialized_qmp(&listener, r#"{"return":[]}"#, &mut commands);
+            commands.push(read_qmp_command(&mut reader));
+            write_qmp_response(&mut writer, r#"{"return":[]}"#);
+            commands.push(read_qmp_command(&mut reader));
+            write_qmp_response(
+                &mut writer,
+                r#"{"error":{"class":"DeviceNotFound","desc":"backend already absent"}}"#,
+            );
+            commands.push(read_qmp_command(&mut reader));
+            write_qmp_response(&mut writer, r#"{"return":[]}"#);
+
+            commands.push(read_qmp_command(&mut reader));
+            write_qmp_response(
+                &mut writer,
+                r#"{"error":{"class":"DeviceNotFound","desc":"frontend already absent"}}"#,
+            );
+            commands.push(read_qmp_command(&mut reader));
+            write_qmp_response(
+                &mut writer,
+                r#"{"error":{"class":"DeviceNotFound","desc":"backend already absent"}}"#,
+            );
+            commands
+        });
+
+        let mut qmp = Qmp::new(socket_path.to_str().unwrap()).unwrap();
+        qmp.block_fdsets.insert("drive-0".to_string(), vec![7]);
+
+        qmp.hotunplug_block_device(block_driver, 0, None).unwrap();
+        qmp.hotunplug_block_device(block_driver, 0, None).unwrap();
+        assert!(!qmp.block_fdsets.contains_key("drive-0"));
+
+        let commands = server.join().unwrap();
+        assert_eq!(
+            commands
+                .iter()
+                .map(|command| command["execute"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            [
+                "qmp_capabilities",
+                "query-fdsets",
+                "device_del",
+                "qmp_capabilities",
+                "query-fdsets",
+                "qom-list",
+                "blockdev-del",
+                "query-fdsets",
+                "device_del",
+                "blockdev-del",
+            ]
+        );
+    }
+
+    #[test]
+    fn scsi_removal_reconciles_lost_response_and_absent_residue() {
+        assert_block_removal_reconciles_lost_response(VIRTIO_SCSI);
+    }
+
+    #[test]
+    fn ccw_removal_reconciles_lost_response_and_absent_residue() {
+        assert_block_removal_reconciles_lost_response(VIRTIO_BLK_CCW);
+    }
+
+    #[test]
+    fn ccw_removal_preserves_subchannel_until_frontend_is_absent() {
+        let (mut qmp, server) = qmp_with_responses(vec![
+            r#"{"error":{"class":"GenericError","desc":"injected device delete failure"}}"#,
+            r#"{"return":[{"name":"drive-0","type":"child<virtio-blk-ccw>"}]}"#,
+            r#"{"error":{"class":"DeviceNotFound","desc":"frontend already absent"}}"#,
+            r#"{"error":{"class":"DeviceNotFound","desc":"backend already absent"}}"#,
+        ]);
+        let mut subchannel = CcwSubChannel::new();
+        subchannel.add_device("drive-0").unwrap();
+        qmp.set_ccw_subchannel(subchannel);
+
+        let error = qmp
+            .hotunplug_block_device(VIRTIO_BLK_CCW, 0, None)
+            .unwrap_err();
+        let state = error
+            .downcast_ref::<BlockDeviceCleanupPending>()
+            .unwrap()
+            .state();
+        assert!(qmp
+            .ccw_subchannel
+            .as_mut()
+            .unwrap()
+            .add_device("drive-0")
+            .is_err());
+
+        qmp.hotunplug_block_device(VIRTIO_BLK_CCW, 0, Some(state))
+            .unwrap();
+        assert!(qmp
+            .ccw_subchannel
+            .as_mut()
+            .unwrap()
+            .add_device("drive-0")
+            .is_ok());
+
+        let commands = server.join().unwrap();
+        assert_eq!(commands[0]["execute"], "device_del");
+        assert_eq!(commands[1]["execute"], "qom-list");
+        assert_eq!(commands[2]["execute"], "device_del");
+        assert_eq!(commands[3]["execute"], "blockdev-del");
+    }
+
+    #[test]
+    fn successful_remove_fd_preserves_residue_until_retry_confirms_absence() {
+        let (mut qmp, server) = qmp_with_responses(vec![
+            TEST_BLOCK_FDSETS,
+            r#"{"return":{}}"#,
+            TEST_BLOCK_FDSETS,
+            TEST_BLOCK_FDSETS,
+            r#"{"return":{}}"#,
+            r#"{"return":[]}"#,
+        ]);
+        qmp.block_fdsets.insert("drive-0".to_string(), vec![7]);
+        let state = BlockCleanupState {
+            frontend: false,
+            backend: false,
+            fdsets: true,
+        };
+
+        let error = qmp
+            .cleanup_pending_block_device("drive-0", state)
+            .unwrap_err();
+        assert_eq!(
+            error
+                .downcast_ref::<BlockDeviceCleanupPending>()
+                .unwrap()
+                .state(),
+            state
+        );
+        assert_eq!(qmp.block_fdsets.get("drive-0"), Some(&vec![7]));
+        qmp.cleanup_pending_block_device("drive-0", state).unwrap();
+        assert!(!qmp.block_fdsets.contains_key("drive-0"));
+
+        let commands = server.join().unwrap();
+        assert_eq!(commands[0]["execute"], "query-fdsets");
+        assert_eq!(commands[1]["execute"], "remove-fd");
+        assert_eq!(commands[2]["execute"], "query-fdsets");
+        assert_eq!(commands[3]["execute"], "query-fdsets");
+        assert_eq!(commands[4]["execute"], "remove-fd");
+        assert_eq!(commands[5]["execute"], "query-fdsets");
+    }
+
+    #[test]
+    fn device_deleted_timeout_discovers_absent_frontend() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let socket_path = temp_dir.path().join("qmp.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let server = std::thread::spawn(move || {
+            let mut commands = Vec::new();
+            let (mut reader, mut writer) =
+                accept_initialized_qmp(&listener, r#"{"return":[]}"#, &mut commands);
+            commands.push(read_qmp_command(&mut reader));
+            write_qmp_response(&mut writer, r#"{"return":{}}"#);
+            commands.push(read_qmp_command(&mut reader));
+            write_qmp_response(
+                &mut writer,
+                r#"{"return":{"qemu":{"major":8,"minor":2,"micro":0},"package":""}}"#,
+            );
+            drop(reader);
+            drop(writer);
+
+            let (mut reader, mut writer) =
+                accept_initialized_qmp(&listener, r#"{"return":[]}"#, &mut commands);
+            commands.push(read_qmp_command(&mut reader));
+            write_qmp_response(&mut writer, r#"{"return":[]}"#);
+            commands
+        });
+
+        let mut qmp = Qmp::new(socket_path.to_str().unwrap()).unwrap();
+        qmp.cleanup_pending_block_device_with_timeout(
+            "drive-0",
+            BlockCleanupState {
+                frontend: true,
+                backend: false,
+                fdsets: false,
+            },
+            Duration::from_millis(1),
+        )
+        .unwrap();
+
+        let commands = server.join().unwrap();
+        assert_eq!(commands[2]["execute"], "device_del");
+        assert_eq!(commands[3]["execute"], "query-version");
+        assert_eq!(commands[6]["execute"], "qom-list");
+    }
+
+    #[test]
+    fn failed_device_deleted_poll_reconnects_before_queued_event() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let socket_path = temp_dir.path().join("qmp.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let server = std::thread::spawn(move || {
+            let mut first_commands = Vec::new();
+            let (mut first_reader, mut first_writer) =
+                accept_initialized_qmp(&listener, r#"{"return":[]}"#, &mut first_commands);
+            first_commands.push(read_qmp_command(&mut first_reader));
+            write_qmp_response(&mut first_writer, r#"{"return":{}}"#);
+            first_commands.push(read_qmp_command(&mut first_reader));
+            write_qmp_response(
+                &mut first_writer,
+                r#"{"event":"DEVICE_DELETED","data":{"device":"drive-0","path":"/machine/peripheral/drive-0"},"timestamp":{"seconds":1,"microseconds":0}}"#,
+            );
+
+            let mut second_commands = Vec::new();
+            let (mut second_reader, mut second_writer) =
+                accept_initialized_qmp(&listener, r#"{"return":[]}"#, &mut second_commands);
+            second_commands.push(read_qmp_command(&mut second_reader));
+            write_qmp_response(&mut second_writer, r#"{"return":[]}"#);
+            second_commands.push(read_qmp_command(&mut second_reader));
+            write_qmp_response(
+                &mut second_writer,
+                r#"{"return":{"qemu":{"major":8,"minor":2,"micro":0},"package":""}}"#,
+            );
+
+            (first_commands, second_commands)
+        });
+
+        let mut qmp = Qmp::new(socket_path.to_str().unwrap()).unwrap();
+        qmp.cleanup_pending_block_device_with_timeout(
+            "drive-0",
+            BlockCleanupState {
+                frontend: true,
+                backend: false,
+                fdsets: false,
+            },
+            Duration::from_millis(250),
+        )
+        .unwrap();
+        assert_eq!(
+            qmp.qmp.inner_mut().get_mut_write().read_timeout().unwrap(),
+            Some(Duration::from_millis(DEFAULT_QMP_READ_TIMEOUT))
+        );
+        qmp.qmp.nop().unwrap();
+
+        let (first_commands, second_commands) = server.join().unwrap();
+        assert_eq!(
+            first_commands
+                .iter()
+                .map(|command| command["execute"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            [
+                "qmp_capabilities",
+                "query-fdsets",
+                "device_del",
+                "query-version"
+            ]
+        );
+        assert_eq!(
+            second_commands
+                .iter()
+                .map(|command| command["execute"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            [
+                "qmp_capabilities",
+                "query-fdsets",
+                "qom-list",
+                "query-version"
+            ]
+        );
+    }
+
+    #[test]
+    fn block_pci_target_prefers_preallocated_root_port() {
+        let bridge_lookup_called = Cell::new(false);
+        let target = select_block_pci_target(Some("rp3"), || {
+            bridge_lookup_called.set(true);
+            Ok(("pci-bridge-0".to_string(), 1))
+        })
+        .unwrap();
+
+        assert_eq!(target, ("rp3".to_string(), 0, false));
+        assert!(!bridge_lookup_called.get());
+        assert!(select_block_pci_target(Some("pci-bridge-0"), || unreachable!()).is_err());
+    }
+
+    #[test]
+    fn root_port_path_uses_structured_qom_properties() {
+        let (mut qmp, server) = qmp_with_responses(vec![
+            r#"{"return":"/machine/peripheral/rp3/rp3"}"#,
+            r#"{"return":0}"#,
+            r#"{"return":32}"#,
+        ]);
+
+        assert_eq!(
+            qmp.get_root_port_device_path("drive-0", "rp3")
+                .unwrap()
+                .to_string(),
+            "04/00"
+        );
+
+        let commands = server.join().unwrap();
+        assert!(commands
+            .iter()
+            .all(|command| command["execute"] == "qom-get"));
+    }
+
+    #[test]
+    fn path_lookup_failure_returns_after_successful_rollback() {
+        let error = complete_pci_path_lookup(
+            "drive-0",
+            Err(anyhow!("lookup failed")),
+            BlockCleanupState::attached(false),
+            || Ok(()),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.to_string(), "lookup failed");
+        assert!(error.downcast_ref::<BlockDeviceCleanupPending>().is_none());
+    }
+
+    #[test]
+    fn path_lookup_failure_preserves_state_after_rollback_failure() {
+        let error = complete_pci_path_lookup(
+            "drive-0",
+            Err(anyhow!("lookup failed")),
+            BlockCleanupState::attached(false),
+            || Err(anyhow!("device_del failed")),
+        )
+        .unwrap_err();
+
+        let pending = error
+            .downcast_ref::<BlockDeviceCleanupPending>()
+            .expect("cleanup failure must preserve ownership");
+        assert!(pending.to_string().contains("lookup failed"));
+        assert!(pending.to_string().contains("device_del failed"));
+    }
+
+    #[test]
+    fn device_add_failure_removes_block_backend() {
+        let (mut qmp, server) = qmp_with_responses(vec![
+            r#"{"error":{"class":"GenericError","desc":"injected device failure"}}"#,
+            r#"{"return":{}}"#,
+            TEST_BLOCK_FDSETS,
+            r#"{"return":{}}"#,
+            r#"{"return":[]}"#,
+        ]);
+        qmp.block_fdsets.insert("drive-0".to_string(), vec![7]);
+        let mut arguments = Dictionary::new();
+        arguments.insert("drive".to_string(), "drive-0".into());
+
+        let error = qmp
+            .device_add_with_rollback(
+                "drive-0",
+                Some("rp0".to_string()),
+                "virtio-blk-pci",
+                arguments,
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("device_add"));
+
+        let commands = server.join().unwrap();
+        assert_eq!(commands[0]["execute"], "device_add");
+        assert_eq!(commands[0]["arguments"]["bus"], "rp0");
+        assert_eq!(commands[1]["execute"], "blockdev-del");
+        assert_eq!(commands[1]["arguments"]["node-name"], "drive-0");
+        assert_eq!(commands[2]["execute"], "query-fdsets");
+        assert_eq!(commands[3]["execute"], "remove-fd");
+        assert_eq!(commands[3]["arguments"]["fdset-id"], 7);
+        assert!(!qmp.block_fdsets.contains_key("drive-0"));
+    }
+
+    #[test]
+    fn device_add_rollback_failure_preserves_fdset_state() {
+        let (mut qmp, server) = qmp_with_responses(vec![
+            r#"{"error":{"class":"GenericError","desc":"injected device failure"}}"#,
+            r#"{"error":{"class":"GenericError","desc":"injected backend failure"}}"#,
+            r#"{"return":[{"node-name":"drive-0"}]}"#,
+            r#"{"return":{}}"#,
+            TEST_BLOCK_FDSETS,
+            r#"{"return":{}}"#,
+            r#"{"return":[]}"#,
+        ]);
+        qmp.block_fdsets.insert("drive-0".to_string(), vec![7]);
+        let mut arguments = Dictionary::new();
+        arguments.insert("drive".to_string(), "drive-0".into());
+
+        let error = qmp
+            .device_add_with_rollback(
+                "drive-0",
+                Some("rp0".to_string()),
+                "virtio-blk-pci",
+                arguments,
+            )
+            .unwrap_err();
+
+        let cleanup_state = error
+            .downcast_ref::<BlockDeviceCleanupPending>()
+            .unwrap()
+            .state();
+        assert_eq!(
+            cleanup_state,
+            BlockCleanupState {
+                frontend: false,
+                backend: true,
+                fdsets: true,
+            }
+        );
+        assert_eq!(qmp.block_fdsets.get("drive-0"), Some(&vec![7]));
+
+        qmp.cleanup_pending_block_device("drive-0", cleanup_state)
+            .unwrap();
+        assert!(!qmp.block_fdsets.contains_key("drive-0"));
+
+        let commands = server.join().unwrap();
+        assert_eq!(commands[0]["execute"], "device_add");
+        assert_eq!(commands[1]["execute"], "blockdev-del");
+        assert_eq!(commands[2]["execute"], "query-named-block-nodes");
+        assert_eq!(commands[3]["execute"], "blockdev-del");
+        assert_eq!(commands[4]["execute"], "query-fdsets");
+        assert_eq!(commands[5]["execute"], "remove-fd");
+    }
+
+    #[test]
+    fn pending_frontend_cleanup_retries_all_residue_stages() {
+        let (mut qmp, server) = qmp_with_responses(vec![
+            r#"{"error":{"class":"GenericError","desc":"injected device delete failure"}}"#,
+            r#"{"error":{"class":"GenericError","desc":"injected query failure"}}"#,
+            r#"{"error":{"class":"DeviceNotFound","desc":"frontend already absent"}}"#,
+            r#"{"return":{}}"#,
+            TEST_BLOCK_FDSETS,
+            r#"{"return":{}}"#,
+            r#"{"return":[]}"#,
+        ]);
+        qmp.block_fdsets.insert("drive-0".to_string(), vec![7]);
+        let attached = BlockCleanupState::attached(true);
+
+        let error = qmp
+            .cleanup_pending_block_device("drive-0", attached)
+            .unwrap_err();
+        assert_eq!(
+            error
+                .downcast_ref::<BlockDeviceCleanupPending>()
+                .unwrap()
+                .state(),
+            attached
+        );
+
+        qmp.cleanup_pending_block_device("drive-0", attached)
+            .unwrap();
+        assert!(!qmp.block_fdsets.contains_key("drive-0"));
+
+        let commands = server.join().unwrap();
+        assert_eq!(commands[0]["execute"], "device_del");
+        assert_eq!(commands[1]["execute"], "qom-list");
+        assert_eq!(commands[2]["execute"], "device_del");
+        assert_eq!(commands[3]["execute"], "blockdev-del");
+        assert_eq!(commands[4]["execute"], "query-fdsets");
+        assert_eq!(commands[5]["execute"], "remove-fd");
+    }
+
+    #[test]
+    fn pending_fdset_only_cleanup_is_idempotent() {
+        let (mut qmp, server) = qmp_with_responses(vec![
+            TEST_BLOCK_FDSETS,
+            r#"{"error":{"class":"GenericError","desc":"injected fdset failure"}}"#,
+            TEST_BLOCK_FDSETS,
+            TEST_BLOCK_FDSETS,
+            r#"{"return":{}}"#,
+            r#"{"return":[]}"#,
+        ]);
+        qmp.block_fdsets.insert("drive-0".to_string(), vec![7]);
+        let fdset_only = BlockCleanupState {
+            frontend: false,
+            backend: false,
+            fdsets: true,
+        };
+
+        let error = qmp
+            .cleanup_pending_block_device("drive-0", fdset_only)
+            .unwrap_err();
+        assert_eq!(
+            error
+                .downcast_ref::<BlockDeviceCleanupPending>()
+                .unwrap()
+                .state(),
+            fdset_only
+        );
+        qmp.cleanup_pending_block_device("drive-0", fdset_only)
+            .unwrap();
+        qmp.cleanup_pending_block_device("drive-0", BlockCleanupState::default())
+            .unwrap();
+
+        assert!(!qmp.block_fdsets.contains_key("drive-0"));
+        let commands = server.join().unwrap();
+        assert_eq!(commands.len(), 6);
+        assert_eq!(commands[0]["execute"], "query-fdsets");
+        assert_eq!(commands[1]["execute"], "remove-fd");
+        assert_eq!(commands[2]["execute"], "query-fdsets");
+        assert_eq!(commands[3]["execute"], "query-fdsets");
+        assert_eq!(commands[4]["execute"], "remove-fd");
+        assert_eq!(commands[5]["execute"], "query-fdsets");
+    }
+
+    #[test]
+    fn pending_backend_cleanup_verifies_already_absent_node() {
+        let (mut qmp, server) = qmp_with_responses(vec![
+            r#"{"error":{"class":"DeviceNotFound","desc":"backend already absent"}}"#,
+        ]);
+        let backend_only = BlockCleanupState {
+            frontend: false,
+            backend: true,
+            fdsets: false,
+        };
+
+        qmp.cleanup_pending_block_device("drive-0", backend_only)
+            .unwrap();
+
+        let commands = server.join().unwrap();
+        assert_eq!(commands[0]["execute"], "blockdev-del");
+        assert_eq!(commands.len(), 1);
+    }
 
     #[test]
     fn reconstructs_kata_block_fdsets_from_qmp() {

@@ -882,6 +882,68 @@ mod tests {
     }
 
     #[actix_rt::test]
+    async fn test_qemu_topology_matches_machine_root_port_support() {
+        for (machine_type, expected_mode, expected_root_ports) in [
+            ("q35", PCIePort::RootPort, 8),
+            ("virt", PCIePort::RootPort, 8),
+            ("pseries", PCIePort::NoPort, 0),
+            ("s390-ccw-virtio", PCIePort::NoPort, 0),
+        ] {
+            let mut config = crate::HypervisorConfig::default();
+            config.machine_info.machine_type = machine_type.to_string();
+            config.device_info.pcie_root_port = 8;
+            let topology_config = TopologyConfigInfo {
+                hypervisor_name: crate::HYPERVISOR_QEMU.to_string(),
+                device_info: config.device_info.clone(),
+            };
+            let hypervisor = Qemu::new();
+            hypervisor.set_hypervisor_config(config).await;
+
+            let manager = DeviceManager::new(Arc::new(hypervisor), Some(&topology_config))
+                .await
+                .unwrap();
+            let topology = manager
+                .get_pcie_topology()
+                .expect("QEMU keeps valid non-root-port topology");
+
+            assert_eq!(topology.mode, expected_mode, "{machine_type}");
+            assert_eq!(
+                topology.pcie_root_ports, expected_root_ports,
+                "{machine_type}"
+            );
+            assert_eq!(
+                topology.pcie_port_devices.len(),
+                expected_root_ports as usize,
+                "{machine_type}"
+            );
+        }
+    }
+
+    #[actix_rt::test]
+    async fn test_qemu_machine_gate_does_not_change_other_hypervisors() {
+        for hypervisor_name in ["cloud-hypervisor", "dragonball"] {
+            let mut config = crate::HypervisorConfig::default();
+            config.machine_info.machine_type = "unsupported-by-qemu".to_string();
+            config.device_info.pcie_root_port = 8;
+            let topology_config = TopologyConfigInfo {
+                hypervisor_name: hypervisor_name.to_string(),
+                device_info: config.device_info.clone(),
+            };
+            let hypervisor = Qemu::new();
+            hypervisor.set_hypervisor_config(config).await;
+
+            let manager = DeviceManager::new(Arc::new(hypervisor), Some(&topology_config))
+                .await
+                .unwrap();
+            let topology = manager.get_pcie_topology().unwrap();
+
+            assert_eq!(topology.mode, PCIePort::RootPort, "{hypervisor_name}");
+            assert_eq!(topology.pcie_root_ports, 8, "{hypervisor_name}");
+            assert_eq!(topology.pcie_port_devices.len(), 8, "{hypervisor_name}");
+        }
+    }
+
+    #[actix_rt::test]
     async fn test_new_block_device() {
         let dm = new_device_manager().await;
         assert!(dm.is_ok());

@@ -4060,6 +4060,104 @@ mod tests {
         config
     }
 
+    #[test]
+    fn preconfigured_root_ports_have_stable_order() {
+        let ports = HashMap::from([
+            (7, TopologyPortDevice::new(7, "pcie.0")),
+            (0, TopologyPortDevice::new(0, "pcie.0")),
+            (3, TopologyPortDevice::new(3, "pcie.0")),
+        ]);
+
+        let ordered_ids: Vec<_> = sorted_root_ports(ports)
+            .into_iter()
+            .map(|(index, port)| (index, port.port_id()))
+            .collect();
+
+        assert_eq!(
+            ordered_ids,
+            vec![
+                (0, "rp0".to_string()),
+                (3, "rp3".to_string()),
+                (7, "rp7".to_string())
+            ]
+        );
+    }
+
+    #[test]
+    fn qemu_pci_profiles_configure_eight_emptydir_root_ports() {
+        const DIRECT_PROFILES: [(&str, &str); 5] = [
+            (
+                "qemu",
+                include_str!("../../../../config/configuration-qemu-runtime-rs.toml.in"),
+            ),
+            (
+                "qemu-coco-dev",
+                include_str!("../../../../config/configuration-qemu-coco-dev-runtime-rs.toml.in"),
+            ),
+            (
+                "qemu-nvidia-cpu",
+                include_str!("../../../../config/configuration-qemu-nvidia-cpu-runtime-rs.toml.in"),
+            ),
+            (
+                "qemu-snp",
+                include_str!("../../../../config/configuration-qemu-snp-runtime-rs.toml.in"),
+            ),
+            (
+                "qemu-tdx",
+                include_str!("../../../../config/configuration-qemu-tdx-runtime-rs.toml.in"),
+            ),
+        ];
+        for (profile, template) in DIRECT_PROFILES {
+            assert!(
+                template
+                    .lines()
+                    .any(|line| line.trim() == "pcie_root_port = 8"),
+                "{} must configure eight PCIe root ports",
+                profile
+            );
+        }
+
+        const NVIDIA_GPU_PROFILES: [(&str, &str); 3] = [
+            (
+                "qemu-nvidia-gpu",
+                include_str!("../../../../config/configuration-qemu-nvidia-gpu-runtime-rs.toml.in"),
+            ),
+            (
+                "qemu-nvidia-gpu-snp",
+                include_str!(
+                    "../../../../config/configuration-qemu-nvidia-gpu-snp-runtime-rs.toml.in"
+                ),
+            ),
+            (
+                "qemu-nvidia-gpu-tdx",
+                include_str!(
+                    "../../../../config/configuration-qemu-nvidia-gpu-tdx-runtime-rs.toml.in"
+                ),
+            ),
+        ];
+        for (profile, template) in NVIDIA_GPU_PROFILES {
+            assert!(
+                template
+                    .lines()
+                    .any(|line| line.trim() == "pcie_root_port = @DEFAULTPCIEROOTPORT_NV@"),
+                "{} must use the NVIDIA root-port capacity",
+                profile
+            );
+        }
+        assert!(include_str!("../../../../Makefile")
+            .lines()
+            .any(|line| line.trim() == "DEFAULTPCIEROOTPORT_NV := 8"));
+
+        let se_template =
+            include_str!("../../../../config/configuration-qemu-se-runtime-rs.toml.in");
+        assert!(se_template
+            .lines()
+            .any(|line| line.trim() == "pcie_root_port = 0"));
+        assert!(include_str!("../../../../Makefile")
+            .lines()
+            .any(|line| line.trim() == "DEFBLOCKSTORAGEDRIVER_QEMU := virtio-blk-ccw"));
+    }
+
     fn has_qemu_arg(params: &[String], option: &str, value: &str) -> bool {
         params
             .windows(2)

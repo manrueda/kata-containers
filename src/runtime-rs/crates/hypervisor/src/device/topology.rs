@@ -1014,6 +1014,50 @@ mod tests {
     }
 
     #[test]
+    fn test_reserve_existing_root_ports_for_eight_block_devices() {
+        let mut topology = new_pcie_topology(8, 0);
+        topology.add_root_ports_on_bus(8).unwrap();
+
+        for count in 1_u32..=8 {
+            let device_id = format!("drive-{count}");
+            assert_eq!(
+                topology
+                    .reserve_existing_root_port_for_device(&device_id)
+                    .unwrap(),
+                format!("rp{}", count - 1)
+            );
+            if matches!(count, 1 | 4 | 8) {
+                assert_eq!(topology.reserved_bus.len(), count as usize);
+            }
+        }
+
+        assert!(topology
+            .reserve_existing_root_port_for_device("drive-9")
+            .is_err());
+    }
+
+    #[test]
+    fn test_release_existing_root_port_after_attach_failure() {
+        let mut topology = new_pcie_topology(2, 0);
+        topology.add_root_ports_on_bus(2).unwrap();
+
+        assert_eq!(
+            topology
+                .reserve_existing_root_port_for_device("failed-drive")
+                .unwrap(),
+            "rp0"
+        );
+        topology.release_bus_for_device("failed-drive").unwrap();
+
+        assert_eq!(
+            topology
+                .reserve_existing_root_port_for_device("replacement-drive")
+                .unwrap(),
+            "rp0"
+        );
+    }
+
+    #[test]
     fn test_add_switch_ports_single_root_port() {
         let mut topology = new_pcie_topology(0, 2);
         assert!(topology

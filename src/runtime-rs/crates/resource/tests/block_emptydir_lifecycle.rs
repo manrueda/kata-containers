@@ -4,6 +4,7 @@
 
 use std::{
     collections::HashMap,
+    convert::TryFrom,
     path::{Path, PathBuf},
     sync::{Arc, LazyLock, Mutex},
     time::Duration,
@@ -15,15 +16,18 @@ use async_trait::async_trait;
 use hypervisor::{
     device::{
         device_manager::{find_device_id, DeviceManager},
+        pci_path::PciPath,
         DeviceStateInDoubt, DeviceType,
     },
     hypervisor_persist::HypervisorState,
-    Hypervisor, MemoryConfig, VcpuThreadIds, VIRTIO_BLOCK_MMIO,
+    Hypervisor, MemoryConfig, VcpuThreadIds, KATA_BLK_DEV_TYPE, VIRTIO_BLOCK_MMIO,
+    VIRTIO_BLOCK_PCI,
 };
 use kata_types::{
     capabilities::{Capabilities, CapabilityBits},
     config::{
-        hypervisor::Hypervisor as HypervisorConfig, Agent as AgentConfig, EMPTYDIR_MODE_BLOCK_PLAIN,
+        hypervisor::{Hypervisor as HypervisorConfig, TopologyConfigInfo, VIRTIO_SCSI},
+        Agent as AgentConfig, EMPTYDIR_MODE_BLOCK_PLAIN,
     },
     mount::{join_path, kata_direct_volume_root_path, KATA_MOUNT_INFO_FILE_NAME},
 };
@@ -43,9 +47,21 @@ struct FakeState {
     attempted_devices: Vec<(String, String)>,
     attempted_indexes: Vec<u64>,
     added_devices: Vec<(String, String)>,
+    block_adds: Vec<BlockAdd>,
     removed_paths: Vec<String>,
     add_events: Vec<AddEvent>,
     running: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct BlockAdd {
+    device_id: String,
+    driver_option: String,
+    discard_unmap: bool,
+    pcie_root_port: Option<String>,
+    use_pcie_root_port: bool,
+    index: u64,
+    path_on_host: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -130,6 +146,7 @@ impl FakeHypervisor {
             attempted_devices: state.attempted_devices.clone(),
             attempted_indexes: state.attempted_indexes.clone(),
             added_devices: state.added_devices.clone(),
+            block_adds: state.block_adds.clone(),
             removed_paths: state.removed_paths.clone(),
             add_events: state.add_events.clone(),
         }
@@ -141,8 +158,27 @@ struct FakeSnapshot {
     attempted_devices: Vec<(String, String)>,
     attempted_indexes: Vec<u64>,
     added_devices: Vec<(String, String)>,
+    block_adds: Vec<BlockAdd>,
     removed_paths: Vec<String>,
     add_events: Vec<AddEvent>,
+}
+
+async fn block_add(device: &DeviceType) -> Option<BlockAdd> {
+    match device {
+        DeviceType::BlockModern(block) => {
+            let block = block.lock().await;
+            Some(BlockAdd {
+                device_id: block.device_id.clone(),
+                driver_option: block.config.driver_option.clone(),
+                discard_unmap: block.config.discard_unmap,
+                pcie_root_port: block.config.pcie_root_port.clone(),
+                use_pcie_root_port: block.config.use_pcie_root_port,
+                index: block.config.index,
+                path_on_host: block.config.path_on_host.clone(),
+            })
+        }
+        _ => None,
+    }
 }
 
 async fn block_identity(device: &DeviceType) -> Option<(String, String)> {
@@ -208,19 +244,19 @@ impl Hypervisor for FakeHypervisor {
     }
 
     async fn add_device(&self, device: DeviceType) -> Result<DeviceType> {
-        let (device_id, path) = block_identity(&device)
+        let block_add = block_add(&device)
             .await
             .ok_or_else(|| anyhow!("expected BlockModern device"))?;
-        let DeviceType::BlockModern(block) = &device else {
-            unreachable!("block identity requires a BlockModern device");
-        };
-        let index = block.lock().await.config.index;
+        let device_id = block_add.device_id.clone();
+        let path = block_add.path_on_host.clone();
+        let index = block_add.index;
         let ordinal = {
             let mut state = self.state.lock().unwrap();
             state
                 .attempted_devices
                 .push((device_id.clone(), path.clone()));
             state.attempted_indexes.push(index);
+            state.block_adds.push(block_add.clone());
             let ordinal = state.attempted_devices.len();
             state.add_events.push(AddEvent::Attempt(ordinal));
             ordinal
@@ -253,6 +289,12 @@ impl Hypervisor for FakeHypervisor {
                 device_id,
                 "injected ambiguous add_device failure",
             )));
+        }
+        if block_add.driver_option == KATA_BLK_DEV_TYPE {
+            let pci_path = PciPath::try_from(format!("{:02x}/00", block_add.index + 2).as_str())?;
+            if let DeviceType::BlockModern(block) = &device {
+                block.lock().await.config.pci_path = Some(pci_path);
+            }
         }
         self.state
             .lock()
@@ -395,8 +437,29 @@ impl Harness {
     }
 
     async fn with_hypervisor(hypervisor: FakeHypervisor) -> Self {
+        Self::with_hypervisor_and_topology(hypervisor, None).await
+    }
+
+    async fn qemu(block_driver: &str) -> Self {
+        let mut hypervisor = FakeHypervisor::new(None, true);
+        hypervisor.config.machine_info.machine_type = "virt".to_string();
+        hypervisor.config.blockdev_info.block_device_driver = block_driver.to_string();
+        hypervisor.config.device_info.pcie_root_port = 8;
+        let topology = TopologyConfigInfo {
+            hypervisor_name: hypervisor::HYPERVISOR_QEMU.to_string(),
+            device_info: hypervisor.config.device_info.clone(),
+        };
+        Self::with_hypervisor_and_topology(hypervisor, Some(&topology)).await
+    }
+
+    async fn with_hypervisor_and_topology(
+        hypervisor: FakeHypervisor,
+        topology: Option<&TopologyConfigInfo>,
+    ) -> Self {
         let hypervisor = Arc::new(hypervisor);
-        let device_manager = DeviceManager::new(hypervisor.clone(), None).await.unwrap();
+        let device_manager = DeviceManager::new(hypervisor.clone(), topology)
+            .await
+            .unwrap();
         Self {
             volume_resource: VolumeResource::new(),
             device_manager: RwLock::new(device_manager),
@@ -1018,6 +1081,80 @@ async fn ambiguous_attach_without_path_lookup(root: &Path) {
     assert!(!metadata_path(source).exists());
 }
 
+async fn qemu_constructor_owns_pcie_root_port_attachments(root: &Path, block_driver: &str) {
+    let harness = Harness::qemu(block_driver).await;
+    let (spec, sources) = emptydir_spec(root, 8);
+    let volumes = harness.handle(&spec).await.unwrap();
+    let snapshot = harness.hypervisor.snapshot();
+
+    assert_eq!(volumes.len(), 8);
+    assert_eq!(snapshot.attempted_devices, snapshot.added_devices);
+    assert_eq!(snapshot.block_adds.len(), 8);
+    for (index, add) in snapshot.block_adds.iter().enumerate() {
+        let expected_root_port = format!("rp{index}");
+        assert_eq!(add.driver_option, KATA_BLK_DEV_TYPE);
+        assert!(add.discard_unmap);
+        assert!(add.use_pcie_root_port);
+        assert_eq!(
+            add.pcie_root_port.as_deref(),
+            Some(expected_root_port.as_str())
+        );
+        assert_eq!(add.index, index as u64);
+        assert_eq!(
+            add.path_on_host,
+            disk_path(&sources[index]).display().to_string()
+        );
+
+        let storage = volumes[index].get_storage().unwrap().pop().unwrap();
+        assert_eq!(storage.driver, KATA_BLK_DEV_TYPE);
+        assert_eq!(storage.source, format!("{:02x}/00", index + 2));
+    }
+    assert_eq!(
+        harness
+            .device_manager
+            .read()
+            .await
+            .get_pcie_topology()
+            .unwrap()
+            .reserved_bus
+            .len(),
+        8
+    );
+
+    harness
+        .volume_resource
+        .detach_ephemeral_disks(&harness.device_manager)
+        .await
+        .unwrap();
+    let device_manager = harness.device_manager.read().await;
+    assert!(snapshot
+        .block_adds
+        .iter()
+        .all(|add| !device_manager.contains_device(&add.device_id)));
+    drop(device_manager);
+    assert!(harness
+        .device_manager
+        .read()
+        .await
+        .get_pcie_topology()
+        .unwrap()
+        .reserved_bus
+        .is_empty());
+    assert!(sources
+        .iter()
+        .all(|source| disk_path(source).exists() && metadata_path(source).exists()));
+
+    harness.hypervisor.stop();
+    harness
+        .volume_resource
+        .finalize_ephemeral_disks(&harness.device_manager)
+        .await
+        .unwrap();
+    assert!(sources
+        .iter()
+        .all(|source| !disk_path(source).exists() && !metadata_path(source).exists()));
+}
+
 static TEST_RUNTIME_DIR: LazyLock<TempDir> = LazyLock::new(|| {
     kata_types::rootless::set_rootless(true);
     let runtime_dir = TempDir::new().unwrap();
@@ -1317,4 +1454,24 @@ async fn failed_detach_during_rollback_converges_after_vm_stop() {
 async fn ambiguous_attach_preserves_artifacts_without_path_lookup() {
     let root = test_root();
     ambiguous_attach_without_path_lookup(&root.path().join("ambiguous")).await;
+}
+
+#[tokio::test]
+async fn qemu_constructor_selects_pcie_root_ports_for_eight_emptydirs() {
+    let root = test_root();
+    qemu_constructor_owns_pcie_root_port_attachments(
+        &root.path().join("qemu-converted-scsi"),
+        VIRTIO_SCSI,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn qemu_constructor_reserves_root_ports_for_preselected_pci() {
+    let root = test_root();
+    qemu_constructor_owns_pcie_root_port_attachments(
+        &root.path().join("qemu-preselected-pci"),
+        VIRTIO_BLOCK_PCI,
+    )
+    .await;
 }

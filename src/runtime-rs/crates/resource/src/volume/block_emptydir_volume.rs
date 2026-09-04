@@ -867,7 +867,7 @@ fn get_filesystem_capacity(path: &Path) -> Result<u64> {
 mod tests {
     use super::*;
     use crate::volume::EphemeralDiskStore;
-    use kata_types::config::hypervisor::VIRTIO_BLK_CCW;
+    use kata_types::config::hypervisor::{VIRTIO_BLK_CCW, VIRTIO_BLK_MMIO};
     use std::sync::Arc;
 
     const ARTIFACT_FAILURE_TEST_ENV: &str = "KATA_TEST_BLOCK_EMPTYDIR_ARTIFACT_FAILURE";
@@ -878,20 +878,59 @@ mod tests {
     const TRACKING_ID_EXHAUSTION_TEST_ENV: &str = "KATA_TEST_BLOCK_EMPTYDIR_TRACKING_ID_EXHAUSTION";
 
     #[test]
-    fn block_emptydir_uses_virtio_blk_when_discard_requires_it() {
-        assert_eq!(
-            block_emptydir_driver(true, VIRTIO_SCSI),
-            VIRTIO_BLK_PCI
-        );
+    fn block_emptydir_selects_qemu_discard_transport_and_root_port() {
+        let qemu = PCIeTopology {
+            hypervisor_name: HYPERVISOR_QEMU.to_string(),
+            pcie_root_ports: 8,
+            ..Default::default()
+        };
+        let qemu_without_root_ports = PCIeTopology {
+            hypervisor_name: HYPERVISOR_QEMU.to_string(),
+            ..Default::default()
+        };
+        let cloud_hypervisor = PCIeTopology {
+            hypervisor_name: "cloud-hypervisor".to_string(),
+            pcie_root_ports: 8,
+            ..Default::default()
+        };
+
+        assert_eq!(block_emptydir_driver(true, VIRTIO_SCSI), VIRTIO_BLK_PCI);
         assert_eq!(block_emptydir_driver(false, VIRTIO_SCSI), VIRTIO_SCSI);
         assert_eq!(
             block_emptydir_driver(true, VIRTIO_BLK_PCI),
             VIRTIO_BLK_PCI
         );
-        assert_eq!(
-            block_emptydir_driver(true, VIRTIO_BLK_CCW),
-            VIRTIO_BLK_CCW
-        );
+        assert_eq!(block_emptydir_driver(true, VIRTIO_BLK_CCW), VIRTIO_BLK_CCW);
+
+        assert!(use_qemu_pcie_root_port(VIRTIO_BLK_PCI, "q35", Some(&qemu)));
+        assert!(use_qemu_pcie_root_port(VIRTIO_BLK_PCI, "virt", Some(&qemu)));
+        assert!(!use_qemu_pcie_root_port(
+            VIRTIO_BLK_PCI,
+            "pseries",
+            Some(&qemu)
+        ));
+        assert!(!use_qemu_pcie_root_port(VIRTIO_SCSI, "q35", Some(&qemu)));
+        assert!(!use_qemu_pcie_root_port(
+            VIRTIO_BLK_CCW,
+            "s390-ccw-virtio",
+            Some(&qemu)
+        ));
+        assert!(!use_qemu_pcie_root_port(
+            VIRTIO_BLK_MMIO,
+            "virt",
+            Some(&qemu)
+        ));
+        assert!(!use_qemu_pcie_root_port(
+            VIRTIO_BLK_PCI,
+            "q35",
+            Some(&cloud_hypervisor)
+        ));
+        assert!(!use_qemu_pcie_root_port(
+            VIRTIO_BLK_PCI,
+            "q35",
+            Some(&qemu_without_root_ports)
+        ));
+        assert!(!use_qemu_pcie_root_port(VIRTIO_BLK_PCI, "q35", None));
     }
 
     #[test]

@@ -1613,6 +1613,22 @@ mod tests {
         assert!(qemu.get_pids().await.unwrap().is_empty());
     }
 
+    #[test]
+    fn test_qemu_block_driver_honors_per_device_transport() {
+        assert_eq!(
+            qemu_block_driver(KATA_BLK_DEV_TYPE, VIRTIO_SCSI).unwrap(),
+            VIRTIO_BLK_PCI
+        );
+        assert_eq!(
+            qemu_block_driver(KATA_SCSI_DEV_TYPE, VIRTIO_BLK_PCI).unwrap(),
+            VIRTIO_SCSI
+        );
+        assert_eq!(
+            qemu_block_driver(KATA_CCW_DEV_TYPE, VIRTIO_SCSI).unwrap(),
+            VIRTIO_BLK_CCW
+        );
+    }
+
     #[rstest]
     #[case::seccomp_sandbox_unset(None, Err(io::ErrorKind::NotFound), false, None)]
     #[case::seccomp_sandbox_empty(Some(""), Err(io::ErrorKind::NotFound), false, None)]
