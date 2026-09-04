@@ -15,9 +15,39 @@ use kata_types::config::hypervisor::Hypervisor as HypervisorConfig;
 use kata_types::config::hypervisor::HYPERVISOR_NAME_CH;
 use persist::sandbox_persist::Persist;
 use std::collections::HashMap;
-use tokio::sync::watch::{channel, Receiver, Sender};
+#[cfg(test)]
+use std::collections::VecDeque;
+use std::sync::Arc;
+use tokio::process::Child;
+use tokio::sync::mpsc;
+use tokio::sync::watch::Sender;
+use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
-use tokio::{process::Child, sync::mpsc};
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ProcessCleanupFault {
+    StartKill,
+}
+
+#[derive(Debug)]
+pub(crate) struct ChildProcess {
+    pub(crate) child: Child,
+    #[cfg(test)]
+    pub(crate) cleanup_faults: VecDeque<ProcessCleanupFault>,
+}
+
+impl ChildProcess {
+    pub(crate) fn new(child: Child) -> Self {
+        Self {
+            child,
+            #[cfg(test)]
+            cleanup_faults: VecDeque::new(),
+        }
+    }
+}
+
+pub(crate) type SharedChild = Arc<Mutex<Option<ChildProcess>>>;
 
 #[derive(Debug)]
 pub struct CloudHypervisorInner {
@@ -29,8 +59,8 @@ pub struct CloudHypervisorInner {
 
     pub(crate) config: HypervisorConfig,
 
-    pub(crate) process: Option<Child>,
     pub(crate) pid: Option<u32>,
+    pub(crate) process: Option<SharedChild>,
 
     pub(crate) timeout_secs: i32,
 
@@ -51,8 +81,16 @@ pub struct CloudHypervisorInner {
     pub(crate) _capabilities: Capabilities,
 
     pub(crate) shutdown_tx: Option<Sender<bool>>,
-    pub(crate) shutdown_rx: Option<Receiver<bool>>,
-    pub(crate) tasks: Option<Vec<JoinHandle<Result<()>>>>,
+    pub(crate) logger_task: Option<JoinHandle<Result<()>>>,
+
+    #[cfg(test)]
+    pub(crate) panic_after_spawn: bool,
+    #[cfg(test)]
+    pub(crate) last_spawned_pid: Option<u32>,
+    #[cfg(test)]
+    pub(crate) report_cleanup_uncertain: bool,
+    #[cfg(test)]
+    pub(crate) panic_during_netdev_add: bool,
 
     // Set if the hardware supports creating a protected guest *AND* if the
     // user has requested creating a protected guest.
@@ -93,14 +131,12 @@ impl CloudHypervisorInner {
                 | CapabilityBits::HybridVsockSupport,
         );
 
-        let (tx, rx) = channel(true);
-
         Self {
             api_socket: ApiSocket::new(None),
             extra_args: None,
 
-            process: None,
             pid: None,
+            process: None,
 
             config: Default::default(),
             state: VmmState::NotReady,
@@ -113,9 +149,16 @@ impl CloudHypervisorInner {
             pending_devices: vec![],
             device_ids: HashMap::<String, String>::new(),
             _capabilities: capabilities,
-            shutdown_tx: Some(tx),
-            shutdown_rx: Some(rx),
-            tasks: None,
+            shutdown_tx: None,
+            logger_task: None,
+            #[cfg(test)]
+            panic_after_spawn: false,
+            #[cfg(test)]
+            last_spawned_pid: None,
+            #[cfg(test)]
+            report_cleanup_uncertain: false,
+            #[cfg(test)]
+            panic_during_netdev_add: false,
             guest_protection_to_use: GuestProtection::NoProtection,
             ch_features: None,
             guest_memory_block_size_mb: 0,
@@ -171,8 +214,6 @@ impl Persist for CloudHypervisorInner {
         exit_notify: mpsc::Sender<i32>,
         hypervisor_state: Self::State,
     ) -> Result<Self> {
-        let (tx, rx) = channel(true);
-
         let mut ch = Self {
             config: hypervisor_state.config,
             state: VmmState::NotReady,
@@ -184,9 +225,9 @@ impl Persist for CloudHypervisorInner {
 
             pending_devices: vec![],
             device_ids: HashMap::<String, String>::new(),
-            tasks: None,
-            shutdown_tx: Some(tx),
-            shutdown_rx: Some(rx),
+            process: None,
+            logger_task: None,
+            shutdown_tx: None,
             timeout_secs: CH_DEFAULT_TIMEOUT_SECS as i32,
             jailer_root: String::default(),
             ch_features: None,

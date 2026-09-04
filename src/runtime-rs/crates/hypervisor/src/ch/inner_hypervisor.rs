@@ -3,7 +3,7 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-use super::inner::CloudHypervisorInner;
+use super::inner::{ChildProcess, CloudHypervisorInner, SharedChild};
 use super::inner_device::OwnedNetworkConfig;
 use crate::ch::utils::get_api_socket_path;
 use crate::ch::utils::get_rootless_symlink_sandbox_path;
@@ -25,13 +25,14 @@ use ch_config::{
         cloud_hypervisor_vm_create, cloud_hypervisor_vm_info, cloud_hypervisor_vm_pause,
         cloud_hypervisor_vm_resize, cloud_hypervisor_vm_restore, cloud_hypervisor_vm_resume,
         cloud_hypervisor_vm_snapshot, cloud_hypervisor_vm_start, cloud_hypervisor_vmm_ping,
-        cloud_hypervisor_vmm_shutdown, RestoreConfig, VmSnapshotConfig,
+        cloud_hypervisor_vmm_shutdown, is_api_command_not_dispatched, is_definite_server_response,
+        RestoreConfig, VmSnapshotConfig,
     },
     VmResize,
 };
 use ch_config::{guest_protection_is_tdx, NamedHypervisorConfig, State, VmConfig};
 use core::future::poll_fn;
-use futures::future::join_all;
+use futures::FutureExt;
 use kata_sys_util::protection::{available_guest_protection, GuestProtection};
 use kata_types::capabilities::{Capabilities, CapabilityBits};
 use kata_types::config::default::DEFAULT_CH_ROOTFS_TYPE;
@@ -47,14 +48,18 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::convert::TryFrom;
 use std::fs;
+use std::future::Future;
+use std::io;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
+use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::process::Stdio;
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
 use tokio::io::BufReader;
-use tokio::process::{Child, Command};
+use tokio::process::{ChildStderr, ChildStdout, Command};
 use tokio::sync::watch::Receiver;
 use tokio::task;
 use tokio::task::JoinHandle;
@@ -74,6 +79,48 @@ const CH_FEATURE_TDX: &str = "tdx";
 
 const CLH_TEMPLATE_STATE_FILE: &str = "state.json";
 const CLH_TEMPLATE_CONFIG_FILE: &str = "config.json";
+
+type ProcessWait<'a> = Pin<Box<dyn Future<Output = io::Result<i32>> + Send + 'a>>;
+
+trait ProcessHandle {
+    fn start_kill(&mut self) -> io::Result<()>;
+    fn try_wait(&mut self) -> io::Result<Option<i32>>;
+    fn wait(&mut self) -> ProcessWait<'_>;
+}
+
+impl ChildProcess {
+    #[cfg(test)]
+    fn take_fault(&mut self, fault: super::inner::ProcessCleanupFault) -> bool {
+        if self.cleanup_faults.front() == Some(&fault) {
+            self.cleanup_faults.pop_front();
+            true
+        } else {
+            false
+        }
+    }
+}
+
+impl ProcessHandle for ChildProcess {
+    fn start_kill(&mut self) -> io::Result<()> {
+        #[cfg(test)]
+        if self.take_fault(super::inner::ProcessCleanupFault::StartKill) {
+            return Err(io::Error::other("injected start_kill failure"));
+        }
+
+        self.child.start_kill()
+    }
+
+    fn try_wait(&mut self) -> io::Result<Option<i32>> {
+        self.child
+            .try_wait()
+            .map(|status| status.map(|status| status.code().unwrap_or(0)))
+    }
+
+    fn wait(&mut self) -> ProcessWait<'_> {
+        let child = &mut self.child;
+        Box::pin(async move { child.wait().await.map(|status| status.code().unwrap_or(0)) })
+    }
+}
 
 #[derive(Debug, PartialEq)]
 enum CloudHypervisorLogLevel {
@@ -109,23 +156,131 @@ impl CloudHypervisorInner {
             .await
             .context("launch failed")?;
 
-        self.cloud_hypervisor_setup_comms()
-            .await
-            .context("comms setup failed")?;
-
-        self.cloud_hypervisor_check_running()
-            .await
-            .context("hypervisor running check failed")?;
-
-        if guest_protection_is_tdx(self.guest_protection_to_use.clone()) {
-            if let Some(features) = &self.ch_features {
-                if !features.contains(&CH_FEATURE_TDX.to_string()) {
-                    return Err(anyhow!("Cloud Hypervisor is not built with TDX support"));
-                }
-            }
+        #[cfg(test)]
+        if self.panic_after_spawn {
+            panic!("injected post-spawn Cloud Hypervisor start panic");
         }
 
+        let setup_result = async {
+            self.cloud_hypervisor_setup_comms()
+                .await
+                .context("comms setup failed")?;
+
+            self.cloud_hypervisor_check_running()
+                .await
+                .context("hypervisor running check failed")?;
+
+            if guest_protection_is_tdx(self.guest_protection_to_use.clone()) {
+                if let Some(features) = &self.ch_features {
+                    if !features.contains(&CH_FEATURE_TDX.to_string()) {
+                        return Err(anyhow!("Cloud Hypervisor is not built with TDX support"));
+                    }
+                }
+            }
+
+            Ok(())
+        }
+        .await;
+        if let Err(error) = setup_result {
+            return Err(self.cleanup_start_failure(error, "start").await);
+        }
         Ok(())
+    }
+
+    pub(super) fn has_active_process_resources(&self) -> bool {
+        self.pid.is_some() || self.process.is_some() || self.logger_task.is_some()
+    }
+
+    pub(super) async fn has_active_epoch_resources(&self) -> bool {
+        self.has_active_process_resources()
+            || self.shutdown_tx.is_some()
+            || self.api_socket.is_open().await
+            || !self.device_ids.is_empty()
+    }
+
+    async fn join_logger_task(&mut self) -> Result<()> {
+        let Some(logger_task) = self.logger_task.take() else {
+            return Ok(());
+        };
+
+        match logger_task.await {
+            Ok(result) => result,
+            Err(error) => Err(anyhow!("logger task join failed: {error}")),
+        }
+    }
+
+    async fn terminate_process(&mut self) -> Result<()> {
+        let Some(process) = self.process.as_ref() else {
+            return if self.pid.is_some() {
+                Err(anyhow!(
+                    "Cloud Hypervisor process handle is unavailable for PID {:?}",
+                    self.pid
+                ))
+            } else {
+                Ok(())
+            };
+        };
+
+        terminate_shared_child(process, self.exit_notify.as_ref()).await?;
+        self.process = None;
+        self.pid = None;
+        Ok(())
+    }
+
+    async fn cleanup_start_failure(
+        &mut self,
+        error: anyhow::Error,
+        phase: &'static str,
+    ) -> anyhow::Error {
+        match self.terminate_launched_hypervisor().await {
+            Ok(()) => error,
+            Err(cleanup_error) => error.context(format!(
+                "Cloud Hypervisor {phase} cleanup remains unresolved: {cleanup_error:#}"
+            )),
+        }
+    }
+
+    pub(super) async fn terminate_launched_hypervisor(&mut self) -> Result<()> {
+        if let Some(shutdown) = self.shutdown_tx.as_mut() {
+            let _ = shutdown.send(true);
+        }
+
+        let logger_result = self.join_logger_task().await;
+        #[cfg(test)]
+        let process_result = if self.report_cleanup_uncertain {
+            Err(anyhow!(
+                "injected uncertainty before Cloud Hypervisor process cleanup"
+            ))
+        } else {
+            self.terminate_process().await
+        };
+        #[cfg(not(test))]
+        let process_result = self.terminate_process().await;
+
+        self.api_socket.close().await;
+        self.shutdown_tx = None;
+        self.state = VmmState::NotReady;
+
+        if process_result.is_ok() {
+            self.process = None;
+            self.pid = None;
+            self.device_ids.clear();
+        }
+
+        match (logger_result, process_result) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(logger_error), Ok(())) => {
+                warn!(
+                    sl!(),
+                    "Cloud Hypervisor logger task failed after process cleanup: {logger_error:#}"
+                );
+                Ok(())
+            }
+            (Ok(()), Err(process_error)) => Err(process_error),
+            (Err(logger_error), Err(process_error)) => Err(process_error.context(format!(
+                "Cloud Hypervisor logger task also failed: {logger_error:#}"
+            ))),
+        }
     }
 
     async fn get_kernel_params(&self) -> Result<String> {
@@ -257,6 +412,10 @@ impl CloudHypervisorInner {
     ) -> Result<()> {
         for net in network_devices.unwrap_or_default() {
             let OwnedNetworkConfig { config, fds } = net;
+            #[cfg(test)]
+            if self.panic_during_netdev_add {
+                panic!("injected panic while owning cold-plug network descriptors");
+            }
             let raw_fds = fds.iter().map(std::os::fd::AsRawFd::as_raw_fd).collect();
             let response =
                 cloud_hypervisor_vm_netdev_add_with_fds(&self.api_socket, config, raw_fds)
@@ -466,11 +625,11 @@ impl CloudHypervisorInner {
     }
 
     async fn cloud_hypervisor_ensure_not_launched(&self) -> Result<()> {
-        if let Some(child) = &self.process {
+        if self.has_active_process_resources() {
             return Err(anyhow!(
-                "{} already running with PID {}",
+                "{} already has active or unresolved process resources for PID {:?}",
                 CH_NAME,
-                child.id().unwrap_or(0)
+                self.pid
             ));
         }
 
@@ -501,6 +660,7 @@ impl CloudHypervisorInner {
         cmd.stdin(Stdio::null());
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
+        cmd.kill_on_drop(true);
 
         cmd.env("RUST_BACKTRACE", "full");
 
@@ -575,29 +735,53 @@ impl CloudHypervisorInner {
 
         debug!(sl!(), "launching {} as: {:?}", CH_NAME, cmd);
 
-        let child = cmd.spawn().context(format!("{CH_NAME} spawn failed"))?;
-
-        // Save process PID
-        self.pid = child.id();
-
-        let shutdown = self
-            .shutdown_rx
-            .as_ref()
-            .ok_or("no receiver channel")
-            .map_err(|e| anyhow!(e))?
-            .clone();
-
         let exit_notify: mpsc::Sender<i32> = self
             .exit_notify
-            .take()
+            .as_ref()
+            .cloned()
             .ok_or_else(|| anyhow!("no exit notify"))?;
+        let (shutdown_tx, shutdown) = tokio::sync::watch::channel(false);
 
-        let ch_outputlogger_task =
-            tokio::spawn(cloud_hypervisor_log_output(child, shutdown, exit_notify));
+        let child = cmd.spawn().context(format!("{CH_NAME} spawn failed"))?;
+        let process = Arc::new(tokio::sync::Mutex::new(Some(ChildProcess::new(child))));
 
-        let tasks = vec![ch_outputlogger_task];
+        // Save process PID
+        self.pid = process
+            .lock()
+            .await
+            .as_ref()
+            .and_then(|process| process.child.id());
+        #[cfg(test)]
+        {
+            self.last_spawned_pid = self.pid;
+        }
+        self.process = Some(process.clone());
+        self.shutdown_tx = Some(shutdown_tx);
 
-        self.tasks = Some(tasks);
+        let (stdout, stderr) = {
+            let mut process = process.lock().await;
+            let child = &mut process
+                .as_mut()
+                .expect("spawned Cloud Hypervisor process is present")
+                .child;
+            let stdout = child
+                .stdout
+                .take()
+                .expect("Cloud Hypervisor stdout was configured as piped");
+            let stderr = child
+                .stderr
+                .take()
+                .expect("Cloud Hypervisor stderr was configured as piped");
+            (stdout, stderr)
+        };
+
+        self.logger_task = Some(tokio::spawn(cloud_hypervisor_log_output(
+            stdout,
+            stderr,
+            process,
+            shutdown,
+            exit_notify,
+        )));
 
         Ok(())
     }
@@ -606,61 +790,11 @@ impl CloudHypervisorInner {
         let response = cloud_hypervisor_vmm_shutdown(&self.api_socket)
             .await
             .context("shutdown failed")?;
-
         if let Some(detail) = response {
             debug!(sl!(), "shutdown response: {:?}", detail);
         }
 
-        // Trigger a controlled shutdown
-        self.shutdown_tx
-            .as_mut()
-            .ok_or("no shutdown channel")
-            .map_err(|e| anyhow!(e))?
-            .send(true)
-            .map_err(|e| anyhow!(e).context("failed to request shutdown"))?;
-
-        let tasks = self
-            .tasks
-            .take()
-            .ok_or("no tasks")
-            .map_err(|e| anyhow!(e))?;
-
-        let results = join_all(tasks).await;
-
-        let mut wait_errors: Vec<tokio::task::JoinError> = vec![];
-
-        for result in results {
-            if let Err(e) = result {
-                eprintln!("wait task error: {e:#?}");
-
-                wait_errors.push(e);
-            }
-        }
-
-        if wait_errors.is_empty() {
-            Ok(())
-        } else {
-            Err(anyhow!("wait all tasks failed: {:#?}", wait_errors))
-        }
-    }
-
-    #[allow(dead_code)]
-    async fn cloud_hypervisor_wait(&mut self) -> Result<()> {
-        let mut child = self
-            .process
-            .take()
-            .ok_or(format!("{CH_NAME} not running"))
-            .map_err(|e| anyhow!(e))?;
-
-        let _pid = child
-            .id()
-            .ok_or(format!("{CH_NAME} missing PID"))
-            .map_err(|e| anyhow!(e))?;
-
-        // Note that this kills _and_ waits for the process!
-        child.kill().await?;
-
-        Ok(())
+        self.terminate_launched_hypervisor().await
     }
 
     // Check the specified ping API response to see if it contains CH's
@@ -801,20 +935,30 @@ impl CloudHypervisorInner {
     }
 
     pub(crate) async fn start_vm(&mut self, timeout_secs: i32) -> Result<()> {
+        if self.state == VmmState::VmRunning {
+            return Err(anyhow!("Cloud Hypervisor VM is already running"));
+        }
         self.timeout_secs = timeout_secs;
         self.start_hypervisor(self.timeout_secs).await?;
 
         self.state = VmmState::VmmServerReady;
 
-        if self.config.vm_template.boot_from_template && self.should_restore_from_template() {
-            self.prepare_restore_files()?;
-            self.restore_vm().await?;
-            self.resume_vm().await?;
-        } else {
-            if self.config.vm_template.boot_from_template {
-                self.config.vm_template.boot_from_template = false;
-            }
-            self.boot_vm().await?;
+        let boot_result =
+            if self.config.vm_template.boot_from_template && self.should_restore_from_template() {
+                async {
+                    self.prepare_restore_files()?;
+                    self.restore_vm().await?;
+                    self.resume_vm().await
+                }
+                .await
+            } else {
+                if self.config.vm_template.boot_from_template {
+                    self.config.vm_template.boot_from_template = false;
+                }
+                self.boot_vm().await
+            };
+        if let Err(error) = boot_result {
+            return Err(self.cleanup_start_failure(error, "boot").await);
         }
 
         self.state = VmmState::VmRunning;
@@ -829,14 +973,28 @@ impl CloudHypervisorInner {
         // time. Without this check, we'll return an error representing EPIPE
         // since the CH API socket is at that point invalid.
         if self.state != VmmState::VmRunning {
-            return Ok(());
+            return if self.has_active_epoch_resources().await {
+                self.terminate_launched_hypervisor()
+                    .await
+                    .context("clean up non-running Cloud Hypervisor epoch")
+            } else {
+                Ok(())
+            };
         }
 
-        self.state = VmmState::NotReady;
-
-        self.cloud_hypervisor_shutdown().await?;
-
-        Ok(())
+        match self.cloud_hypervisor_shutdown().await {
+            Ok(()) => Ok(()),
+            Err(error)
+                if is_api_command_not_dispatched(&error) || is_definite_server_response(&error) =>
+            {
+                self.state = VmmState::VmRunning;
+                Err(error)
+            }
+            Err(error) => {
+                self.state = VmmState::NotReady;
+                Err(error)
+            }
+        }
     }
 
     #[allow(dead_code)]
@@ -1105,73 +1263,115 @@ impl CloudHypervisorInner {
     }
 }
 
-// Log all output from the CH process until a shutdown signal is received.
-// When that happens, stop logging and wait for the child process to finish
-// before returning.
+async fn terminate_process_handle(process: &mut impl ProcessHandle) -> Result<i32> {
+    match process.start_kill() {
+        Ok(()) => process
+            .wait()
+            .await
+            .context("wait for Cloud Hypervisor process"),
+        Err(kill_error) => match process.try_wait() {
+            Ok(Some(exit_code)) => Ok(exit_code),
+            Ok(None) => Err(kill_error).context("terminate live Cloud Hypervisor process"),
+            Err(wait_error) => Err(kill_error).context(format!(
+                "terminate Cloud Hypervisor process; nonblocking exit check also failed: {wait_error}"
+            )),
+        },
+    }
+}
+
+async fn terminate_owned_process<P: ProcessHandle>(
+    process: &mut Option<P>,
+    exit_notify: Option<&mpsc::Sender<i32>>,
+) -> Result<()> {
+    let Some(child) = process.as_mut() else {
+        return Ok(());
+    };
+
+    let exit_code = terminate_process_handle(child).await?;
+    if let Some(exit_notify) = exit_notify {
+        let _ = exit_notify.try_send(exit_code);
+    }
+    *process = None;
+
+    Ok(())
+}
+
+async fn terminate_shared_child(
+    process: &SharedChild,
+    exit_notify: Option<&mpsc::Sender<i32>>,
+) -> Result<()> {
+    let mut process = process.lock().await;
+    terminate_owned_process(&mut process, exit_notify).await
+}
+
+// Log all output from the CH process until shutdown or stream closure. Explicit
+// cleanup owns termination; unexpected logger completion terminates the shared
+// child so wait_vm still receives an exit notification.
 async fn cloud_hypervisor_log_output(
-    mut child: Child,
+    stdout: ChildStdout,
+    stderr: ChildStderr,
+    process: SharedChild,
     mut shutdown: Receiver<bool>,
     exit_notify: mpsc::Sender<i32>,
 ) -> Result<()> {
-    let stdout = child
-        .stdout
-        .as_mut()
-        .ok_or("failed to get child stdout")
-        .map_err(|e| anyhow!(e))?;
+    let log_result = AssertUnwindSafe(async {
+        let stdout_reader = BufReader::new(stdout);
+        let mut stdout_lines = stdout_reader.lines();
+        let stderr_reader = BufReader::new(stderr);
+        let mut stderr_lines = stderr_reader.lines();
 
-    let stdout_reader = BufReader::new(stdout);
-    let mut stdout_lines = stdout_reader.lines();
+        loop {
+            tokio::select! {
+                _ = shutdown.changed() => {
+                    info!(sl!(), "got shutdown request");
+                    return Ok::<(), anyhow::Error>(());
+                },
+                stderr_line = poll_fn(|cx| Pin::new(&mut stderr_lines).poll_next_line(cx)) => {
+                    if let Ok(line) = stderr_line {
+                        let line = line.ok_or("missing stderr line").map_err(|e| anyhow!(e))?;
 
-    let stderr = child
-        .stderr
-        .as_mut()
-        .ok_or("failed to get child stderr")
-        .map_err(|e| anyhow!(e))?;
-
-    let stderr_reader = BufReader::new(stderr);
-    let mut stderr_lines = stderr_reader.lines();
-
-    loop {
-        tokio::select! {
-            _ = shutdown.changed() => {
-                info!(sl!(), "got shutdown request");
-                break;
-            },
-            stderr_line = poll_fn(|cx| Pin::new(&mut stderr_lines).poll_next_line(cx)) => {
-                if let Ok(line) = stderr_line {
-                    let line = line.ok_or("missing stderr line").map_err(|e| anyhow!(e))?;
-
-                    match parse_ch_log_level(&line) {
-                        CloudHypervisorLogLevel::Trace => trace!(sl!(), "{:?}", line; "stream" => "stderr"),
-                        CloudHypervisorLogLevel::Debug => debug!(sl!(), "{:?}", line; "stream" => "stderr"),
-                        CloudHypervisorLogLevel::Warn => warn!(sl!(), "{:?}", line; "stream" => "stderr"),
-                        CloudHypervisorLogLevel::Error => error!(sl!(), "{:?}", line; "stream" => "stderr"),
-                        _ => info!(sl!(), "{:?}", line; "stream" => "stderr"),
+                        match parse_ch_log_level(&line) {
+                            CloudHypervisorLogLevel::Trace => trace!(sl!(), "{:?}", line; "stream" => "stderr"),
+                            CloudHypervisorLogLevel::Debug => debug!(sl!(), "{:?}", line; "stream" => "stderr"),
+                            CloudHypervisorLogLevel::Warn => warn!(sl!(), "{:?}", line; "stream" => "stderr"),
+                            CloudHypervisorLogLevel::Error => error!(sl!(), "{:?}", line; "stream" => "stderr"),
+                            _ => info!(sl!(), "{:?}", line; "stream" => "stderr"),
+                        }
                     }
-                }
-            },
-            stdout_line = poll_fn(|cx| Pin::new(&mut stdout_lines).poll_next_line(cx)) => {
-                if let Ok(line) = stdout_line {
-                    let line = line.ok_or("missing stdout line").map_err(|e| anyhow!(e))?;
+                },
+                stdout_line = poll_fn(|cx| Pin::new(&mut stdout_lines).poll_next_line(cx)) => {
+                    if let Ok(line) = stdout_line {
+                        let line = line.ok_or("missing stdout line").map_err(|e| anyhow!(e))?;
 
-                    match parse_ch_log_level(&line) {
-                        CloudHypervisorLogLevel::Trace => trace!(sl!(), "{:?}", line; "stream" => "stdout"),
-                        CloudHypervisorLogLevel::Debug => debug!(sl!(), "{:?}", line; "stream" => "stdout"),
-                        CloudHypervisorLogLevel::Warn => warn!(sl!(), "{:?}", line; "stream" => "stdout"),
-                        CloudHypervisorLogLevel::Error => error!(sl!(), "{:?}", line; "stream" => "stdout"),
-                        _ => info!(sl!(), "{:?}", line; "stream" => "stdout"),
+                        match parse_ch_log_level(&line) {
+                            CloudHypervisorLogLevel::Trace => trace!(sl!(), "{:?}", line; "stream" => "stdout"),
+                            CloudHypervisorLogLevel::Debug => debug!(sl!(), "{:?}", line; "stream" => "stdout"),
+                            CloudHypervisorLogLevel::Warn => warn!(sl!(), "{:?}", line; "stream" => "stdout"),
+                            CloudHypervisorLogLevel::Error => error!(sl!(), "{:?}", line; "stream" => "stdout"),
+                            _ => info!(sl!(), "{:?}", line; "stream" => "stdout"),
+                        }
                     }
-                }
-            },
-        };
+                },
+            };
+        }
+    })
+    .catch_unwind()
+    .await;
+
+    match log_result {
+        Ok(Ok(())) => return Ok(()),
+        Ok(Err(error)) => {
+            warn!(
+                sl!(),
+                "Cloud Hypervisor logger stopped with an error: {error:#}"
+            );
+        }
+        Err(_) => {
+            warn!(sl!(), "Cloud Hypervisor logger panicked");
+        }
     }
 
-    // Note that this kills _and_ waits for the process!
-    let _ = child.kill().await;
-    if let Ok(status) = child.wait().await {
-        let _ = exit_notify.try_send(status.code().unwrap_or(0));
-    }
-
+    terminate_shared_child(&process, Some(&exit_notify)).await?;
     Ok(())
 }
 

@@ -16,6 +16,7 @@ use std::collections::HashMap;
 use std::error::Error as StdError;
 use std::fmt;
 use std::panic::AssertUnwindSafe;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex, Notify, RwLock};
 
@@ -33,6 +34,60 @@ mod inner_hypervisor;
 mod utils;
 
 use inner::CloudHypervisorInner;
+
+#[derive(Debug)]
+struct SharedOperation<T> {
+    outcome: Mutex<Option<T>>,
+    completed: Notify,
+    finished: AtomicBool,
+}
+
+impl<T> Default for SharedOperation<T> {
+    fn default() -> Self {
+        Self {
+            outcome: Mutex::new(None),
+            completed: Notify::new(),
+            finished: AtomicBool::new(false),
+        }
+    }
+}
+
+impl<T: Clone> SharedOperation<T> {
+    async fn complete(&self, outcome: T) {
+        *self.outcome.lock().await = Some(outcome);
+        self.finished.store(true, Ordering::Release);
+        self.completed.notify_waiters();
+    }
+
+    async fn wait(&self) -> T {
+        loop {
+            let completed = self.completed.notified();
+            if let Some(outcome) = self.outcome.lock().await.as_ref().cloned() {
+                return outcome;
+            }
+            completed.await;
+        }
+    }
+
+    fn is_complete(&self) -> bool {
+        self.finished.load(Ordering::Acquire)
+    }
+}
+
+#[derive(Clone, Debug)]
+struct SharedOperationError(Arc<anyhow::Error>);
+
+impl fmt::Display for SharedOperationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}", self.0)
+    }
+}
+
+impl StdError for SharedOperationError {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        Some(self.0.as_ref().as_ref())
+    }
+}
 
 #[derive(Clone, Debug)]
 enum BlockAddOutcome {
@@ -58,53 +113,100 @@ impl BlockAddOutcome {
     fn into_result(self) -> Result<DeviceType> {
         match self {
             Self::Success(device) => Ok(*device),
-            Self::Failure(error) => Err(anyhow::Error::new(SharedBlockAddError(error))),
+            Self::Failure(error) => Err(anyhow::Error::new(SharedOperationError(error))),
         }
     }
 }
 
 #[derive(Clone, Debug)]
-struct SharedBlockAddError(Arc<anyhow::Error>);
+struct BlockAddIdentity {
+    device: Arc<Mutex<BlockDeviceModern>>,
+    device_id: String,
+    config: crate::BlockConfigModern,
+}
 
-impl fmt::Display for SharedBlockAddError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "{}", self.0)
+impl BlockAddIdentity {
+    async fn from_device(device: Arc<Mutex<BlockDeviceModern>>) -> Self {
+        let snapshot = device.lock().await;
+        let mut config = snapshot.config.clone();
+        // The attach worker fills this output field. It is not part of the
+        // request identity used to decide whether a retry can join.
+        config.pci_path = None;
+        Self {
+            device: device.clone(),
+            device_id: snapshot.device_id.clone(),
+            config,
+        }
+    }
+
+    fn matches(&self, other: &Self) -> bool {
+        self.device_id == other.device_id
+            && self.config == other.config
+            && Arc::ptr_eq(&self.device, &other.device)
     }
 }
 
-impl StdError for SharedBlockAddError {
-    fn source(&self) -> Option<&(dyn StdError + 'static)> {
-        Some(self.0.as_ref().as_ref())
-    }
-}
-
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct BlockAddOperation {
-    outcome: Mutex<Option<BlockAddOutcome>>,
-    completed: Notify,
+    identity: BlockAddIdentity,
+    completion: SharedOperation<BlockAddOutcome>,
 }
 
 impl BlockAddOperation {
+    fn new(identity: BlockAddIdentity) -> Self {
+        Self {
+            identity,
+            completion: SharedOperation::default(),
+        }
+    }
+
     async fn complete(&self, result: Result<DeviceType>) {
-        *self.outcome.lock().await = Some(BlockAddOutcome::from_result(result));
-        self.completed.notify_waiters();
+        self.completion
+            .complete(BlockAddOutcome::from_result(result))
+            .await;
     }
 
     async fn wait(&self) -> BlockAddOutcome {
-        loop {
-            let completed = self.completed.notified();
-            if let Some(outcome) = self.outcome.lock().await.as_ref().cloned() {
-                return outcome;
-            }
-            completed.await;
+        self.completion.wait().await
+    }
+
+    fn is_complete(&self) -> bool {
+        self.completion.is_complete()
+    }
+}
+
+#[derive(Clone, Debug)]
+enum VmOperationOutcome {
+    Success,
+    Failure(Arc<anyhow::Error>),
+}
+
+impl VmOperationOutcome {
+    fn from_result(result: Result<()>) -> Self {
+        match result {
+            Ok(()) => Self::Success,
+            Err(error) => Self::Failure(Arc::new(error)),
+        }
+    }
+
+    fn into_result(self) -> Result<()> {
+        match self {
+            Self::Success => Ok(()),
+            Self::Failure(error) => Err(anyhow::Error::new(SharedOperationError(error))),
         }
     }
 }
+
+type VmStopOperation = SharedOperation<VmOperationOutcome>;
+type VmStartOperation = SharedOperation<VmOperationOutcome>;
 
 #[derive(Debug)]
 struct BlockAddState {
     admission_open: bool,
     operations: HashMap<String, Arc<BlockAddOperation>>,
+    stop: Option<Arc<VmStopOperation>>,
+    start: Option<Arc<VmStartOperation>>,
+    cleanup_unresolved: Option<Arc<anyhow::Error>>,
 }
 
 impl Default for BlockAddState {
@@ -112,6 +214,9 @@ impl Default for BlockAddState {
         Self {
             admission_open: true,
             operations: HashMap::new(),
+            stop: None,
+            start: None,
+            cleanup_unresolved: None,
         }
     }
 }
@@ -119,7 +224,7 @@ impl Default for BlockAddState {
 #[derive(Debug)]
 pub struct CloudHypervisor {
     inner: Arc<RwLock<CloudHypervisorInner>>,
-    block_adds: Mutex<BlockAddState>,
+    block_adds: Arc<Mutex<BlockAddState>>,
     exit_waiter: Mutex<(mpsc::Receiver<i32>, i32)>,
 }
 
@@ -129,24 +234,36 @@ impl CloudHypervisor {
 
         Self {
             inner: Arc::new(RwLock::new(CloudHypervisorInner::new(Some(exit_notify)))),
-            block_adds: Mutex::new(BlockAddState::default()),
+            block_adds: Arc::new(Mutex::new(BlockAddState::default())),
             exit_waiter: Mutex::new((exit_waiter, 0)),
         }
     }
 
     async fn add_block_device(&self, device: Arc<Mutex<BlockDeviceModern>>) -> Result<DeviceType> {
-        let device_id = device.lock().await.device_id.clone();
+        let identity = BlockAddIdentity::from_device(device).await;
+        let device_id = identity.device_id.clone();
         let (operation, start) = {
             let mut state = self.block_adds.lock().await;
-            if !state.admission_open {
-                return Err(anyhow::anyhow!(
-                    "Cloud Hypervisor block add for device {device_id} was not admitted because VM stop has begun"
-                ));
-            }
             match state.operations.get(&device_id) {
-                Some(operation) => (operation.clone(), false),
+                Some(operation) if operation.identity.matches(&identity) => {
+                    (operation.clone(), false)
+                }
+                Some(operation) => {
+                    let reason = format!(
+                        "Cloud Hypervisor block add retry for device {device_id} does not match the admitted device at {}; original cleanup remains pending",
+                        operation.identity.config.path_on_host
+                    );
+                    return Err(anyhow::Error::new(DeviceStateInDoubt::new(
+                        device_id, reason,
+                    )));
+                }
                 None => {
-                    let operation = Arc::new(BlockAddOperation::default());
+                    if !state.admission_open {
+                        return Err(anyhow::anyhow!(
+                            "Cloud Hypervisor block add for device {device_id} was not admitted because VM stop has begun"
+                        ));
+                    }
+                    let operation = Arc::new(BlockAddOperation::new(identity.clone()));
                     state
                         .operations
                         .insert(device_id.clone(), operation.clone());
@@ -164,7 +281,7 @@ impl CloudHypervisor {
                     inner
                         .write()
                         .await
-                        .add_device(DeviceType::BlockModern(device))
+                        .add_device(DeviceType::BlockModern(identity.device))
                         .await
                 })
                 .catch_unwind()
@@ -193,16 +310,232 @@ impl CloudHypervisor {
         outcome.into_result()
     }
 
-    async fn close_block_add_admission_and_drain(&self) {
-        let operations = {
+    async fn stop_vm_shared(&self) -> Result<()> {
+        let (operation, start, active_start, block_adds) = {
             let mut state = self.block_adds.lock().await;
-            state.admission_open = false;
-            state.operations.values().cloned().collect::<Vec<_>>()
+            if let Some(operation) = &state.stop {
+                (operation.clone(), false, None, Vec::new())
+            } else {
+                let operation = Arc::new(VmStopOperation::default());
+                let active_start = state.start.clone();
+                let block_adds = state.operations.values().cloned().collect::<Vec<_>>();
+                state.stop = Some(operation.clone());
+                state.admission_open = false;
+                (operation, true, active_start, block_adds)
+            }
         };
 
-        for operation in operations {
-            operation.wait().await;
+        if start {
+            let inner = self.inner.clone();
+            let state = self.block_adds.clone();
+            let worker_operation = operation.clone();
+            tokio::spawn(async move {
+                let (outcome, can_hot_add) = AssertUnwindSafe(async {
+                    if let Some(active_start) = active_start {
+                        active_start.wait().await;
+                    }
+
+                    let unresolved_start = {
+                        let state = state.lock().await;
+                        state.cleanup_unresolved.clone()
+                    };
+
+                    for block_add in block_adds {
+                        block_add.wait().await;
+                    }
+
+                    {
+                        let mut inner = inner.write().await;
+                        let mut result = if let Some(error) = unresolved_start {
+                            match inner.terminate_launched_hypervisor().await {
+                                Ok(()) => Ok(()),
+                                Err(cleanup_error) => Err(anyhow::Error::new(
+                                    SharedOperationError(error),
+                                )
+                                .context(format!(
+                                    "Cloud Hypervisor stop cleanup remains unresolved: {cleanup_error:#}"
+                                ))),
+                            }
+                        } else {
+                            inner.stop_vm().await
+                        };
+
+                        let resources_remain = inner.has_active_epoch_resources().await;
+                        if result.is_ok() && resources_remain {
+                            result = Err(anyhow::anyhow!(
+                                "Cloud Hypervisor stop returned before all epoch resources were cleaned"
+                            ));
+                        }
+                        (
+                            VmOperationOutcome::from_result(result),
+                            inner.state == crate::VmmState::VmRunning,
+                        )
+                    }
+                })
+                .catch_unwind()
+                .await
+                .unwrap_or_else(|_| {
+                    (
+                        VmOperationOutcome::Failure(Arc::new(anyhow::anyhow!(
+                            "Cloud Hypervisor stop worker panicked; VM state remains unresolved"
+                        ))),
+                        false,
+                    )
+                });
+
+                {
+                    let mut state = state.lock().await;
+                    if state
+                        .stop
+                        .as_ref()
+                        .is_some_and(|active| Arc::ptr_eq(active, &worker_operation))
+                    {
+                        match &outcome {
+                            VmOperationOutcome::Success => {
+                                state.admission_open = false;
+                                state.operations.clear();
+                                state.cleanup_unresolved = None;
+                            }
+                            VmOperationOutcome::Failure(_) if can_hot_add => {
+                                state.admission_open = true;
+                                state.stop = None;
+                                state.cleanup_unresolved = None;
+                            }
+                            VmOperationOutcome::Failure(error) => {
+                                state.admission_open = false;
+                                state.stop = None;
+                                state.cleanup_unresolved = Some(error.clone());
+                            }
+                        }
+                    }
+                }
+                worker_operation.complete(outcome).await;
+            });
         }
+
+        operation.wait().await.into_result()
+    }
+
+    async fn start_vm_shared(&self, timeout: i32) -> Result<()> {
+        let operation = loop {
+            let (cleanup_unresolved, active_start, previous_stop) = {
+                let state = self.block_adds.lock().await;
+                (
+                    state.cleanup_unresolved.clone(),
+                    state.start.clone(),
+                    state.stop.clone(),
+                )
+            };
+            if let Some(error) = cleanup_unresolved {
+                return Err(anyhow::Error::new(SharedOperationError(error)).context(
+                    "Cloud Hypervisor cannot start while the previous VM shutdown is unresolved because process cleanup remains unresolved",
+                ));
+            }
+            if let Some(active_start) = active_start {
+                return active_start.wait().await.into_result();
+            }
+
+            if let Some(previous_stop) = &previous_stop {
+                return match previous_stop.wait().await {
+                    VmOperationOutcome::Success => Err(anyhow::anyhow!(
+                        "Cloud Hypervisor VM has stopped; this sandbox lifecycle cannot restart"
+                    )),
+                    VmOperationOutcome::Failure(error) => Err(anyhow::Error::new(
+                        SharedOperationError(error),
+                    )
+                    .context(
+                        "Cloud Hypervisor cannot start while the previous VM shutdown is unresolved",
+                    )),
+                };
+            }
+
+            let mut state = self.block_adds.lock().await;
+            if state.cleanup_unresolved.is_some() || state.stop.is_some() || state.start.is_some() {
+                continue;
+            }
+            let operation = Arc::new(VmStartOperation::default());
+            state.start = Some(operation.clone());
+            break operation;
+        };
+
+        let inner = self.inner.clone();
+        let state = self.block_adds.clone();
+        let worker_operation = operation.clone();
+        tokio::spawn(async move {
+            let (worker_result, cleanup_unresolved) = {
+                let mut inner = inner.write().await;
+                if inner.state == crate::VmmState::VmRunning {
+                    (
+                        Err(anyhow::anyhow!("Cloud Hypervisor VM is already running")),
+                        false,
+                    )
+                } else {
+                    match AssertUnwindSafe(inner.start_vm(timeout))
+                        .catch_unwind()
+                        .await
+                    {
+                        Ok(result) => {
+                            let unresolved =
+                                result.is_err() && inner.has_active_epoch_resources().await;
+                            (result, unresolved)
+                        }
+                        Err(_) => {
+                            let cleanup = AssertUnwindSafe(inner.terminate_launched_hypervisor())
+                                .catch_unwind()
+                                .await;
+                            match cleanup {
+                                Ok(Ok(())) => (
+                                    Err(anyhow::anyhow!(
+                                        "Cloud Hypervisor start worker panicked; spawned process resources were cleaned"
+                                    )),
+                                    false,
+                                ),
+                                Ok(Err(cleanup_error)) => (
+                                    Err(anyhow::anyhow!(
+                                        "Cloud Hypervisor start worker panicked; process cleanup remains unresolved: {cleanup_error:#}"
+                                    )),
+                                    true,
+                                ),
+                                Err(_) => (
+                                    Err(anyhow::anyhow!(
+                                        "Cloud Hypervisor start worker panicked; process cleanup also panicked"
+                                    )),
+                                    true,
+                                ),
+                            }
+                        }
+                    }
+                }
+            };
+            let outcome = VmOperationOutcome::from_result(worker_result);
+            {
+                let mut state = state.lock().await;
+                if state
+                    .start
+                    .as_ref()
+                    .is_some_and(|active| Arc::ptr_eq(active, &worker_operation))
+                {
+                    state.start = None;
+                    if cleanup_unresolved {
+                        if let VmOperationOutcome::Failure(error) = &outcome {
+                            state.cleanup_unresolved = Some(error.clone());
+                            state.admission_open = false;
+                        }
+                    } else if matches!(outcome, VmOperationOutcome::Success) {
+                        state.cleanup_unresolved = None;
+                        state
+                            .operations
+                            .retain(|_, operation| !operation.is_complete());
+                        if state.stop.is_none() {
+                            state.admission_open = true;
+                        }
+                    }
+                }
+            }
+            worker_operation.complete(outcome).await;
+        });
+
+        operation.wait().await.into_result()
     }
 
     pub async fn set_hypervisor_config(&self, config: HypervisorConfig) {
@@ -231,14 +564,11 @@ impl Hypervisor for CloudHypervisor {
     }
 
     async fn start_vm(&self, timeout: i32) -> Result<()> {
-        let mut inner = self.inner.write().await;
-        inner.start_vm(timeout).await
+        self.start_vm_shared(timeout).await
     }
 
     async fn stop_vm(&self) -> Result<()> {
-        self.close_block_add_admission_and_drain().await;
-        let mut inner = self.inner.write().await;
-        inner.stop_vm().await
+        self.stop_vm_shared().await
     }
 
     async fn wait_vm(&self) -> Result<i32> {
@@ -414,7 +744,7 @@ impl Persist for CloudHypervisor {
         let inner = CloudHypervisorInner::restore(exit_notify, hypervisor_state).await?;
         Ok(Self {
             inner: Arc::new(RwLock::new(inner)),
-            block_adds: Mutex::new(BlockAddState::default()),
+            block_adds: Arc::new(Mutex::new(BlockAddState::default())),
             exit_waiter: Mutex::new((exit_waiter, 0)),
         })
     }
