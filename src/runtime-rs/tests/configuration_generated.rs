@@ -1,4 +1,4 @@
-// Copyright (c) 2026 Thomson Reuters
+// Copyright (c) 2026 Kata Contributors
 //
 // SPDX-License-Identifier: Apache-2.0
 
