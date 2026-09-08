@@ -896,10 +896,7 @@ mod tests {
 
         assert_eq!(block_emptydir_driver(true, VIRTIO_SCSI), VIRTIO_BLK_PCI);
         assert_eq!(block_emptydir_driver(false, VIRTIO_SCSI), VIRTIO_SCSI);
-        assert_eq!(
-            block_emptydir_driver(true, VIRTIO_BLK_PCI),
-            VIRTIO_BLK_PCI
-        );
+        assert_eq!(block_emptydir_driver(true, VIRTIO_BLK_PCI), VIRTIO_BLK_PCI);
         assert_eq!(block_emptydir_driver(true, VIRTIO_BLK_CCW), VIRTIO_BLK_CCW);
 
         assert!(use_qemu_pcie_root_port(VIRTIO_BLK_PCI, "q35", Some(&qemu)));
