@@ -28,7 +28,7 @@ use hypervisor::{
     BlockConfigModern, BlockDeviceAio, HYPERVISOR_QEMU,
 };
 use kata_sys_util::k8s::is_disk_empty_dir;
-use kata_types::config::hypervisor::{VIRTIO_BLK_PCI, VIRTIO_SCSI};
+use kata_types::config::hypervisor::VIRTIO_BLK_PCI;
 use kata_types::config::{EMPTYDIR_MODE_BLOCK_ENCRYPTED, EMPTYDIR_MODE_BLOCK_PLAIN};
 use kata_types::mount::{
     add_volume_mount_info, is_volume_mounted, join_path, kata_direct_volume_root_path,
@@ -830,16 +830,11 @@ pub(crate) fn is_block_emptydir_mode(emptydir_mode: &str) -> bool {
     emptydir_mode == EMPTYDIR_MODE_BLOCK_ENCRYPTED || emptydir_mode == EMPTYDIR_MODE_BLOCK_PLAIN
 }
 
-/// Block-backed emptyDir volumes rely on guest discard to punch holes in the
-/// host sparse `disk.img` after file deletion or overwrite. QEMU's default
-/// virtio-scsi frontend does not expose discard, so virtio-blk is selected when
-/// discard is required.
-fn block_emptydir_driver(discard_unmap: bool, default_driver: &str) -> &str {
-    if discard_unmap && default_driver == VIRTIO_SCSI {
-        VIRTIO_BLK_PCI
-    } else {
-        default_driver
-    }
+/// Keep block-backed EmptyDirs on the configured hypervisor transport.
+/// Discard remains a separate backend and guest mount option instead of
+/// overriding the transport selected by the operator.
+fn block_emptydir_driver(_discard_unmap: bool, default_driver: &str) -> &str {
+    default_driver
 }
 
 fn use_qemu_pcie_root_port(
@@ -867,7 +862,7 @@ fn get_filesystem_capacity(path: &Path) -> Result<u64> {
 mod tests {
     use super::*;
     use crate::volume::EphemeralDiskStore;
-    use kata_types::config::hypervisor::{VIRTIO_BLK_CCW, VIRTIO_BLK_MMIO};
+    use kata_types::config::hypervisor::{VIRTIO_BLK_CCW, VIRTIO_BLK_MMIO, VIRTIO_SCSI};
     use std::sync::Arc;
 
     const ARTIFACT_FAILURE_TEST_ENV: &str = "KATA_TEST_BLOCK_EMPTYDIR_ARTIFACT_FAILURE";
@@ -878,7 +873,7 @@ mod tests {
     const TRACKING_ID_EXHAUSTION_TEST_ENV: &str = "KATA_TEST_BLOCK_EMPTYDIR_TRACKING_ID_EXHAUSTION";
 
     #[test]
-    fn block_emptydir_selects_qemu_discard_transport_and_root_port() {
+    fn block_emptydir_preserves_configured_transport_and_selects_root_port() {
         let qemu = PCIeTopology {
             hypervisor_name: HYPERVISOR_QEMU.to_string(),
             pcie_root_ports: 8,
@@ -894,7 +889,7 @@ mod tests {
             ..Default::default()
         };
 
-        assert_eq!(block_emptydir_driver(true, VIRTIO_SCSI), VIRTIO_BLK_PCI);
+        assert_eq!(block_emptydir_driver(true, VIRTIO_SCSI), VIRTIO_SCSI);
         assert_eq!(block_emptydir_driver(false, VIRTIO_SCSI), VIRTIO_SCSI);
         assert_eq!(block_emptydir_driver(true, VIRTIO_BLK_PCI), VIRTIO_BLK_PCI);
         assert_eq!(block_emptydir_driver(true, VIRTIO_BLK_CCW), VIRTIO_BLK_CCW);

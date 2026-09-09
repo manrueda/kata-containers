@@ -20,8 +20,8 @@ use hypervisor::{
         DeviceStateInDoubt, DeviceType,
     },
     hypervisor_persist::HypervisorState,
-    Hypervisor, MemoryConfig, VcpuThreadIds, KATA_BLK_DEV_TYPE, VIRTIO_BLOCK_MMIO,
-    VIRTIO_BLOCK_PCI,
+    Hypervisor, MemoryConfig, VcpuThreadIds, KATA_BLK_DEV_TYPE, KATA_SCSI_DEV_TYPE,
+    VIRTIO_BLOCK_MMIO, VIRTIO_BLOCK_PCI,
 };
 use kata_types::{
     capabilities::{Capabilities, CapabilityBits},
@@ -294,6 +294,10 @@ impl Hypervisor for FakeHypervisor {
             let pci_path = PciPath::try_from(format!("{:02x}/00", block_add.index + 2).as_str())?;
             if let DeviceType::BlockModern(block) = &device {
                 block.lock().await.config.pci_path = Some(pci_path);
+            }
+        } else if block_add.driver_option == KATA_SCSI_DEV_TYPE {
+            if let DeviceType::BlockModern(block) = &device {
+                block.lock().await.config.scsi_addr = Some(format!("0:{}", block_add.index));
             }
         }
         self.state
@@ -1081,24 +1085,30 @@ async fn ambiguous_attach_without_path_lookup(root: &Path) {
     assert!(!metadata_path(source).exists());
 }
 
-async fn qemu_constructor_owns_pcie_root_port_attachments(root: &Path, block_driver: &str) {
+async fn qemu_constructor_preserves_configured_block_driver(root: &Path, block_driver: &str) {
     let harness = Harness::qemu(block_driver).await;
     let (spec, sources) = emptydir_spec(root, 8);
     let volumes = harness.handle(&spec).await.unwrap();
     let snapshot = harness.hypervisor.snapshot();
+    let expected_driver_option = if block_driver == VIRTIO_SCSI {
+        KATA_SCSI_DEV_TYPE
+    } else {
+        KATA_BLK_DEV_TYPE
+    };
 
     assert_eq!(volumes.len(), 8);
     assert_eq!(snapshot.attempted_devices, snapshot.added_devices);
     assert_eq!(snapshot.block_adds.len(), 8);
     for (index, add) in snapshot.block_adds.iter().enumerate() {
-        let expected_root_port = format!("rp{index}");
-        assert_eq!(add.driver_option, KATA_BLK_DEV_TYPE);
+        assert_eq!(add.driver_option, expected_driver_option);
         assert!(add.discard_unmap);
-        assert!(add.use_pcie_root_port);
-        assert_eq!(
-            add.pcie_root_port.as_deref(),
-            Some(expected_root_port.as_str())
-        );
+        if block_driver == VIRTIO_SCSI {
+            assert!(!add.use_pcie_root_port);
+            assert_eq!(add.pcie_root_port, None);
+        } else {
+            assert!(add.use_pcie_root_port);
+            assert_eq!(add.pcie_root_port, Some(format!("rp{index}")));
+        }
         assert_eq!(add.index, index as u64);
         assert_eq!(
             add.path_on_host,
@@ -1106,8 +1116,12 @@ async fn qemu_constructor_owns_pcie_root_port_attachments(root: &Path, block_dri
         );
 
         let storage = volumes[index].get_storage().unwrap().pop().unwrap();
-        assert_eq!(storage.driver, KATA_BLK_DEV_TYPE);
-        assert_eq!(storage.source, format!("{:02x}/00", index + 2));
+        assert_eq!(storage.driver, expected_driver_option);
+        if block_driver == VIRTIO_SCSI {
+            assert_eq!(storage.source, format!("0:{index}"));
+        } else {
+            assert_eq!(storage.source, format!("{:02x}/00", index + 2));
+        }
     }
     assert_eq!(
         harness
@@ -1118,7 +1132,7 @@ async fn qemu_constructor_owns_pcie_root_port_attachments(root: &Path, block_dri
             .unwrap()
             .reserved_bus
             .len(),
-        8
+        if block_driver == VIRTIO_SCSI { 0 } else { 8 }
     );
 
     harness
@@ -1457,9 +1471,9 @@ async fn ambiguous_attach_preserves_artifacts_without_path_lookup() {
 }
 
 #[tokio::test]
-async fn qemu_constructor_selects_pcie_root_ports_for_eight_emptydirs() {
+async fn qemu_constructor_preserves_scsi_for_eight_emptydirs() {
     let root = test_root();
-    qemu_constructor_owns_pcie_root_port_attachments(
+    qemu_constructor_preserves_configured_block_driver(
         &root.path().join("qemu-converted-scsi"),
         VIRTIO_SCSI,
     )
@@ -1469,7 +1483,7 @@ async fn qemu_constructor_selects_pcie_root_ports_for_eight_emptydirs() {
 #[tokio::test]
 async fn qemu_constructor_reserves_root_ports_for_preselected_pci() {
     let root = test_root();
-    qemu_constructor_owns_pcie_root_port_attachments(
+    qemu_constructor_preserves_configured_block_driver(
         &root.path().join("qemu-preselected-pci"),
         VIRTIO_BLOCK_PCI,
     )
